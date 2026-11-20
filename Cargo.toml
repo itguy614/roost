@@ -5,6 +5,7 @@ members = [
     "crates/roost-ipc",
     "crates/roost-process",
     "crates/roost-providers",
+    "crates/roost-watch",
     "crates/roost-daemon",
     "crates/roost-cli",
 ]
@@ -20,6 +21,7 @@ roost-store = { path = "crates/roost-store" }
 roost-ipc = { path = "crates/roost-ipc" }
 roost-process = { path = "crates/roost-process" }
 roost-providers = { path = "crates/roost-providers" }
+roost-watch = { path = "crates/roost-watch" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

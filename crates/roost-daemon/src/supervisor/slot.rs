@@ -5,7 +5,7 @@ use std::{
 };
 
 use roost_core::{
-    CrashRestartPolicy, DesiredState, ProjectId, WorkerProfile,
+    CodeRestartPolicy, CrashRestartPolicy, DesiredState, ProjectId, WorkerProfile,
     worker_runtime::{
         LaunchFailure, ObservedState, OutputStream, OutputSummary, ProcessCrash, ProcessExit,
         ProcessLease, ProcessProfileId, ProcessStatus, StopCause, WorkerLeaseState,
@@ -37,6 +37,7 @@ pub(super) struct Slot<P: SupervisedProfile = WorkerProfile> {
     startup_timed_out: bool,
     draining_since: Option<Instant>,
     launch_failures: u8,
+    code_restart_pending: bool,
 }
 
 impl<P: SupervisedProfile> Slot<P> {
@@ -68,6 +69,7 @@ impl<P: SupervisedProfile> Slot<P> {
             startup_timed_out: false,
             draining_since: None,
             launch_failures: 0,
+            code_restart_pending: false,
         }
     }
 
@@ -104,6 +106,7 @@ impl<P: SupervisedProfile> Slot<P> {
     }
 
     pub(super) fn stop(&mut self, cause: StopCause) {
+        self.code_restart_pending = false;
         self.status.desired_state = DesiredState::Stopped;
         self.retry_at = None;
         self.status.reason = Some("process stop requested".into());
@@ -320,10 +323,14 @@ impl<P: SupervisedProfile> Slot<P> {
                 store.finish_process::<P::Id>(id, report.as_ref())?;
                 self.detach();
                 self.status.last_exit = Some(exit);
+                let code_restart = std::mem::take(&mut self.code_restart_pending);
                 if exit.stop_cause == Some(StopCause::StatePublicationFailed) {
                     self.after_launch_failure(LaunchFailure::StatePublication);
                 } else if self.startup_timed_out && exit.requested_stop {
                     self.after_launch_failure(LaunchFailure::ReadinessTimeout);
+                } else if code_restart && exit.stop_cause == Some(StopCause::ProjectRestart) {
+                    self.status.state = ObservedState::Starting;
+                    self.status.reason = Some("restarting after a watched file change".into());
                 } else {
                     self.after_exit(exit);
                 }
@@ -428,6 +435,22 @@ impl<P: SupervisedProfile> Slot<P> {
         self.status.recovery_blocked = true;
         self.status.last_error = Some(message.into());
         self.status.reason = self.status.last_error.clone();
+    }
+}
+
+impl Slot {
+    pub(super) fn request_code_restart(&mut self, changed_at: Instant) {
+        if self.profile.code_restart == CodeRestartPolicy::OnChange
+            && self.status.desired_state == DesiredState::Running
+            && self.status.state == ObservedState::Running
+            && self.has_guardian()
+            && self.since <= changed_at
+        {
+            self.stop(StopCause::ProjectRestart);
+            self.code_restart_pending = true;
+            self.status.desired_state = DesiredState::Running;
+            self.status.reason = Some("restarting after a watched file change".into());
+        }
     }
 }
 

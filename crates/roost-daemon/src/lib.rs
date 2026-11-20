@@ -4,9 +4,12 @@ pub mod guardian;
 mod scheduler_rpc;
 mod supervised;
 mod supervisor;
+mod watch;
+mod watch_rpc;
 mod worker_rpc;
 
 use std::{
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io,
     os::{
@@ -22,7 +25,7 @@ use std::{
 };
 
 use discovery_rpc::{DiscoveryCall, Snapshots};
-use roost_core::{Project, worker_runtime::DaemonStartup};
+use roost_core::{Project, ProjectId, worker_runtime::DaemonStartup};
 use roost_ipc::{
     self as rpc, AddParams, GetParams, Hello, HelloParams, Mutation, RemoveParams, Removed,
     RpcError, Status, endpoint,
@@ -100,6 +103,7 @@ impl Daemon {
         tokio::select! {
             result = self.accept() => result,
             () = self.service.poll_workers() => unreachable!("worker polling does not terminate"),
+            () = self.service.poll_watches() => unreachable!("watch polling does not terminate"),
         }
     }
 
@@ -217,6 +221,7 @@ pub struct DaemonService {
     started: Instant,
     startup: DaemonStartup,
     workers: Mutex<Supervisor>,
+    watch_status: Mutex<HashMap<ProjectId, watch::RuntimeStatus>>,
     snapshots: Mutex<Snapshots>,
     discovery_capacity: Arc<Semaphore>,
 }
@@ -234,6 +239,7 @@ impl DaemonService {
         let startup = store.begin_daemon_run()?;
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone(), intents, schedulers)),
+            watch_status: Mutex::default(),
             snapshots: Mutex::new(Snapshots::new()),
             discovery_capacity: Arc::new(Semaphore::new(2)),
             db,
@@ -414,6 +420,9 @@ async fn dispatch(
     } else if method.starts_with("scheduler.") {
         let call = scheduler_rpc::SchedulerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if method.starts_with("watch.") || method == "worker.profile.setCodeRestart" {
+        let call = watch_rpc::WatchCall::decode(method, params)?;
+        tokio::task::spawn_blocking(move || call.execute(&service))
     } else {
         let call = WorkerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
@@ -483,6 +492,7 @@ impl ProjectCall {
                     ));
                 }
                 let request = request_key("project.add", &params)?;
+                let _workers = service.workers.lock().map_err(|_| internal_error())?;
                 let (operation_id, result) = store
                     .mutate(params.idempotency_key, &request, |store| {
                         let project = Project::register(&params.path)?;

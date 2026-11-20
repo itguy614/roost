@@ -1,0 +1,13 @@
+[package]
+name = "roost-watch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+globset = "0.4"
+notify = "8"
+roost-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

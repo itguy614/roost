@@ -1,6 +1,7 @@
 pub mod discovery;
 pub mod endpoint;
 pub mod scheduler;
+pub mod watch;
 pub mod workers;
 
 use std::{
@@ -47,6 +48,10 @@ pub const METHODS: &[&str] = &[
     "project.restart",
     "worker.profile.create",
     "worker.profile.list",
+    "worker.profile.setCodeRestart",
+    "watch.status",
+    "watch.enable",
+    "watch.disable",
     "process.list",
     "log.tail",
 ];
