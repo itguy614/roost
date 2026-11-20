@@ -6,9 +6,17 @@ Resolution order is an explicit executable, an explicitly selected provider, the
 
 ## CLI demo
 
-Start the local daemon and register a trusted development Laravel project with its dependencies installed. Use the UUID in the registration response.
+From the repository root in Terminal 1, build both binaries and start the daemon. Leave it running after it prints `Roost IPC is ready`.
 
 ```sh
+cargo build --workspace --locked
+target/debug/roost-daemon
+```
+
+Open Terminal 2 in the same repository and confirm `daemon status` returns JSON. Register a trusted development Laravel project with its dependencies installed. Use the UUID from `result.id` in the registration response.
+
+```sh
+target/debug/roost daemon status
 target/debug/roost project add /path/to/laravel
 target/debug/roost provider list
 target/debug/roost provider detect PROJECT_UUID
@@ -20,7 +28,7 @@ target/debug/roost queue suggestions PROJECT_UUID high default
 target/debug/roost worker profile list PROJECT_UUID
 ```
 
-Use `--state-dir` before the command if your daemon uses a custom state directory. Add `--php /absolute/path/to/php` to discovery to use a specific executable, or use `--provider system` when system PHP is installed. `queue connections` returns `null` until discovery succeeds. Profile listing shows that discovery creates no workers or profiles.
+The default state directory on macOS is `~/Library/Application Support/Roost`. If you started the daemon with a custom `--state-dir`, pass the same absolute directory before the CLI subcommand. A missing socket usually means the daemon has yet to start for that directory. Add `--php /absolute/path/to/php` to discovery to use a specific executable, or use `--provider system` when system PHP is installed. `queue connections` returns `null` until discovery succeeds. Profile listing shows that discovery creates no workers or profiles.
 
 ## Effective connection discovery
 

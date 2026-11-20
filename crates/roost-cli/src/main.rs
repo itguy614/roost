@@ -3,7 +3,7 @@ mod workers;
 
 use std::{ffi::OsString, io, path::PathBuf, process::ExitCode};
 
-use roost_ipc::{AddParams, Client, RemoveParams};
+use roost_ipc::{AddParams, Client, ClientError, RemoveParams, endpoint::SOCKET_NAME};
 use uuid::Uuid;
 
 const USAGE: &str = "Usage:
@@ -90,7 +90,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let mut client = Client::connect(&dir).await?;
+        let mut client = match Client::connect(&dir).await {
+            Ok(client) => client,
+            Err(ClientError::Io(error))
+                if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) =>
+            {
+                return Err(io::Error::new(error.kind(), format!(
+                    "cannot reach the Roost daemon at {} ({error}). Start roost-daemon in another terminal. If using --state-dir, pass the same directory to both commands.",
+                    dir.join(SOCKET_NAME).display(),
+                )).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let result = match command {
             Command::Status => serde_json::to_value(client.status().await?)?,
             Command::Add(path) => serde_json::to_value(
