@@ -29,8 +29,13 @@ static SENSITIVE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub struct OutputPipe<R> {
-    reader: R,
+    reader: Option<R>,
     capture: Capture,
+}
+
+pub struct DrainResult {
+    pub saw_output: bool,
+    pub complete: bool,
 }
 
 impl<R: Read + AsRawFd> OutputPipe<R> {
@@ -42,40 +47,65 @@ impl<R: Read + AsRawFd> OutputPipe<R> {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
-            reader,
+            reader: Some(reader),
             capture: Capture::default(),
         })
     }
+}
 
-    /// Read at most 64 KiB per tick and never wait for inherited pipe writers.
+impl<R: Read> OutputPipe<R> {
+    /// Read at most 64 KiB per tick. Hitting the budget leaves the same
+    /// capture open so a partial line can continue on the next tick.
     pub fn drain(
         &mut self,
         stream: OutputStream,
         status: &WorkerStatus,
         entries: &mut VecDeque<OutputSummary>,
-        finished: bool,
-    ) -> bool {
+        guardian_exited: bool,
+    ) -> DrainResult {
+        let Some(reader) = &mut self.reader else {
+            return DrainResult {
+                saw_output: false,
+                complete: true,
+            };
+        };
         let mut buffer = [0; 8192];
-        let mut seen = false;
+        let mut result = DrainResult {
+            saw_output: false,
+            complete: false,
+        };
         for _ in 0..8 {
-            match self.reader.read(&mut buffer) {
+            match reader.read(&mut buffer) {
                 Ok(0) => {
-                    self.capture.finish(stream, status, entries);
+                    result.complete = true;
                     break;
                 }
                 Ok(count) => {
-                    seen = true;
+                    result.saw_output = true;
                     self.capture
                         .append(&buffer[..count], stream, status, entries);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // A writer outside the worker group may still hold the pipe open.
+                    result.complete = guardian_exited;
+                    break;
+                }
+                Err(_) => {
+                    // The remaining bytes are inaccessible. Drop an incomplete line.
+                    self.reader = None;
+                    return DrainResult {
+                        complete: true,
+                        ..result
+                    };
+                }
             }
         }
-        if finished {
+        if result.complete {
             self.capture.finish(stream, status, entries);
+            self.reader = None;
         }
-        seen
+        result
     }
 }
 
@@ -259,5 +289,73 @@ mod tests {
         }
         assert_eq!(entries.len(), LINES_PER_STREAM + 2);
         assert_eq!(entries[1].text, "#0 source.php");
+    }
+
+    #[test]
+    fn exit_drain_keeps_tail_and_redacts_a_line_split_at_the_read_budget() {
+        use std::io::Cursor;
+
+        // Put the credential key across the 64 KiB boundary. The next reads
+        // must complete the line before applying redaction and retain the stack tail.
+        let mut data = b"padding\n".repeat(8191);
+        data.extend_from_slice(b"DB_PASSW");
+        assert_eq!(data.len(), 64 * 1024);
+        data.extend_from_slice(
+            b"ORD=sample-private-value\nRuntimeException: failed\n#0 worker.php:42",
+        );
+        let mut pipe = OutputPipe {
+            reader: Some(Cursor::new(data)),
+            capture: Capture::default(),
+        };
+        let status = status();
+        let mut entries = VecDeque::new();
+
+        let first = pipe.drain(OutputStream::Stderr, &status, &mut entries, true);
+        assert!(first.saw_output && !first.complete);
+        assert_eq!(entries.back().unwrap().text, "padding");
+
+        let second = pipe.drain(OutputStream::Stderr, &status, &mut entries, true);
+        assert!(second.saw_output && second.complete);
+        let tail: Vec<_> = entries
+            .iter()
+            .rev()
+            .take(3)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            tail,
+            ["#0 worker.php:42", "RuntimeException: failed", REDACTED]
+        );
+        assert_eq!(entries.back().unwrap().newlines, 0);
+
+        let third = pipe.drain(OutputStream::Stderr, &status, &mut entries, true);
+        assert!(!third.saw_output && third.complete);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|line| line.text == "#0 worker.php:42")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn exit_drain_finishes_when_an_inherited_writer_keeps_the_pipe_open() {
+        use std::{io::Write, os::unix::net::UnixStream};
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let mut pipe = OutputPipe::new(reader).unwrap();
+        writer.write_all(b"#0 worker.php:42").unwrap();
+        let status = status();
+        let mut entries = VecDeque::new();
+
+        let running = pipe.drain(OutputStream::Stderr, &status, &mut entries, false);
+        assert!(running.saw_output && !running.complete);
+        assert!(entries.is_empty());
+
+        let exited = pipe.drain(OutputStream::Stderr, &status, &mut entries, true);
+        assert!(!exited.saw_output && exited.complete);
+        assert_eq!(entries[0].text, "#0 worker.php:42");
+        assert_eq!(entries[0].newlines, 0);
     }
 }

@@ -1,6 +1,7 @@
 // Built by the integration tests as an executable PHP stand-in.
 use std::{
     fs,
+    io::{self, Write},
     process::{Command, ExitCode},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -44,9 +45,9 @@ fn main() -> ExitCode {
         "fail" => return ExitCode::from(7),
         "clean_exit" => return ExitCode::SUCCESS,
         "trace_fail" => {
-            eprintln!("RuntimeException: queue connection unavailable");
-            eprintln!("DB_PASSWORD=secret-fixture-output");
-            eprintln!("#0 src/Queue.php(20): connect()");
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(&[b'x'; 96 * 1024]).unwrap();
+            stderr.write_all(b"\nRuntimeException: queue connection unavailable\nDB_PASSWORD=secret-fixture-output\n#0 src/Queue.php(20): connect()").unwrap();
             return ExitCode::from(7);
         }
         _ => {}

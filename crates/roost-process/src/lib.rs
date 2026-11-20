@@ -11,7 +11,7 @@ use roost_core::worker_runtime::{MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCE
 use roost_core::{Project, WorkerProfile, worker_runtime::LaunchFailure};
 
 mod output;
-pub use output::OutputPipe;
+pub use output::{DrainResult, OutputPipe};
 
 #[cfg(target_os = "macos")]
 mod macos;

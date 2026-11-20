@@ -11,6 +11,7 @@ use roost_core::{
         StopCause, WorkerLease, WorkerLeaseState, WorkerStatus,
     },
 };
+use roost_process::DrainResult;
 use roost_store::Store;
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ use super::{Error, verify_horizon};
 use crate::{backoff, guardian::Guardian};
 
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(10);
+const EXIT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 const MAX_LAUNCH_ATTEMPTS: u8 = 3;
 
 pub(super) struct Slot {
@@ -33,6 +35,7 @@ pub(super) struct Slot {
     last_output_at: Instant,
     stderr_seen: bool,
     startup_timed_out: bool,
+    draining_since: Option<Instant>,
     launch_failures: u8,
 }
 
@@ -63,6 +66,7 @@ impl Slot {
             last_output_at: Instant::now(),
             stderr_seen: false,
             startup_timed_out: false,
+            draining_since: None,
             launch_failures: 0,
         }
     }
@@ -162,6 +166,7 @@ impl Slot {
         self.status.launch_failure = None;
         self.stderr_seen = false;
         self.startup_timed_out = false;
+        self.draining_since = None;
         self.retry_at = None;
         self.since = Instant::now();
         match Guardian::spawn(binary, db, &lease, &self.php) {
@@ -196,26 +201,46 @@ impl Slot {
                 return Ok(());
             }
         };
-        let stdout = guardian.stdout.as_mut().is_some_and(|pipe| {
+        let guardian_exited = exit.is_some();
+        let absent = || DrainResult {
+            saw_output: false,
+            complete: true,
+        };
+        let stdout = guardian.stdout.as_mut().map_or_else(absent, |pipe| {
             pipe.drain(
                 OutputStream::Stdout,
                 &self.status,
                 &mut self.output,
-                exit.is_some(),
+                guardian_exited,
             )
         });
-        let stderr = guardian.stderr.as_mut().is_some_and(|pipe| {
+        let stderr = guardian.stderr.as_mut().map_or_else(absent, |pipe| {
             pipe.drain(
                 OutputStream::Stderr,
                 &self.status,
                 &mut self.output,
-                exit.is_some(),
+                guardian_exited,
             )
         });
-        self.stderr_seen |= stderr;
-        if stdout || stderr {
+        self.stderr_seen |= stderr.saw_output;
+        if stdout.saw_output || stderr.saw_output {
             self.last_output_at = Instant::now();
         }
+
+        let mut output_incomplete = false;
+        if guardian_exited && !(stdout.complete && stderr.complete) {
+            let since = self.draining_since.get_or_insert_with(Instant::now);
+            self.status.identity = None;
+            self.status.state = ObservedState::Stopping;
+            self.status.reason = Some("guardian exited; collecting buffered worker output".into());
+            if since.elapsed() < EXIT_DRAIN_WINDOW {
+                return Ok(());
+            }
+            // Avoid holding the lease open if an escaped writer keeps sending data.
+            // Finalizing the lease drops the pipes and any unfinished capture.
+            output_incomplete = true;
+        }
+
         if exit.is_none() && self.status.state == ObservedState::Running {
             if self.since.elapsed() >= backoff::STABLE_RUN {
                 self.status.rapid_failures = 0;
@@ -272,7 +297,14 @@ impl Slot {
                     profile_id: self.status.profile_id,
                     slot: self.status.slot,
                     exit,
-                    reason: exit_reason(exit, self.stderr_seen),
+                    reason: if output_incomplete {
+                        format!(
+                            "{}; output drain timed out",
+                            exit_reason(exit, self.stderr_seen)
+                        )
+                    } else {
+                        exit_reason(exit, self.stderr_seen)
+                    },
                     output: self
                         .output
                         .iter()
