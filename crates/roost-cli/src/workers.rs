@@ -1,8 +1,9 @@
-use std::{ffi::OsString, io, path::PathBuf};
+use std::{ffi::OsString, io};
 
-use roost_core::ProjectId;
+use crate::discovery::{absolute_utf8, parse_id, selection_params, utf8};
 use roost_ipc::{
     Client,
+    discovery::ResolvePhpParams,
     workers::{
         AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
     },
@@ -17,9 +18,12 @@ pub enum Command {
     Logs(ProjectParams),
     Crashes(ProjectParams),
     Autostart(AutostartParams),
-    Start(LaunchParams),
+    Launch {
+        php: ResolvePhpParams,
+        restart: bool,
+        allow_horizon: bool,
+    },
     Stop(StopParams),
-    Restart(LaunchParams),
 }
 
 impl Command {
@@ -28,22 +32,24 @@ impl Command {
             return Ok(None);
         };
         let command = match (noun.to_str(), verb.to_str(), rest) {
-            (Some("project"), Some("start" | "restart"), [id, php, flags @ ..]) => {
-                let allow_horizon = match flags {
-                    [] => false,
-                    [flag] if flag == "--allow-horizon" => true,
-                    _ => return Err(io::Error::other("expected optional --allow-horizon")),
+            (Some("project"), Some("start" | "restart"), [id, options @ ..]) => {
+                let (allow_horizon, options) = match options.split_last() {
+                    Some((flag, rest)) if flag == "--allow-horizon" => (true, rest),
+                    _ => (false, options),
                 };
-                let params = LaunchParams {
-                    id: parse_id(id)?,
-                    php: absolute_utf8(php)?,
+                let id = parse_id(id)?;
+                let php = match options {
+                    [path] if !path.to_string_lossy().starts_with("--") => ResolvePhpParams {
+                        id,
+                        provider: None,
+                        php: Some(absolute_utf8(path)?),
+                    },
+                    options => selection_params(id, options)?,
+                };
+                Self::Launch {
+                    php,
+                    restart: verb == "restart",
                     allow_horizon,
-                    idempotency_key: Some(Uuid::new_v4()),
-                };
-                if verb == "start" {
-                    Self::Start(params)
-                } else {
-                    Self::Restart(params)
                 }
             }
             (Some("project"), Some("autostart"), [id, value]) => {
@@ -109,29 +115,31 @@ impl Command {
             Self::Autostart(params) => serde_json::to_value(client.set_autostart(&params).await?)?,
             Self::Crashes(params) => serde_json::to_value(client.recent_crashes(&params).await?)?,
             Self::Logs(params) => serde_json::to_value(client.tail_logs(&params).await?)?,
-            Self::Start(params) => serde_json::to_value(client.start_project(&params).await?)?,
+            Self::Launch {
+                php,
+                restart,
+                allow_horizon,
+            } => {
+                // Explicit paths retain the original IPC path. Default/provider
+                // resolution is a separate request, before taking lifecycle locks.
+                let path = match &php.php {
+                    Some(path) => path.clone(),
+                    None => client.resolve_php(&php).await?.path,
+                };
+                let params = LaunchParams {
+                    id: php.id,
+                    php: path,
+                    allow_horizon,
+                    idempotency_key: Some(Uuid::new_v4()),
+                };
+                let intent = if restart {
+                    client.restart_project(&params).await?
+                } else {
+                    client.start_project(&params).await?
+                };
+                serde_json::to_value(intent)?
+            }
             Self::Stop(params) => serde_json::to_value(client.stop_project(&params).await?)?,
-            Self::Restart(params) => serde_json::to_value(client.restart_project(&params).await?)?,
         })
     }
-}
-
-fn utf8(argument: &OsString) -> io::Result<&str> {
-    argument
-        .to_str()
-        .ok_or_else(|| io::Error::other("argument must be valid UTF-8"))
-}
-
-fn absolute_utf8(argument: &OsString) -> io::Result<PathBuf> {
-    let path = std::path::absolute(argument)?;
-    if path.to_str().is_none() {
-        return Err(io::Error::other("PHP path must be valid UTF-8"));
-    }
-    Ok(path)
-}
-
-fn parse_id(argument: &OsString) -> io::Result<ProjectId> {
-    Uuid::parse_str(utf8(argument)?)
-        .map(ProjectId)
-        .map_err(|_| io::Error::other("project ID must be a UUID"))
 }

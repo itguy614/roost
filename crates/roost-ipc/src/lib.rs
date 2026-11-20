@@ -1,3 +1,4 @@
+pub mod discovery;
 pub mod endpoint;
 pub mod workers;
 
@@ -21,6 +22,12 @@ pub const VERSION: u32 = 1;
 pub const METHODS: &[&str] = &[
     "daemon.hello",
     "daemon.status",
+    "provider.list",
+    "provider.detect",
+    "provider.resolvePhp",
+    "queue.connections",
+    "queue.discover",
+    "queue.suggestions",
     "project.list",
     "project.add",
     "project.get",
@@ -49,6 +56,11 @@ pub const VERSION_MISMATCH: i32 = -32001;
 pub const FRAME_TOO_LARGE: i32 = -32002;
 pub const NOT_FOUND: i32 = -32003;
 pub const CONFLICT: i32 = -32004;
+
+pub const DISCOVERY_UNAVAILABLE: i32 = -32005;
+pub const DISCOVERY_TIMEOUT: i32 = -32006;
+pub const DISCOVERY_OUTPUT_LIMIT: i32 = -32007;
+pub const DISCOVERY_BUSY: i32 = -32008;
 
 #[derive(Debug, Serialize, Deserialize, thiserror::Error)]
 #[error("{message} (RPC {code})")]

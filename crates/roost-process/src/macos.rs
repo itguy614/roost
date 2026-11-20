@@ -150,7 +150,7 @@ fn supervise(
     })
 }
 
-fn exited(pid: libc::pid_t) -> io::Result<bool> {
+pub(crate) fn exited(pid: libc::pid_t) -> io::Result<bool> {
     // SAFETY: waitid fills the initialized siginfo and WNOWAIT preserves the child PID.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let result = unsafe {
@@ -207,7 +207,7 @@ fn signal(pid: libc::pid_t, expected: ProcessIdentity, sig: i32) -> io::Result<(
     }
 }
 
-fn send_group(pid: libc::pid_t, signal: i32) -> io::Result<()> {
+pub(crate) fn send_group(pid: libc::pid_t, signal: i32) -> io::Result<()> {
     // SAFETY: pid is the positive PID of our unreaped session leader.
     if unsafe { libc::kill(-pid, signal) } < 0 {
         let error = io::Error::last_os_error();
@@ -218,7 +218,7 @@ fn send_group(pid: libc::pid_t, signal: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn group_has_live_members(leader: libc::pid_t) -> io::Result<bool> {
+pub(crate) fn group_has_live_members(leader: libc::pid_t) -> io::Result<bool> {
     let mut pids = [0_i32; 512];
     let size = size_of_val(&pids) as i32;
     // SAFETY: proc_listpids writes at most size bytes to the PID array.

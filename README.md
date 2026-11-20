@@ -49,7 +49,7 @@ See [IPC v1](docs/ipc-v1.md), [storage and domain schema](docs/storage.md), and 
 
 ## Run a queue worker on macOS
 
-Start the daemon as above and register a Laravel app with a configured queue connection. Use the project UUID returned by `project add` and the absolute path of the PHP executable for that project.
+Start the daemon as above and register a Laravel app with a configured queue connection. Use the project UUID returned by `project add`. Roost uses Herd by default when the PHP path is omitted. You can also pass an explicit executable or select `--provider system`. See [Laravel runtime and queue discovery](docs/laravel-discovery.md) for the discovery commands and a demo.
 
 ```sh
 target/debug/roost project add /path/to/laravel

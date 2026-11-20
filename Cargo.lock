@@ -213,6 +213,7 @@ dependencies = [
  "roost-core",
  "roost-ipc",
  "roost-process",
+ "roost-providers",
  "roost-store",
  "serde",
  "serde_json",
@@ -243,6 +244,20 @@ dependencies = [
  "libc",
  "regex",
  "roost-core",
+ "thiserror",
+]
+
+[[package]]
+name = "roost-providers"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "roost-core",
+ "roost-process",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

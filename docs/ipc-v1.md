@@ -14,6 +14,12 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `project.add` | Absolute UTF-8 `path`, optional UUID `idempotency_key` | `operation_id` and `result` containing the created project |
 | `project.get` | Project UUID `id` | Project record |
 | `project.remove` | Project UUID `id`, optional UUID `idempotency_key` | `operation_id` and `result` containing the removed record's `id` |
+| `provider.list` | Omit or use `{}` | Supported provider names |
+| `provider.detect` | Project UUID `id` | Preferred provider, Herd and system availability, and whether an override is configured |
+| `provider.resolvePhp` | Project UUID `id`, optional `provider` or absolute `php` override | Validated executable `path` and `source` |
+| `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` |
+| `queue.discover` | Same parameters as `provider.resolvePhp` | Fresh snapshot with default connection, connection names and drivers, omission count, observation time, and PHP source |
+| `queue.suggestions` | Project UUID `id`, optional `explicit` string array | Incomplete symbolic name suggestions with sources, ordered configured profile queues, and scan coverage flags |
 | `worker.profile.create` | `project_id`, `name`, `connection`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new profile |
 | `worker.profile.list` | Project UUID `id` | Configured worker profiles |
 | `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
@@ -56,5 +62,11 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32002` | Request or response exceeds its size limit |
 | `-32003` | Project not found |
 | `-32004` | Already registered, mutation identity or revision conflict, or a worker safety constraint |
+| `-32005` | PHP provider or discovery unavailable, or the probe failed or returned invalid data |
+| `-32006` | Probe timed out |
+| `-32007` | Probe output exceeded its limit |
+| `-32008` | All discovery slots are busy |
 
 The endpoint uses a user-owned state directory with mode `0700`, a socket with mode `0600`, peer UID validation, and an exclusive lock for the daemon. The server accepts up to 32 active connections. Requests are capped at 64 KiB and responses at 4 MiB, excluding delimiters. Reads and writes have five-second deadlines. The server closes idle connections and connections that send an oversized request.
+
+See [Laravel runtime and queue discovery](laravel-discovery.md) for selection precedence, limits, and the bootstrap trust boundary.
