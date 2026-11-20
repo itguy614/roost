@@ -68,28 +68,54 @@ impl Command {
 }
 
 pub fn selection_params(id: ProjectId, options: &[OsString]) -> io::Result<ResolvePhpParams> {
-    let mut params = ResolvePhpParams {
-        id,
-        provider: None,
-        php: None,
-    };
-    match options {
-        [] => (),
-        [flag, path] if flag == "--php" => params.php = Some(absolute_utf8(path)?),
+    Ok(parse_selection(options)?.for_project(id))
+}
+
+pub enum PhpSelection {
+    Configured,
+    Explicit(PathBuf),
+    Provider(PhpProvider),
+}
+
+impl PhpSelection {
+    pub fn for_project(&self, id: ProjectId) -> ResolvePhpParams {
+        match self {
+            Self::Configured => ResolvePhpParams {
+                id,
+                provider: None,
+                php: None,
+            },
+            Self::Explicit(path) => ResolvePhpParams {
+                id,
+                provider: None,
+                php: Some(path.clone()),
+            },
+            Self::Provider(provider) => ResolvePhpParams {
+                id,
+                provider: Some(*provider),
+                php: None,
+            },
+        }
+    }
+}
+
+pub fn parse_selection(options: &[OsString]) -> io::Result<PhpSelection> {
+    Ok(match options {
+        [] => PhpSelection::Configured,
+        [flag, path] if flag == "--php" => PhpSelection::Explicit(absolute_utf8(path)?),
         [flag, provider] if flag == "--provider" => {
-            params.provider = Some(match provider.to_str() {
+            PhpSelection::Provider(match provider.to_str() {
                 Some("herd") => PhpProvider::Herd,
                 Some("system") => PhpProvider::System,
                 _ => return Err(io::Error::other("provider must be herd or system")),
-            });
+            })
         }
         _ => {
             return Err(io::Error::other(
                 "expected one of --php PATH or --provider herd|system",
             ));
         }
-    }
-    Ok(params)
+    })
 }
 
 pub fn utf8(argument: &OsString) -> io::Result<&str> {

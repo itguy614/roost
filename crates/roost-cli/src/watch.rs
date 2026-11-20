@@ -90,7 +90,7 @@ impl Command {
     }
 }
 
-fn revision(value: &OsString) -> io::Result<Revision> {
+pub(crate) fn revision(value: &OsString) -> io::Result<Revision> {
     utf8(value)?
         .parse::<NonZeroU32>()
         .map(|revision| Revision(revision.get()))

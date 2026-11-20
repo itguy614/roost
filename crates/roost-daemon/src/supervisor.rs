@@ -21,6 +21,7 @@ use roost_store::Store;
 mod scheduler;
 mod slot;
 use crate::supervised::SupervisedProfile;
+pub(crate) use scheduler::SchedulerPlan;
 use scheduler::Schedulers;
 use slot::{Slot, status_for};
 
@@ -93,6 +94,35 @@ impl Supervisor {
         self.projects
             .get(&id)
             .map_or(DesiredState::Stopped, |project| project.desired)
+    }
+
+    pub(crate) fn available_capacity(&self) -> usize {
+        let occupied = self
+            .projects
+            .values()
+            .map(ProjectRuntime::reserved_capacity)
+            .sum::<usize>()
+            + self.schedulers.reserved_capacity(None);
+        MAX_ACTIVE.saturating_sub(occupied)
+    }
+
+    pub(crate) fn additional_capacity(
+        &self,
+        id: ProjectId,
+        workers: Option<&Plan>,
+        scheduler: Option<&SchedulerPlan>,
+    ) -> usize {
+        let current = self
+            .projects
+            .get(&id)
+            .map_or(0, ProjectRuntime::reserved_capacity);
+        let worker_growth = workers.map_or(0, |plan| plan.slots.len().saturating_sub(current));
+        let scheduler_growth = usize::from(
+            scheduler.is_some()
+                && self.schedulers.reserved_capacity(None)
+                    == self.schedulers.reserved_capacity(Some(id)),
+        );
+        worker_growth + scheduler_growth
     }
 
     pub fn validate_mutation(&self) -> Result<(), Error> {

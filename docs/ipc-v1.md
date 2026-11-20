@@ -40,6 +40,14 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit, `reason`, optional `launch_failure`, and recovery block |
 | `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
 | `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
+| `group.list` | Omit or use `{}` | Array of group records |
+| `group.get` | Group UUID `id` | Group record and member projects with saved worker intent and nullable scheduler intent |
+| `group.create` | `name`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new group |
+| `group.update` | Group UUID `id`, `expected_revision`, `name`, complete `options`, optional UUID `idempotency_key` | Mutation result containing the updated group |
+| `group.delete` | Group UUID `id`, `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the deleted group UUID |
+| `group.addProject`, `group.removeProject` | Group UUID `id`, `project_id`, group `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the group and its members |
+| `group.start`, `group.restart` | Group UUID `id`, group `expected_revision`, `launches` with distinct member `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with a per-project outcome |
+| `group.stop` | Group UUID `id`, optional UUID `idempotency_key` | Mutation result acknowledging per-project stop intent |
 
 Worker profile `options` accepts the following fields and defaults.
 
@@ -59,6 +67,8 @@ Scheduler options are `enabled` (defaults to true), `crash_restart` (defaults to
 
 Watch rules contain `include` and `exclude` arrays of relative globs. Omitting `rules` preserves the saved rules. Watch state is `disabled`, `initializing`, `watching`, or `degraded`. The project watcher and profile policy both default to off. Changing a profile policy requires the project's queue workers to be stopped and their leases cleaned up. File-owned settings and stale revisions return conflicts. See [file watching](file-watching.md).
 
+The optional `watch.status.shared` array lists every configured group directory targeting that project, with `group_id`, the group-relative `path`, `state`, `pending`, and nullable `problem`. The top-level state describes the local watcher. The project's watch opt-in controls both local and shared watching. When the project is opted out, its shared entries have state `disabled` and `pending: false`, even if a directory is watched for other targets. Group options contain optional `root_path`, `watch_rules`, and `shared_paths` entries with a relative directory `path` and explicit `projects` UUIDs. Group lifecycle results contain `id` and a `projects` array. Each entry has a project `id` and a `status` of `accepted` with `workers` and `scheduler` flags, `unchanged`, or `failed` with a structured `error`. Acceptance records intent. Poll the usual worker and scheduler status methods for observed state.
+
 The `startup` field is `first_start`, `after_clean_shutdown`, or `after_interrupted_shutdown`. Worker exits can also include a `stop_cause` such as `project_stop`, `project_restart`, `daemon_shutdown`, or `daemon_disconnected`. Startup failure classifications include `validation`, `spawn_rejected`, `resource_unavailable`, `readiness_timeout`, `state_publication`, and `cancelled`. The response fields and methods are additive to IPC v1.
 
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
@@ -75,7 +85,7 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32000` | Handshake required |
 | `-32001` | Unsupported protocol version, with `error.data.supported` |
 | `-32002` | Request or response exceeds its size limit |
-| `-32003` | Project or profile not found |
+| `-32003` | Project, profile, or group not found |
 | `-32004` | Already registered, mutation identity or revision conflict, or a worker safety constraint |
 | `-32005` | PHP provider or discovery unavailable, or the probe failed or returned invalid data |
 | `-32006` | Probe timed out |

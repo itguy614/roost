@@ -1,4 +1,5 @@
 mod discovery;
+mod groups;
 mod scheduler;
 mod watch;
 mod workers;
@@ -39,7 +40,16 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] scheduler restart ID [PHP_PATH | --provider herd|system]
   roost [--state-dir ABSOLUTE_PATH] scheduler stop ID
   roost [--state-dir ABSOLUTE_PATH] scheduler logs ID
-  roost [--state-dir ABSOLUTE_PATH] scheduler crashes ID";
+  roost [--state-dir ABSOLUTE_PATH] scheduler crashes ID
+  roost [--state-dir ABSOLUTE_PATH] group list
+  roost [--state-dir ABSOLUTE_PATH] group get ID
+  roost [--state-dir ABSOLUTE_PATH] group create NAME [--options-json JSON]
+  roost [--state-dir ABSOLUTE_PATH] group update ID NAME --revision REV --options-json JSON
+  roost [--state-dir ABSOLUTE_PATH] group delete ID --revision REV
+  roost [--state-dir ABSOLUTE_PATH] group add-project ID PROJECT_ID --revision REV
+  roost [--state-dir ABSOLUTE_PATH] group remove-project ID PROJECT_ID --revision REV
+  roost [--state-dir ABSOLUTE_PATH] group start|restart ID [--php PATH | --provider herd|system] [--allow-horizon]
+  roost [--state-dir ABSOLUTE_PATH] group stop ID";
 
 enum Command {
     Status,
@@ -48,19 +58,22 @@ enum Command {
     Remove(Uuid),
     Worker(workers::Command),
     Discovery(discovery::Command),
+    Group(groups::Command),
     Scheduler(scheduler::Command),
     Watch(watch::Command),
 }
 
 fn main() -> ExitCode {
-    if let Err(error) = run() {
-        eprintln!("roost: {error}");
-        return ExitCode::FAILURE;
+    match run() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("roost: {error}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let (dir, args) = match args.as_slice() {
         [flag, dir, rest @ ..] if flag == "--state-dir" => (Some(PathBuf::from(dir)), rest),
@@ -69,7 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = match args {
         [help] if help == "-h" || help == "--help" => {
             println!("{USAGE}");
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         [noun, verb] if noun == "daemon" && verb == "status" => Command::Status,
         [noun, verb] if noun == "project" && verb == "list" => Command::List,
@@ -90,6 +103,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             if let Some(command) = discovery::Command::parse(args)? {
                 Command::Discovery(command)
+            } else if let Some(command) = groups::Command::parse(args)? {
+                Command::Group(command)
             } else if let Some(command) = scheduler::Command::parse(args)? {
                 Command::Scheduler(command)
             } else if let Some(command) = watch::Command::parse(args)? {
@@ -121,6 +136,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) => return Err(error.into()),
         };
+        let mut failed = false;
         let result = match command {
             Command::Status => serde_json::to_value(client.status().await?)?,
             Command::Add(path) => serde_json::to_value(
@@ -142,10 +158,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
+            Command::Group(command) => {
+                let (result, partial_failure) = command.execute(&mut client).await?;
+                failed = partial_failure;
+                result
+            }
             Command::Scheduler(command) => command.execute(&mut client).await?,
             Command::Watch(command) => command.execute(&mut client).await?,
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
-        Ok(())
+        Ok(if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
     })
 }

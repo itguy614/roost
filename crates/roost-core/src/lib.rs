@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -71,9 +72,53 @@ pub struct Group {
     pub name: String,
     pub root_path: Option<PathBuf>,
     pub watch_rules: WatchRules,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_paths: Vec<SharedWatchPath>,
     pub created_at: u64,
     pub updated_at: u64,
     pub revision: Revision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedWatchPath {
+    pub path: PathBuf,
+    pub projects: Vec<ProjectId>,
+}
+
+impl SharedWatchPath {
+    fn validate_path(&self) -> Result<(), ValidationError> {
+        if self.path.as_os_str().is_empty()
+            || self
+                .path
+                .to_str()
+                .is_none_or(|path| path.chars().any(char::is_control))
+            || self
+                .path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(ValidationError(
+                "shared paths must be nonempty relative directories",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn directory(&self, root: &Path) -> Result<PathBuf, ValidationError> {
+        self.validate_path()?;
+        let path = root.join(&self.path);
+        if path
+            .canonicalize()
+            .is_ok_and(|real| real == path && real.is_dir())
+        {
+            Ok(path)
+        } else {
+            Err(ValidationError(
+                "shared path must be an existing directory without symlinks under the group root",
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +226,7 @@ impl Group {
             name,
             root_path: None,
             watch_rules: WatchRules::default(),
+            shared_paths: Vec::new(),
             created_at: now,
             updated_at: now,
             revision: Revision(1),
@@ -193,6 +239,17 @@ impl Group {
         validate_name(&self.name)?;
         if let Some(path) = &self.root_path {
             validate_path(path)?;
+        } else if !self.shared_paths.is_empty() {
+            return Err(ValidationError("shared watch paths require a group root"));
+        }
+        for mapping in &self.shared_paths {
+            mapping.validate_path()?;
+            let distinct: HashSet<_> = mapping.projects.iter().collect();
+            if mapping.projects.is_empty() || distinct.len() != mapping.projects.len() {
+                return Err(ValidationError(
+                    "each shared watch path requires distinct target projects",
+                ));
+            }
         }
         if self.updated_at < self.created_at {
             return Err(ValidationError("group update timestamp predates creation"));

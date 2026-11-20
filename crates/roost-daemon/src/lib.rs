@@ -1,5 +1,6 @@
 mod backoff;
 mod discovery_rpc;
+mod group_rpc;
 pub mod guardian;
 mod scheduler_rpc;
 mod supervised;
@@ -423,6 +424,9 @@ async fn dispatch(
     } else if method.starts_with("scheduler.") {
         let call = scheduler_rpc::SchedulerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if method.starts_with("group.") {
+        let call = group_rpc::GroupCall::decode(method, params)?;
+        tokio::task::spawn_blocking(move || call.execute(&service))
     } else if method.starts_with("watch.") || method == "worker.profile.setCodeRestart" {
         let call = watch_rpc::WatchCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
@@ -497,12 +501,24 @@ impl ProjectCall {
                 let request = request_key("project.add", &params)?;
                 let _workers = service.workers.lock().map_err(|_| internal_error())?;
                 let (operation_id, result) = store
-                    .mutate(params.idempotency_key, &request, |store| {
-                        let project = Project::register(&params.path)?;
+                    .try_mutate::<_, supervisor::Error>(params.idempotency_key, &request, |store| {
+                        let project = Project::register(&params.path).map_err(StoreError::from)?;
+                        if store.list_groups()?.iter().any(|group| {
+                            group.root_path.as_ref().is_some_and(|root| {
+                                group
+                                    .shared_paths
+                                    .iter()
+                                    .any(|mapping| root.join(&mapping.path) == project.path)
+                            })
+                        }) {
+                            return Err(supervisor::Error::Conflict(
+                                "the directory is already a shared watch root",
+                            ));
+                        }
                         store.create_project(&project)?;
                         Ok(project)
                     })
-                    .map_err(store_error)?;
+                    .map_err(worker_error)?;
                 encode(Mutation {
                     operation_id,
                     result,
@@ -522,6 +538,14 @@ impl ProjectCall {
                     .try_mutate::<_, supervisor::Error>(params.idempotency_key, &request, |store| {
                         workers.validate_config_change(store, params.id)?;
                         workers.scheduler_clear_for_change(store, params.id)?;
+                        if store
+                            .get_project(params.id)?
+                            .is_some_and(|project| project.group_id.is_some())
+                        {
+                            return Err(supervisor::Error::Conflict(
+                                "remove the project from its group first",
+                            ));
+                        }
                         store.delete_project(params.id)?;
                         apply = true;
                         Ok(Removed { id: params.id })
@@ -575,7 +599,7 @@ fn internal_error() -> RpcError {
 fn store_error(error: StoreError) -> RpcError {
     match error {
         StoreError::Validation(error) => RpcError::new(rpc::INVALID_PARAMS, error.to_string()),
-        StoreError::NotFound => RpcError::new(rpc::NOT_FOUND, "project not found"),
+        StoreError::NotFound => RpcError::new(rpc::NOT_FOUND, "record not found"),
         StoreError::Duplicate => {
             RpcError::new(rpc::CONFLICT, "project directory is already registered")
         }
