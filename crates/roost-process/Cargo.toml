@@ -7,3 +7,4 @@ edition.workspace = true
 libc.workspace = true
 roost-core.workspace = true
 regex = "1"
+thiserror.workspace = true

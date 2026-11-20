@@ -1,4 +1,5 @@
 mod backoff;
+mod discovery_rpc;
 pub mod guardian;
 mod supervisor;
 mod worker_rpc;
@@ -18,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use discovery_rpc::{DiscoveryCall, Snapshots};
 use roost_core::{Project, worker_runtime::DaemonStartup};
 use roost_ipc::{
     self as rpc, AddParams, GetParams, Hello, HelloParams, Mutation, RemoveParams, Removed,
@@ -213,6 +215,8 @@ pub struct DaemonService {
     started: Instant,
     startup: DaemonStartup,
     workers: Mutex<Supervisor>,
+    snapshots: Mutex<Snapshots>,
+    discovery_capacity: Arc<Semaphore>,
 }
 
 impl DaemonService {
@@ -225,6 +229,8 @@ impl DaemonService {
         let startup = store.begin_daemon_run()?;
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone(), intents)),
+            snapshots: Mutex::new(Snapshots::new()),
+            discovery_capacity: Arc::new(Semaphore::new(2)),
             db,
             started: Instant::now(),
             startup,
@@ -389,12 +395,23 @@ async fn dispatch(
     let job = if methods.contains(&method) {
         let call = ProjectCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if method.starts_with("provider.") || method.starts_with("queue.") {
+        let call = DiscoveryCall::decode(method, params)?;
+        let permit = call
+            .needs_permit()
+            .then(|| service.discovery_capacity.clone().try_acquire_owned())
+            .transpose()
+            .map_err(|_| RpcError::new(rpc::DISCOVERY_BUSY, "discovery is busy; retry shortly"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            call.execute(&service)
+        })
     } else {
         let call = WorkerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
     };
     job.await.map_err(|_| {
-        tracing::error!("IPC database task did not complete");
+        tracing::error!("IPC task did not complete");
         internal_error()
     })?
 }

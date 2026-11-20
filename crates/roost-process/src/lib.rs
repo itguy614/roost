@@ -1,5 +1,5 @@
 use std::{
-    ffi::CString,
+    ffi::{CString, OsString},
     io,
     os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -11,7 +11,9 @@ use roost_core::worker_runtime::{MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCE
 use roost_core::{Project, WorkerProfile, worker_runtime::LaunchFailure};
 
 mod output;
+mod probe;
 pub use output::{DrainResult, OutputPipe};
+pub use probe::{ProbeError, run_probe};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -75,8 +77,16 @@ pub fn worker_command(project: &Project, profile: &WorkerProfile, php: &Path) ->
 
 /// Start an absolute executable in a new session. Calling execv directly
 /// prevents execvp from falling back to a shell on an invalid executable.
-pub fn spawn_in_session(mut command: Command) -> io::Result<Child> {
+pub fn spawn_in_session(command: Command) -> io::Result<Child> {
+    spawn_session(command, None)
+}
+
+fn spawn_session(
+    mut command: Command,
+    environment: Option<&[(&str, OsString)]>,
+) -> io::Result<Child> {
     const MAX_ARGV: usize = 16;
+    const MAX_ENV: usize = 16;
     if !Path::new(command.get_program()).is_absolute() {
         return Err(io::Error::other(
             "session executable must use an absolute path",
@@ -89,6 +99,22 @@ pub fn spawn_in_session(mut command: Command) -> io::Result<Child> {
     if args.len() >= MAX_ARGV {
         return Err(io::Error::other("too many session arguments"));
     }
+    let environment = environment
+        .map(|entries| {
+            if entries.len() >= MAX_ENV {
+                return Err(io::Error::other("too many session environment variables"));
+            }
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    let mut entry = key.as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value.as_bytes());
+                    CString::new(entry).map_err(io::Error::from)
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .transpose()?;
     // SAFETY: args are owned before fork. The hook uses stack storage and
     // async-signal-safe syscalls only. Command sets up cwd and stdio before this hook.
     unsafe {
@@ -99,7 +125,16 @@ pub fn spawn_in_session(mut command: Command) -> io::Result<Child> {
             let argv: [*const libc::c_char; MAX_ARGV] = std::array::from_fn(|index| {
                 args.get(index).map_or(ptr::null(), |arg| arg.as_ptr())
             });
-            libc::execv(argv[0], argv.as_ptr());
+            if let Some(values) = &environment {
+                let envp: [*const libc::c_char; MAX_ENV] = std::array::from_fn(|index| {
+                    values
+                        .get(index)
+                        .map_or(ptr::null(), |value| value.as_ptr())
+                });
+                libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+            } else {
+                libc::execv(argv[0], argv.as_ptr());
+            }
             Err(io::Error::last_os_error())
         });
     }

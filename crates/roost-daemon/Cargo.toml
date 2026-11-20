@@ -8,6 +8,7 @@ libc.workspace = true
 roost-core.workspace = true
 roost-store.workspace = true
 roost-process.workspace = true
+roost-providers.workspace = true
 thiserror.workspace = true
 roost-ipc.workspace = true
 serde.workspace = true

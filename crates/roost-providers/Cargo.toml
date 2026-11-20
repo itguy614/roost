@@ -1,0 +1,13 @@
+[package]
+name = "roost-providers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
+regex = "1"
+roost-core.workspace = true
+roost-process.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

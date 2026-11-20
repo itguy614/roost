@@ -341,3 +341,5 @@ mod tests {
 }
 
 pub mod worker_runtime;
+
+pub mod discovery;

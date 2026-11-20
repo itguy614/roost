@@ -338,6 +338,20 @@ impl Store {
             .collect()
     }
 
+    pub fn worker_profiles_for_suggestions(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<WorkerProfile>, Error> {
+        self.0
+            .query(
+                c"SELECT data FROM worker_profiles WHERE project_id = ?1 ORDER BY id LIMIT 129",
+                &[Some(&project_id.0.to_string())],
+            )?
+            .iter()
+            .map(|row| serde_json::from_str(row).map_err(Error::from))
+            .collect()
+    }
+
     pub fn update_worker_profile(
         &self,
         mut profile: WorkerProfile,
