@@ -1,0 +1,172 @@
+# Milestone 4 architecture and acceptance contracts
+
+These are proposed contracts for review before implementation. The [implementation plan](milestone-4-plan.md) starts with the native notification feasibility spike after contract approval. PRs 1 through 4 remain independently reviewable.
+
+## 1. Metric identity and attribution
+
+| Scope | Identity and meaning |
+| --- | --- |
+| Project | Stable project UUID. Summaries combine that project's queue workers and scheduler and report their desired, running, and unresolved counts separately. |
+| Profile and slot | Project UUID, process kind, profile UUID, and slot index. This is the logical series across replacements. A retired profile UUID identifies historical data only. |
+| Process generation | Logical slot, instance UUID, and generation number. Within one generation, samples must also match the guardian-recorded PID and OS start identity. A replacement can change the instance UUID or increment the generation. Neither a PID nor a generation number alone identifies a sample. |
+
+Collect subject identities under the supervisor lock. Read OS counters off that lock, verify identity before and after the read, and discard results if the slot has since changed. Compute CPU from two monotonic counter readings for the same generation. Use 100% per fully used logical core. First samples, counter resets, and intervals spanning a detected wake or sampling gap yield unknown CPU and establish a new baseline. Uptime comes from the current process start on a verified OS time basis. Per-generation peak RSS is the largest successfully observed RSS in that generation. CPU deltas, uptime, and peaks never carry over to a replacement.
+
+Expose restart and crash counts as lifecycle totals keyed by logical slot, profile, and project, with an explicit counting start time. Count a committed crash once even after lease recovery. A relaunch counts as a restart when the replacement generation is confirmed running. Aggregate current gauges only from the current generations. Report coverage for partial aggregates and represent missing values as null. An unresolved lease is reported separately from confirmed running instances.
+
+## 2. Resource budgets and schema gate
+
+Before selecting the storage schema, run a reproducible benchmark on Apple Silicon macOS with 32 confirmed active processes, including queue workers and a scheduler. Compare the merged baseline with candidate sampling enabled. Run the two-second process cadence and ten-second queue cadence with opted-in database and Redis fixtures. Include idle and loaded workers, active metrics readers, restart churn, a slow queue backend, and cleanup while samples are arriving. Record hardware, OS, dependency versions, fixture size, commands, duration, and raw results.
+
+| Measure | Required evidence |
+| --- | --- |
+| Storage | Main database and journal bytes, bytes per row and per day, rows retained after 24 hours, and five-minute rollup size through seven days. At 32 processes, the nominal process load is 1,382,400 raw rows per day before queue samples and indexes. Use a real cadence run plus accelerated seeded retention tests and a sustained 24-hour soak before sign-off. |
+| Cleanup | Batch duration, writer stalls and contention, retry behavior, and physical disk growth during pruning and rollup. Test the 24-hour raw and seven-day rollup boundaries and demonstrate that retrying compaction preserves the aggregates. |
+| CPU and memory | Added daemon CPU over baseline, probe CPU and concurrency, peak and steady-state daemon RSS, and dropped or delayed samples. Track worker and helper costs separately. Preserve the specification's under-50 MB idle daemon target, excluding children. |
+| Responsiveness | Report p50, p95, and p99 for status, process and metrics reads, and representative lifecycle RPCs during the workload and cleanup. Use the specification's under-100 ms local read target as the proposed p95 review criterion. Verify lifecycle polling continues when telemetry is slow. |
+
+Publish the measured results in PR 1 and accept byte, CPU, and peak-memory budgets in review before freezing the schema. Candidate storage batches and retention cleanup run off the supervisor lock with bounded queues and pages. Under sustained pressure, skip telemetry work and expose coverage gaps. Queue-probe measurements may use an isolated workload harness during the schema benchmark and must be repeated with the real adapters in PR 2.
+
+## 3. Queue probe safety and semantics
+
+Queue polling is off by default and explicitly enabled per project. Resolve PHP and the effective Laravel queue configuration through the existing provider boundary. Select only configured queues and Laravel-resolved defaults, deduplicate selectors, and discard results after disable, project revision changes, or watcher invalidation. Roost issues only count queries against supported adapters. Trusted Laravel bootstrap can still execute application code, so the read-only contract covers Roost's probe operations.
+
+Run probes off the supervisor lock in isolated subprocesses. Use direct argv, a minimal environment, and validated symbolic connection and queue names. Proposed initial ceilings are two concurrent probes across the daemon, one per project, a two-second timeout, 32 selectors, and 16 KiB of captured output per probe. Rotate eligible selectors when a batch is full and report overdue values as stale. Keep queue credentials in the project runtime and publish only counts, names, sample times, and sanitized reasons.
+
+Use Laravel's database and Redis pending-count APIs where the effective driver and runtime version support them. Prove counts with real Laravel database and Redis fixtures containing ready, delayed, and reserved jobs, an empty queue, and a second queue on the same connection. Database counts ready unreserved rows. Redis counts the ready list, including due jobs only after they enter that list. Verify both adapters leave queue contents unchanged. Test an unsupported driver, a missing capability, hostile output, and a hung backend. A confirmed empty queue is zero. Unsupported or failed reads are null. [Laravel database queue](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Queue/DatabaseQueue.php) · [Laravel Redis queue](https://github.com/laravel/framework/blob/12.x/src/Illuminate/Queue/RedisQueue.php)
+
+## 4. IPC and reconnect
+
+Milestone 4 ships durable cursor polling through `event.history`, `metrics.process.history`, and `metrics.queue.history`. Defer `event.subscribe`, `event.unsubscribe`, `metrics.subscribe`, and its unsubscribe operation to Milestone 5. Advertise only implemented methods in the v1 handshake. Preserve existing method shapes and frame limits. Use bounded page sizes and bounded history ranges.
+
+- Events and metric history use separate committed sequence streams. An opaque cursor binds the stream lineage, scope, filters, and last scanned sequence. Resume with the same scope and filters. Persist ordering with the records it describes, and return `next_cursor` and `has_more`. The first page captures a high-water mark that subsequent pages reuse until drained. The next poll captures a new mark. Append rollups only for finalized buckets and key their writes idempotently by series and bucket. Sequence values encoded as strings avoid loss of precision in JavaScript.
+- A cursor older than retention, from a replaced database, or from a different scope returns a typed cursor error with the recovery action. For metrics, request a current snapshot and restart at a retained history boundary. For events, restart at the earliest retained cursor and expose the missed interval. Resuming from a retained cursor preserves ordering without silent gaps.
+- Future subscriptions use an explicitly negotiated, dedicated Unix-socket connection. A client supplies its polling cursor and filters. The server replays retained records and transitions to live updates on the same sequence stream. A subscription ACK, data frames, and unsubscribe are bounded and identifiable. Disconnect slow consumers on overflow and let them recover through cursor polling. Existing request-response clients receive push frames only after explicitly subscribing.
+
+## 5. Native notification semantics
+
+| Stage | Meaning and durable evidence |
+| --- | --- |
+| Event created | The daemon commits a stable event UUID and sequence. A crash event commits together with its crash report. A permanent recovery failure or threshold episode gets its own deduplicated event. |
+| Helper received | The helper reads the committed event, persists its delivery record, and rechecks per-profile opt-in and OS authorization before submission. Its cursor advances only after a terminal outcome has been journaled. |
+| OS accepted | UserNotifications accepts the request. Retry transient failures with capped backoff under the same stable OS request ID. Record denied permission, opt-out, or expiration as terminal skips. Persist the outcome before advancing the cursor. |
+| Presented | macOS controls presentation, including Focus and notification settings. Report actual presentation as unknown through IPC unless a supported signal establishes it. Verify visible presentation manually during the feasibility spike and PR 4 demo. |
+
+Delivery is best effort. A helper crash between OS acceptance and its local journal write can cause a retry. Use the same request identifier across retries and cap retries. Persist the cursor and use one helper per daemon state directory, with delivery records scoped to the daemon event-stream lineage. Expose connection freshness, permission state, last receipt, and last OS submission outcome separately. Use minimal metadata in visible notifications and exclude captured output. [Apple notification authorization](https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications) · [Apple notification request identifiers](https://developer.apple.com/documentation/usernotifications/unnotificationrequest/identifier)
+
+## 6. Resource alert state machine
+
+The following initial defaults require review. A revisioned per-profile rule declares a breach threshold, a strictly lower clear threshold in the same units, its notification setting, and an optional restart action. Resource-triggered restarts default to off.
+
+| State or input | Transition and action |
+| --- | --- |
+| Clear → pending → active | Three consecutive fresh samples from the current generation at or above the breach threshold open one durable episode. A lower or missing sample clears the pending count. |
+| Active → clear | Three consecutive fresh samples at or below the clear threshold close the episode. Values between thresholds leave it active and reset the clear streak. |
+| Missing, stale, or unsupported | Reset consecutive sample counters. Keep an active episode visible with unknown or stale evidence. Never trigger a new episode or restart from these inputs. A wake or generation change resets the sampling baseline. Replacing the generation closes its episode with a recorded reason. |
+| Repeated breach | Deduplicate by rule and episode. A proposed five-minute cooldown per logical slot and rule suppresses duplicate notification or restart actions across episodes. Retain suppressed episode history. Cooldown expiry alone triggers no action. |
+| Restart | Require explicit opt-in and a fresh breach. Allow at most one attempt per episode and two attempts per logical slot in a rolling hour. Revalidate the current identity, revision, running intent, and guardian lease under the existing supervisor lock. Charge the durable attempt budget before asking the guardian to stop. An interruption after charging can consume an attempt without initiating a restart. Recovered actions must pass the same freshness and intent checks. |
+| Manual stop | Committed stop intent cancels any pending threshold restart. If the guardian has already begun stopping for replacement, cleanup completes and the supervisor suppresses relaunch. A stale queued or recovered action cannot restore running intent. |
+
+## 7. Example IPC result payloads for Milestone 5
+
+These examples show the proposed `result` objects inside v1 responses. `fresh` has a current measured value. `unknown` identifies an eligible series without a usable value. `stale` has no current value and may include a separately labeled last known sample. `unsupported` identifies a missing driver or capability. Zero is a measured value.
+
+### `metrics.process.current`
+
+```json
+{
+  "identity": {"project_id":"00000000-0000-4000-8000-000000000001","kind":"worker","profile_id":"00000000-0000-4000-8000-000000000002","slot":0,"instance_id":"00000000-0000-4000-8000-000000000003","generation":2},
+  "observed_at":"2026-11-20T20:00:00Z",
+  "cpu_percent":{"state":"unknown","value":null,"reason":"first_sample"},
+  "rss_bytes":{"state":"fresh","value":41943040},
+  "uptime_seconds":{"state":"fresh","value":2},
+  "peak_rss_bytes":{"state":"fresh","value":41943040}
+}
+```
+
+### `metrics.process.history`
+
+```json
+{
+  "resolution":"5m",
+  "items":[{"sequence":"118","generation":2,"instance_id":"00000000-0000-4000-8000-000000000003","from":"2026-11-20T20:00:00Z","to":"2026-11-20T20:05:00Z","cpu_percent":{"state":"fresh","mean":12.5,"min":0,"max":36,"samples":113,"expected_samples":150}}],
+  "next_cursor":"example-process-cursor-118",
+  "has_more":false
+}
+```
+
+### `metrics.queue.current`
+
+```json
+{
+  "project_id":"00000000-0000-4000-8000-000000000001",
+  "queues":[
+    {"connection":"database","queue":"default","pending":{"state":"fresh","value":0,"observed_at":"2026-11-20T20:00:00Z"}},
+    {"connection":"redis","queue":"high","pending":{"state":"stale","value":null,"reason":"timeout","last_known":{"value":4,"observed_at":"2026-11-20T19:59:40Z"}}},
+    {"connection":"sqs","queue":"default","pending":{"state":"unsupported","value":null,"reason":"driver_unsupported"}}
+  ]
+}
+```
+
+### `metrics.queue.history`
+
+```json
+{
+  "connection":"redis",
+  "queue":"high",
+  "resolution":"5m",
+  "items":[{"sequence":"91","from":"2026-11-20T19:55:00Z","to":"2026-11-20T20:00:00Z","pending":{"state":"unknown","mean":null,"min":null,"max":null,"samples":0,"expected_samples":30}}],
+  "next_cursor":"example-queue-cursor-91",
+  "has_more":false
+}
+```
+
+### `worker.crash.get`
+
+```json
+{
+  "id":"00000000-0000-4000-8000-000000000004",
+  "project_id":"00000000-0000-4000-8000-000000000001",
+  "profile_id":"00000000-0000-4000-8000-000000000002",
+  "slot":0,
+  "exit":{"at":1795204800,"code":7,"signal":null,"requested_stop":false,"forced":false,"stop_cause":null},
+  "reason":"Recovered exit metadata after daemon interruption",
+  "output_state":"unavailable",
+  "output":[]
+}
+```
+
+### `metrics.alerts.list`
+
+```json
+{
+  "alerts":[{"id":"00000000-0000-4000-8000-000000000005","profile_id":"00000000-0000-4000-8000-000000000002","slot":0,"state":"active","metric":"rss_bytes","breach_at":104857600,"clear_at":94371840,"evidence":{"state":"stale","value":null},"restart":{"state":"off","attempts_in_last_hour":0}}],
+  "next_cursor":null
+}
+```
+
+### `notifications.helper.status`
+
+```json
+{
+  "connection":"stale",
+  "last_seen_at":"2026-11-20T19:59:45Z",
+  "permission":"unknown",
+  "last_received_event_id":"00000000-0000-4000-8000-000000000006",
+  "last_submission":{"event_id":"00000000-0000-4000-8000-000000000006","state":"accepted","at":"2026-11-20T19:59:44Z"},
+  "presentation":"unknown"
+}
+```
+
+## 8. Failure injection and review gate
+
+| Injected failure | Acceptance evidence |
+| --- | --- |
+| Late SQLite write failure | Abort a sample batch, a rollup write, and a crash report plus event transaction after earlier writes. Verify rollback, no cursor for uncommitted data, no raw deletion before rollup commit, and idempotent retry. Exercise disk pressure during a sustained run. |
+| Daemon restart | Interrupt persistence and restart. Verify retained cursor order, no duplicate committed events, reset CPU baselines, preserved restart budgets, and no automatic restart of manually stopped projects. |
+| Helper reconnect | Disconnect before receipt, after receipt, and after OS acceptance before local journaling. Verify bounded retries, stable IDs, cursor progression, expired-cursor recovery, and explicit permission behavior. |
+| Queue timeout | Hang a probe while workers and a scheduler run. Verify bounded cleanup, a null or stale reading, no leaked secrets, and responsive lifecycle IPC. |
+| PID replacement | Replace a process between collection and publication, and simulate PID reuse. Verify the replacement's first CPU sample is unknown and its uptime and peak belong to the new generation. |
+| Sleep and wake | Use a fake clock to verify timer gaps and perform a real macOS sleep/wake run with active workers and a helper. Verify re-established baselines, no synthetic CPU spike, bounded poll resumption, cursor recovery, and no duplicate restarts or notifications attributable to wake. |
+
+Each PR supplies a review record with its invariants, fault-test results, measured costs or a justified scope-specific measurement, compatibility evidence, and a reproducible demo. Architecture approval of these contracts precedes the feasibility spike. Review the spike evidence before PR 1 and the PR evidence before each merge. Milestone 4 ends with a verified end-to-end macOS demonstration and sign-off. Throughput instrumentation, Horizon metrics, arbitrary command execution, and desktop UI implementation are outside this milestone.
