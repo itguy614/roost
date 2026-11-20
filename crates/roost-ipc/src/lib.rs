@@ -26,6 +26,8 @@ pub const METHODS: &[&str] = &[
     "project.get",
     "project.remove",
     "project.start",
+    "project.setAutostart",
+    "worker.crashes",
     "project.stop",
     "project.restart",
     "worker.profile.create",
@@ -81,6 +83,8 @@ pub struct Hello {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub startup: Option<roost_core::worker_runtime::DaemonStartup>,
     pub pid: u32,
     pub uptime_seconds: u64,
     pub protocol_version: u32,

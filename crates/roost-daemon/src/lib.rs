@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use roost_core::Project;
+use roost_core::{Project, worker_runtime::DaemonStartup};
 use roost_ipc::{
     self as rpc, AddParams, GetParams, Hello, HelloParams, Mutation, RemoveParams, Removed,
     RpcError, Status, endpoint,
@@ -73,7 +73,6 @@ impl Daemon {
         let db = dir.join("roost.sqlite3");
         drop(private_file(&db)?);
         Store::initialize(&db)?;
-        let service = Arc::new(DaemonService::new(db, std::env::current_exe()?)?);
         let listener = StdListener::bind(&path)?;
         let metadata = endpoint::owned_socket(&path)?;
         let socket = SocketGuard {
@@ -83,8 +82,10 @@ impl Daemon {
         };
         fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let listener = UnixListener::from_std(listener)?;
+        let service = Arc::new(DaemonService::new(db, std::env::current_exe()?)?);
         Ok(Self {
-            listener: UnixListener::from_std(listener)?,
+            listener,
             _socket: socket,
             _lock: lock,
             service,
@@ -98,7 +99,7 @@ impl Daemon {
         }
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self, mark_clean: bool) {
         let service = self.service.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let Ok(mut supervisor) = service.workers.lock() else {
@@ -115,7 +116,13 @@ impl Daemon {
                     return false;
                 };
                 let _ = supervisor.tick();
-                supervisor.has_children()
+                if supervisor.has_children() {
+                    return true;
+                }
+                if mark_clean && !Store::open(&service.db).and_then(|store| store.finish_daemon_run()).unwrap_or(false) {
+                    tracing::warn!("daemon shutdown left unresolved worker ownership or could not record completion");
+                }
+                false
             })
             .await
             .unwrap_or(false);
@@ -204,6 +211,7 @@ impl Drop for SocketGuard {
 pub struct DaemonService {
     db: PathBuf,
     started: Instant,
+    startup: DaemonStartup,
     workers: Mutex<Supervisor>,
 }
 
@@ -212,11 +220,14 @@ impl DaemonService {
     pub fn new(db: PathBuf, binary: PathBuf) -> Result<Self, StoreError> {
         let store = Store::open(&db)?;
         store.cancel_unclaimed_workers()?;
-        store.clear_completed_worker_leases()?;
+        store.recover_completed_workers()?;
+        let intents = store.autostart_intents()?;
+        let startup = store.begin_daemon_run()?;
         Ok(Self {
-            workers: Mutex::new(Supervisor::new(binary, db.clone())),
+            workers: Mutex::new(Supervisor::new(binary, db.clone(), intents)),
             db,
             started: Instant::now(),
+            startup,
         })
     }
 
@@ -362,6 +373,7 @@ async fn dispatch(
     if method == "daemon.status" {
         decode::<Empty>(params)?;
         return encode(Status {
+            startup: Some(service.startup),
             pid: std::process::id(),
             uptime_seconds: service.started.elapsed().as_secs(),
             protocol_version: rpc::VERSION,
@@ -416,20 +428,26 @@ impl ProjectCall {
         let store = Store::open(&service.db).map_err(store_error)?;
         match self {
             Self::List => {
-                let workers = service.workers.lock().map_err(|_| internal_error())?;
+                let _workers = service.workers.lock().map_err(|_| internal_error())?;
                 let mut projects = store.list_projects().map_err(store_error)?;
                 for project in &mut projects {
-                    project.desired_state = workers.desired(project.id);
+                    project.desired_state = store
+                        .project_intent(project.id)
+                        .map_err(store_error)?
+                        .desired();
                 }
                 encode(projects)
             }
             Self::Get(params) => {
-                let workers = service.workers.lock().map_err(|_| internal_error())?;
+                let _workers = service.workers.lock().map_err(|_| internal_error())?;
                 let mut project = store
                     .get_project(params.id)
                     .map_err(store_error)?
                     .ok_or_else(|| store_error(StoreError::NotFound))?;
-                project.desired_state = workers.desired(project.id);
+                project.desired_state = store
+                    .project_intent(project.id)
+                    .map_err(store_error)?
+                    .desired();
                 encode(project)
             }
             Self::Add(params) => {
@@ -455,10 +473,12 @@ impl ProjectCall {
             Self::Remove(params) => {
                 let request = request_key("project.remove", &params)?;
                 let mut workers = service.workers.lock().map_err(|_| internal_error())?;
+                workers
+                    .clean_previous(&store, params.id)
+                    .map_err(worker_error)?;
                 let mut apply = false;
                 let (operation_id, result) = store
                     .try_mutate::<_, supervisor::Error>(params.idempotency_key, &request, |store| {
-                        workers.clean_previous(store, params.id)?;
                         workers.validate_config_change(store, params.id)?;
                         store.delete_project(params.id)?;
                         apply = true;

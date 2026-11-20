@@ -9,19 +9,20 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | Method | Parameters | Result |
 | --- | --- | --- |
 | `daemon.hello` | `protocol_version` (integer) | `protocol_version` and the available method names in `capabilities` |
-| `daemon.status` | Omit or use `{}` | Daemon `pid`, monotonic `uptime_seconds`, and `protocol_version` |
+| `daemon.status` | Omit or use `{}` | Daemon `pid`, monotonic `uptime_seconds`, `protocol_version`, and `startup` |
 | `project.list` | Omit or use `{}` | Array of project records ordered by canonical path |
 | `project.add` | Absolute UTF-8 `path`, optional UUID `idempotency_key` | `operation_id` and `result` containing the created project |
 | `project.get` | Project UUID `id` | Project record |
 | `project.remove` | Project UUID `id`, optional UUID `idempotency_key` | `operation_id` and `result` containing the removed record's `id` |
-
 | `worker.profile.create` | `project_id`, `name`, `connection`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new profile |
 | `worker.profile.list` | Project UUID `id` | Configured worker profiles |
 | `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
 | `project.restart` | Same parameters as `project.start` | Queues replacement after cleanup and returns the requested intent |
+| `project.setAutostart` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result containing the project record |
 | `project.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
-| `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit and recovery block |
-| `log.tail` | Project UUID `id` | Bounded output summaries with instance ID, generation, timestamp, stream, byte count, and newline count |
+| `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit, `reason`, optional `launch_failure`, and recovery block |
+| `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
+| `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
 
 Worker profile `options` accepts the following fields and defaults.
 
@@ -35,7 +36,9 @@ Worker profile `options` accepts the following fields and defaults.
 | `graceful_stop_seconds` | `15` |
 | `crash_restart` | `"on_failure"` |
 
-Worker mutations use the `operation_id` and `result` envelope. Start, stop, and restart acknowledge intent before the OS transition finishes. A replay returns the historical acknowledgement even across a daemon restart. The new daemon session starts stopped and needs a fresh start request. A project with active intent or unresolved ownership cannot be removed. See [worker supervision](supervision.md) for lifecycle and safety details.
+Worker mutations use the `operation_id` and `result` envelope. Start, stop, and restart acknowledge intent before the OS transition finishes. A replay returns the historical acknowledgement even across a daemon restart. A replay leaves current intent unchanged. Project reads report saved desired state. A new session resumes saved running intent only when autostart is enabled and the prior lease has confirmed cleanup. A project with active supervision, queued recovery, or unresolved ownership must be stopped before removal. See [worker supervision](supervision.md) for lifecycle and safety details.
+
+The `startup` field is `first_start`, `after_clean_shutdown`, or `after_interrupted_shutdown`. Worker exits can also include a `stop_cause` such as `project_stop`, `project_restart`, `daemon_shutdown`, or `daemon_disconnected`. Startup failure classifications include `validation`, `spawn_rejected`, `resource_unavailable`, `readiness_timeout`, `state_publication`, and `cancelled`. The response fields and methods are additive to IPC v1.
 
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
 

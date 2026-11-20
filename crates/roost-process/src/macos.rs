@@ -9,7 +9,7 @@ use std::{
 
 use roost_core::{
     unix_timestamp,
-    worker_runtime::{ProcessExit, ProcessIdentity, WorkerLeaseState},
+    worker_runtime::{LaunchFailure, ProcessExit, ProcessIdentity, StopCause, WorkerLeaseState},
 };
 
 const TICK: Duration = Duration::from_millis(20);
@@ -20,18 +20,25 @@ const PROC_PGRP_ONLY: u32 = 2;
 pub fn run_guarded(
     mut command: Command,
     grace: Duration,
-    stop: impl Fn() -> bool,
+    stop: impl Fn() -> Option<StopCause>,
     mut record: impl FnMut(WorkerLeaseState) -> io::Result<()>,
 ) -> io::Result<()> {
-    if stop() {
-        return record(WorkerLeaseState::LaunchFailed);
+    if stop().is_some() {
+        return record(WorkerLeaseState::LaunchFailure {
+            failure: LaunchFailure::Cancelled,
+        });
     }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let Ok(mut child) = crate::spawn_in_session(command) else {
-        return record(WorkerLeaseState::LaunchFailed);
+    let mut child = match crate::spawn_in_session(command) {
+        Ok(child) => child,
+        Err(error) => {
+            return record(WorkerLeaseState::LaunchFailure {
+                failure: crate::classify_spawn_error(&error),
+            });
+        }
     };
 
     let mut last_identity = None;
@@ -53,7 +60,7 @@ pub fn run_guarded(
 fn supervise(
     child: &mut Child,
     grace: Duration,
-    stop: impl Fn() -> bool,
+    stop: impl Fn() -> Option<StopCause>,
     record: &mut impl FnMut(WorkerLeaseState) -> io::Result<()>,
 ) -> io::Result<()> {
     let pid = child.id() as libc::pid_t;
@@ -73,18 +80,22 @@ fn supervise(
             _ => return Err(io::Error::other("cannot verify worker process identity")),
         }
     };
-    let mut requested_stop = false;
+    let mut stop_cause = None;
     let mut forced = false;
     let mut deadline = None;
     if let Some(identity) = identity {
         // If durable publication fails, stop the verified child instead of losing ownership.
-        requested_stop = record(WorkerLeaseState::Running { identity }).is_err();
+        if record(WorkerLeaseState::Running { identity }).is_err() {
+            stop_cause = Some(StopCause::StatePublicationFailed);
+        }
         loop {
             if exited(pid)? {
                 break;
             }
-            if deadline.is_none() && (requested_stop || stop()) {
-                requested_stop = true;
+            if deadline.is_none()
+                && let Some(cause) = stop_cause.or_else(&stop)
+            {
+                stop_cause = Some(cause);
                 signal(pid, identity, libc::SIGTERM)?;
                 deadline = Some(Instant::now() + grace);
             }
@@ -132,7 +143,8 @@ fn supervise(
             code: status.code(),
             signal: status.signal(),
             at: unix_timestamp(),
-            requested_stop,
+            requested_stop: stop_cause.is_some(),
+            stop_cause,
             forced,
         },
     })

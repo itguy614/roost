@@ -1,6 +1,7 @@
 // Built by the integration tests as an executable PHP stand-in.
 use std::{
     fs,
+    io::{self, Write},
     process::{Command, ExitCode},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -40,8 +41,16 @@ fn main() -> ExitCode {
         ]
     );
     let behavior = fs::read_to_string("artisan").unwrap();
-    if behavior == "fail" {
-        return ExitCode::from(7);
+    match behavior.as_str() {
+        "fail" => return ExitCode::from(7),
+        "clean_exit" => return ExitCode::SUCCESS,
+        "trace_fail" => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(&[b'x'; 96 * 1024]).unwrap();
+            stderr.write_all(b"\nRuntimeException: queue connection unavailable\nDB_PASSWORD=secret-fixture-output\n#0 src/Queue.php(20): connect()").unwrap();
+            return ExitCode::from(7);
+        }
+        _ => {}
     }
     unsafe { signal(15, if behavior == "ignore" { ignore } else { stop }) };
     if behavior == "ignore" {
@@ -49,10 +58,12 @@ fn main() -> ExitCode {
             .arg("descendant")
             .spawn()
             .unwrap();
-        fs::write("descendant.pid", child.id().to_string()).unwrap();
+        let temporary = format!("descendant-{}.tmp", std::process::id());
+        fs::write(&temporary, child.id().to_string()).unwrap();
+        fs::rename(temporary, "descendant.pid").unwrap();
     }
-    println!("secret-fixture-output");
-    eprintln!("secret-fixture-output");
+    println!("worker ready");
+    eprintln!("Authorization: Bearer secret-fixture-output");
     while !STOP.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(10));
     }

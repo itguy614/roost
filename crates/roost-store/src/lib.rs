@@ -1,4 +1,5 @@
 mod leases;
+mod runtime;
 mod sqlite;
 
 use std::{ffi::CStr, path::Path};
@@ -18,6 +19,17 @@ const INITIAL: &CStr = match CStr::from_bytes_with_nul(
 
 const WORKER_LEASES: &CStr = match CStr::from_bytes_with_nul(
     concat!(include_str!("../migrations/002_worker_leases.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
+const RUNTIME: &CStr = match CStr::from_bytes_with_nul(
+    concat!(
+        include_str!("../migrations/003_intent_and_diagnostics.sql"),
+        "\0"
+    )
+    .as_bytes(),
 ) {
     Ok(sql) => sql,
     Err(_) => panic!("migration contains NUL"),
@@ -70,9 +82,14 @@ impl Store {
                 Some("0") => {
                     store.0.exec(INITIAL)?;
                     store.0.exec(WORKER_LEASES)?;
+                    store.0.exec(RUNTIME)?;
                 }
-                Some("1") => store.0.exec(WORKER_LEASES)?,
-                Some("2") => (),
+                Some("1") => {
+                    store.0.exec(WORKER_LEASES)?;
+                    store.0.exec(RUNTIME)?;
+                }
+                Some("2") => store.0.exec(RUNTIME)?,
+                Some("3") => (),
                 _ => return Err(Error::Schema),
             }
             Ok(())
@@ -389,7 +406,7 @@ mod tests {
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["2"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["3"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -397,9 +414,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 3").unwrap();
+        store.0.exec(c"PRAGMA user_version = 4").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["3"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
     }
 
     #[test]
@@ -412,9 +429,65 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["2"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["3"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
         assert!(old.project_worker_leases(project.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrades_v2_preserving_unresolved_worker_ownership() {
+        use roost_core::worker_runtime::{
+            DaemonStartup, ProjectIntent, WorkerLease, WorkerLeaseState,
+        };
+
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let old = Store(sqlite::Connection::open(&db, true).unwrap());
+        old.0.exec(INITIAL).unwrap();
+        old.0.exec(WORKER_LEASES).unwrap();
+        let project = fixture.project();
+        old.create_project(&project).unwrap();
+        let profile = WorkerProfile {
+            id: WorkerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            name: "Worker".into(),
+            connection: "database".into(),
+            queues: Vec::new(),
+            desired_instances: 1,
+            sleep_seconds: 3,
+            tries: 1,
+            timeout_seconds: 60,
+            graceful_stop_seconds: 1,
+            crash_restart: CrashRestartPolicy::Never,
+            code_restart: CodeRestartPolicy::Never,
+            notifications: false,
+            enabled: true,
+            revision: Revision(1),
+        };
+        old.create_worker_profile(&profile).unwrap();
+        let lease = WorkerLease {
+            id: Uuid::new_v4(),
+            project_id: project.id,
+            profile_id: profile.id,
+            slot: 0,
+            state: WorkerLeaseState::Reserved,
+        };
+        old.reserve_worker(&lease).unwrap();
+        let claimed = old.claim_worker(lease).unwrap();
+
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.project_intent(project.id).unwrap(),
+            ProjectIntent::Stopped
+        );
+        assert_eq!(store.worker_lease(claimed.id).unwrap(), Some(claimed));
+        assert_eq!(store.begin_daemon_run().unwrap(), DaemonStartup::FirstStart);
+        assert!(!store.finish_daemon_run().unwrap());
+        assert_eq!(
+            store.begin_daemon_run().unwrap(),
+            DaemonStartup::AfterInterruptedShutdown
+        );
     }
 
     #[test]

@@ -1,10 +1,14 @@
 use roost_core::{
     CodeRestartPolicy, DesiredState, ProjectId, Revision, WorkerProfile, WorkerProfileId,
-    worker_runtime::{MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCES},
+    worker_runtime::{
+        LaunchIntent, MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCES, ProjectIntent,
+    },
 };
 use roost_ipc::{
     Mutation, RpcError,
-    workers::{CreateWorkerParams, Intent, LaunchParams, ProjectParams, StopParams},
+    workers::{
+        AutostartParams, CreateWorkerParams, Intent, LaunchParams, ProjectParams, StopParams,
+    },
 };
 use roost_store::{Error as StoreError, Store};
 use serde_json::Value;
@@ -19,6 +23,8 @@ pub enum WorkerCall {
     ListProfiles(ProjectParams),
     ListProcesses(ProjectParams),
     Logs(ProjectParams),
+    Crashes(ProjectParams),
+    Autostart(AutostartParams),
     Launch(LaunchParams, bool),
     Stop(StopParams),
 }
@@ -29,6 +35,8 @@ impl WorkerCall {
             "worker.profile.create" => Ok(Self::Create(decode(params)?)),
             "worker.profile.list" => Ok(Self::ListProfiles(decode(params)?)),
             "process.list" => Ok(Self::ListProcesses(decode(params)?)),
+            "worker.crashes" => Ok(Self::Crashes(decode(params)?)),
+            "project.setAutostart" => Ok(Self::Autostart(decode(params)?)),
             "log.tail" => Ok(Self::Logs(decode(params)?)),
             "project.start" => Ok(Self::Launch(decode(params)?, false)),
             "project.restart" => Ok(Self::Launch(decode(params)?, true)),
@@ -43,10 +51,12 @@ impl WorkerCall {
         match self {
             Self::Create(params) => {
                 let key = request_key("worker.profile.create", &params)?;
+                supervisor
+                    .clean_previous(&store, params.project_id)
+                    .map_err(worker_error)?;
                 let (operation_id, result) =
                     worker_mutation(&store, params.idempotency_key, &key, || {
                         require_project(&store, params.project_id)?;
-                        supervisor.clean_previous(&store, params.project_id)?;
                         supervisor.validate_config_change(&store, params.project_id)?;
                         let options = params.options;
                         if options.instances > MAX_PROFILE_INSTANCES
@@ -93,6 +103,37 @@ impl WorkerCall {
                 require_project(&store, params.id).map_err(worker_error)?;
                 encode(supervisor.logs(params.id))
             }
+            Self::Crashes(params) => {
+                require_project(&store, params.id).map_err(worker_error)?;
+                supervisor
+                    .clean_previous(&store, params.id)
+                    .map_err(worker_error)?;
+                encode(store.recent_crashes(params.id).map_err(store_error)?)
+            }
+            Self::Autostart(params) => {
+                let key = request_key("project.setAutostart", &params)?;
+                let mut changed = false;
+                let (operation_id, result) =
+                    worker_mutation(&store, params.idempotency_key, &key, || {
+                        supervisor.validate_mutation()?;
+                        let mut project =
+                            store.get_project(params.id)?.ok_or(StoreError::NotFound)?;
+                        if project.autostart != params.enabled {
+                            project.autostart = params.enabled;
+                            project = store.update_project(project)?;
+                        }
+                        changed = true;
+                        project.desired_state = store.project_intent(params.id)?.desired();
+                        Ok(project)
+                    })?;
+                if changed && !params.enabled {
+                    supervisor.cancel_recovery(params.id);
+                }
+                encode(Mutation {
+                    operation_id,
+                    result,
+                })
+            }
             Self::Launch(params, restart) => {
                 let method = if restart {
                     "project.restart"
@@ -100,10 +141,12 @@ impl WorkerCall {
                     "project.start"
                 };
                 let key = request_key(method, &params)?;
+                supervisor
+                    .clean_previous(&store, params.id)
+                    .map_err(worker_error)?;
                 let mut plan = None;
                 let (operation_id, result) =
                     worker_mutation(&store, params.idempotency_key, &key, || {
-                        supervisor.clean_previous(&store, params.id)?;
                         plan = supervisor.prepare(
                             &store,
                             params.id,
@@ -111,6 +154,15 @@ impl WorkerCall {
                             params.allow_horizon,
                             restart,
                         )?;
+                        if let Some(plan) = &plan {
+                            store.set_project_intent(
+                                params.id,
+                                &ProjectIntent::Running(LaunchIntent {
+                                    php: plan.php().to_owned(),
+                                    allow_horizon: params.allow_horizon,
+                                }),
+                            )?;
+                        }
                         Ok(Intent {
                             id: params.id,
                             desired_state: DesiredState::Running,
@@ -131,7 +183,7 @@ impl WorkerCall {
                     worker_mutation(&store, params.idempotency_key, &key, || {
                         require_project(&store, params.id)?;
                         supervisor.validate_mutation()?;
-                        supervisor.clean_previous(&store, params.id)?;
+                        store.set_project_intent(params.id, &ProjectIntent::Stopped)?;
                         apply = true;
                         Ok(Intent {
                             id: params.id,
@@ -168,6 +220,8 @@ pub fn worker_error(error: supervisor::Error) -> RpcError {
     match error {
         supervisor::Error::Store(error) => store_error(error),
         supervisor::Error::Invalid(message) => RpcError::new(rpc::INVALID_PARAMS, message),
-        supervisor::Error::Conflict(message) => RpcError::new(rpc::CONFLICT, message),
+        error @ (supervisor::Error::Conflict(_)
+        | supervisor::Error::RecoveryBlocked
+        | supervisor::Error::Capacity) => RpcError::new(rpc::CONFLICT, error.to_string()),
     }
 }

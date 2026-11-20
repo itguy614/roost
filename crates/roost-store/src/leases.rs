@@ -94,7 +94,9 @@ impl Store {
     ) -> Result<(), Error> {
         let complete = matches!(
             state,
-            WorkerLeaseState::Exited { .. } | WorkerLeaseState::LaunchFailed
+            WorkerLeaseState::Exited { .. }
+                | WorkerLeaseState::LaunchFailed
+                | WorkerLeaseState::LaunchFailure { .. }
         );
         lease.state = state;
         self.0.query(
@@ -119,13 +121,6 @@ impl Store {
         if self.0.changes() == 0 {
             return Err(Error::RevisionConflict);
         }
-        Ok(())
-    }
-
-    /// After a daemon restart only the guardian may certify its previous group is empty.
-    pub fn clear_completed_worker_leases(&self) -> Result<(), Error> {
-        self.0
-            .query(c"DELETE FROM worker_leases WHERE complete = 1", &[])?;
         Ok(())
     }
 }
