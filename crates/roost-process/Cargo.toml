@@ -1,0 +1,8 @@
+[package]
+name = "roost-process"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true
+roost-core.workspace = true
