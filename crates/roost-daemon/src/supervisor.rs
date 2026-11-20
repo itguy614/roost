@@ -18,7 +18,10 @@ use roost_core::{
 };
 use roost_store::Store;
 
+mod scheduler;
 mod slot;
+use crate::supervised::SupervisedProfile;
+use scheduler::Schedulers;
 use slot::{Slot, status_for};
 
 const MAX_ACTIVE: usize = 32;
@@ -32,9 +35,9 @@ pub enum Error {
     Invalid(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
-    #[error("worker recovery is blocked until the previous guardian confirms cleanup")]
+    #[error("process recovery is blocked until the previous guardian confirms cleanup")]
     RecoveryBlocked,
-    #[error("daemon capacity is 32 worker instances")]
+    #[error("daemon capacity is 32 managed process instances")]
     Capacity,
 }
 
@@ -43,6 +46,7 @@ pub struct Supervisor {
     db: PathBuf,
     projects: HashMap<ProjectId, ProjectRuntime>,
     closing: bool,
+    schedulers: Schedulers,
     recovering: Vec<(ProjectId, LaunchIntent)>,
     recovery_errors: HashMap<ProjectId, String>,
     next_recovery: Instant,
@@ -67,12 +71,18 @@ impl Plan {
 }
 
 impl Supervisor {
-    pub fn new(binary: PathBuf, db: PathBuf, recovering: Vec<(ProjectId, LaunchIntent)>) -> Self {
+    pub fn new(
+        binary: PathBuf,
+        db: PathBuf,
+        recovering: Vec<(ProjectId, LaunchIntent)>,
+        recovering_schedulers: Vec<(ProjectId, PathBuf)>,
+    ) -> Self {
         Self {
             binary,
             db,
             projects: HashMap::new(),
             closing: false,
+            schedulers: Schedulers::new(recovering_schedulers),
             recovering,
             recovery_errors: HashMap::new(),
             next_recovery: Instant::now(),
@@ -96,7 +106,9 @@ impl Supervisor {
         self.validate_mutation()?;
         if self.desired(id) == DesiredState::Running
             || self.recovering.iter().any(|(project, _)| *project == id)
-            || !store.project_worker_leases(id)?.is_empty()
+            || !store
+                .project_leases::<roost_core::WorkerProfileId>(id)?
+                .is_empty()
         {
             return Err(Error::Conflict(
                 "stop the project and wait for worker cleanup first",
@@ -116,8 +128,8 @@ impl Supervisor {
         self.validate_mutation()?;
         let project = store.get_project(id)?.ok_or(roost_store::Error::NotFound)?;
         let runtime = self.projects.get(&id);
-        for lease in store.project_worker_leases(id)? {
-            if lease_is_complete(&lease.state) {
+        for lease in store.project_leases::<roost_core::WorkerProfileId>(id)? {
+            if lease.state.is_complete() {
                 continue;
             }
             if runtime.is_none_or(|runtime| {
@@ -164,7 +176,7 @@ impl Supervisor {
             .filter(|(project, _)| **project != id)
             .map(|(_, runtime)| runtime.reserved_capacity())
             .sum();
-        if other_count + slots.len() > MAX_ACTIVE {
+        if other_count + slots.len() + self.schedulers.reserved_capacity(None) > MAX_ACTIVE {
             return Err(Error::Capacity);
         }
         Ok(Some(Plan {
@@ -233,6 +245,7 @@ impl Supervisor {
 
     pub fn shutdown(&mut self) {
         self.closing = true;
+        self.schedulers.shutdown();
         self.recovering.clear();
         for runtime in self.projects.values_mut() {
             runtime.replacement = None;
@@ -242,9 +255,11 @@ impl Supervisor {
     }
 
     pub fn has_children(&self) -> bool {
-        self.projects
-            .values()
-            .any(|project| project.slots.iter().any(|slot| slot.has_guardian()))
+        self.schedulers.has_children()
+            || self
+                .projects
+                .values()
+                .any(|project| project.slots.iter().any(|slot| slot.has_guardian()))
     }
 
     pub fn status(&self, store: &Store, id: ProjectId) -> Result<Vec<WorkerStatus>, Error> {
@@ -255,8 +270,8 @@ impl Supervisor {
             .flat_map(|runtime| runtime.slots.iter().map(Slot::status))
             .collect();
         let desired = store.project_intent(id)?.desired();
-        for lease in store.project_worker_leases(id)? {
-            if lease_is_complete(&lease.state)
+        for lease in store.project_leases::<roost_core::WorkerProfileId>(id)? {
+            if lease.state.is_complete()
                 || self.projects.get(&id).is_some_and(|runtime| {
                     runtime
                         .slots
@@ -325,13 +340,14 @@ impl Supervisor {
                     .any(|slot| slot.has_guardian() || slot.should_launch())
         });
         let recover_now = !self.recovering.is_empty() && Instant::now() >= self.next_recovery;
-        if !pending && !recover_now {
+        if !pending && !recover_now && !self.schedulers.pending() {
             return Ok(());
         }
         let store = Store::open(&self.db)?;
         if recover_now {
             self.recover_projects(&store);
         }
+        self.recover_schedulers(&store);
         let mut outcome = Ok(());
         for (&id, runtime) in &mut self.projects {
             for slot in &mut runtime.slots {
@@ -348,30 +364,21 @@ impl Supervisor {
                 }
             }
         }
-        self.trim_output();
-        outcome
-    }
-
-    fn trim_output(&mut self) {
-        let mut retained: Vec<_> = self
-            .projects
-            .values_mut()
-            .flat_map(|runtime| &mut runtime.slots)
-            .filter_map(|slot| slot.output_priority().map(|priority| (priority, slot)))
-            .collect();
-        if retained.len() > MAX_OUTPUT_SLOTS {
-            retained.sort_unstable_by_key(|(priority, _)| *priority);
-            let excess = retained.len() - MAX_OUTPUT_SLOTS;
-            for (_, slot) in retained.into_iter().take(excess) {
-                slot.discard_output();
-            }
+        trim_slots(
+            self.projects
+                .values_mut()
+                .flat_map(|runtime| &mut runtime.slots),
+        );
+        if let Err(error) = self.schedulers.tick(&store, &self.binary, &self.db) {
+            outcome = Err(error);
         }
+        outcome
     }
 
     pub fn clean_previous(&self, store: &Store, id: ProjectId) -> Result<(), Error> {
         let owned = self.projects.get(&id);
-        for lease in store.project_worker_leases(id)? {
-            if lease_is_complete(&lease.state)
+        for lease in store.project_leases::<roost_core::WorkerProfileId>(id)? {
+            if lease.state.is_complete()
                 && owned.is_none_or(|runtime| {
                     !runtime
                         .slots
@@ -379,20 +386,24 @@ impl Supervisor {
                         .any(|slot| slot.lease_id == Some(lease.id))
                 })
             {
-                store.finish_previous_worker(&lease)?;
+                store.finish_previous_process(&lease)?;
             }
         }
         Ok(())
     }
 }
 
-fn lease_is_complete(state: &WorkerLeaseState) -> bool {
-    matches!(
-        state,
-        WorkerLeaseState::Exited { .. }
-            | WorkerLeaseState::LaunchFailed
-            | WorkerLeaseState::LaunchFailure { .. }
-    )
+fn trim_slots<'a, P: SupervisedProfile + 'a>(slots: impl Iterator<Item = &'a mut Slot<P>>) {
+    let mut retained: Vec<_> = slots
+        .filter_map(|slot| slot.output_priority().map(|priority| (priority, slot)))
+        .collect();
+    if retained.len() > MAX_OUTPUT_SLOTS {
+        retained.sort_unstable_by_key(|(priority, _)| *priority);
+        let excess = retained.len() - MAX_OUTPUT_SLOTS;
+        for (_, slot) in retained.into_iter().take(excess) {
+            slot.discard_output();
+        }
+    }
 }
 
 impl ProjectRuntime {

@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod endpoint;
+pub mod scheduler;
 pub mod workers;
 
 use std::{
@@ -22,6 +23,13 @@ pub const VERSION: u32 = 1;
 pub const METHODS: &[&str] = &[
     "daemon.hello",
     "daemon.status",
+    "scheduler.configure",
+    "scheduler.status",
+    "scheduler.start",
+    "scheduler.stop",
+    "scheduler.restart",
+    "scheduler.logs",
+    "scheduler.crashes",
     "provider.list",
     "provider.detect",
     "provider.resolvePhp",

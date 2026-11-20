@@ -1,4 +1,5 @@
 mod discovery;
+mod scheduler;
 mod workers;
 
 use std::{ffi::OsString, io, path::PathBuf, process::ExitCode};
@@ -26,7 +27,14 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] provider resolve-php ID [--php PATH | --provider herd|system]
   roost [--state-dir ABSOLUTE_PATH] queue connections ID
   roost [--state-dir ABSOLUTE_PATH] queue discover ID [--php PATH | --provider herd|system]
-  roost [--state-dir ABSOLUTE_PATH] queue suggestions ID [NAME ...]";
+  roost [--state-dir ABSOLUTE_PATH] queue suggestions ID [NAME ...]
+  roost [--state-dir ABSOLUTE_PATH] scheduler configure ID [--revision REV] [--options-json JSON]
+  roost [--state-dir ABSOLUTE_PATH] scheduler status ID
+  roost [--state-dir ABSOLUTE_PATH] scheduler start ID [PHP_PATH | --provider herd|system]
+  roost [--state-dir ABSOLUTE_PATH] scheduler restart ID [PHP_PATH | --provider herd|system]
+  roost [--state-dir ABSOLUTE_PATH] scheduler stop ID
+  roost [--state-dir ABSOLUTE_PATH] scheduler logs ID
+  roost [--state-dir ABSOLUTE_PATH] scheduler crashes ID";
 
 enum Command {
     Status,
@@ -35,6 +43,7 @@ enum Command {
     Remove(Uuid),
     Worker(workers::Command),
     Discovery(discovery::Command),
+    Scheduler(scheduler::Command),
 }
 
 fn main() -> ExitCode {
@@ -75,6 +84,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             if let Some(command) = discovery::Command::parse(args)? {
                 Command::Discovery(command)
+            } else if let Some(command) = scheduler::Command::parse(args)? {
+                Command::Scheduler(command)
             } else {
                 Command::Worker(
                     workers::Command::parse(args)?.ok_or_else(|| io::Error::other(USAGE))?,
@@ -123,6 +134,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
+            Command::Scheduler(command) => command.execute(&mut client).await?,
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
         Ok(())

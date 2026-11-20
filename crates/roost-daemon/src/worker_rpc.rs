@@ -128,6 +128,7 @@ impl WorkerCall {
                     })?;
                 if changed && !params.enabled {
                     supervisor.cancel_recovery(params.id);
+                    supervisor.cancel_scheduler_recovery(params.id);
                 }
                 encode(Mutation {
                     operation_id,
@@ -202,12 +203,12 @@ impl WorkerCall {
     }
 }
 
-fn require_project(store: &Store, id: ProjectId) -> Result<(), supervisor::Error> {
+pub(crate) fn require_project(store: &Store, id: ProjectId) -> Result<(), supervisor::Error> {
     store.get_project(id)?.ok_or(StoreError::NotFound)?;
     Ok(())
 }
 
-fn worker_mutation<T: serde::Serialize + serde::de::DeserializeOwned>(
+pub(crate) fn worker_mutation<T: serde::Serialize + serde::de::DeserializeOwned>(
     store: &Store,
     id: Option<Uuid>,
     key: &str,

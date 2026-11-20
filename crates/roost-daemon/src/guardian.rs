@@ -9,10 +9,16 @@ use std::{
     time::Duration,
 };
 
-use roost_core::worker_runtime::{LaunchFailure, StopCause, WorkerLease, WorkerLeaseState};
+use roost_core::{
+    WorkerProfile,
+    scheduler::SchedulerProfile,
+    worker_runtime::{LaunchFailure, ProcessLease, ProcessProfileId, StopCause, WorkerLeaseState},
+};
 use roost_process::OutputPipe;
 use roost_store::Store;
 use serde::{Deserialize, Serialize};
+
+use crate::supervised::SupervisedProfile;
 
 pub const ARG: &str = "__worker-guardian";
 
@@ -20,6 +26,8 @@ pub const ARG: &str = "__worker-guardian";
 struct Launch {
     lease_id: uuid::Uuid,
     php: PathBuf,
+    #[serde(default)]
+    scheduler: bool,
 }
 
 pub struct Guardian {
@@ -30,10 +38,16 @@ pub struct Guardian {
 }
 
 impl Guardian {
-    pub fn spawn(binary: &Path, db: &Path, lease: &WorkerLease, php: &Path) -> io::Result<Self> {
+    pub fn spawn<P: ProcessProfileId>(
+        binary: &Path,
+        db: &Path,
+        lease: &ProcessLease<P>,
+        php: &Path,
+    ) -> io::Result<Self> {
         let mut launch = serde_json::to_vec(&Launch {
             lease_id: lease.id,
             php: php.to_owned(),
+            scheduler: P::SCHEDULER,
         })?;
         launch.push(b'\n');
         let mut command = Command::new(binary);
@@ -107,18 +121,28 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     let launch: Launch = serde_json::from_slice(&line)?;
     let store = Store::open(db)?;
+    if launch.scheduler {
+        run_process::<SchedulerProfile>(&store, launch, input)
+    } else {
+        run_process::<WorkerProfile>(&store, launch, input)
+    }
+}
+
+fn run_process<P: SupervisedProfile>(
+    store: &Store,
+    launch: Launch,
+    mut input: BufReader<io::Stdin>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let lease = store
-        .worker_lease(launch.lease_id)?
-        .ok_or(io::Error::other("worker lease missing"))?;
-    let lease = store.claim_worker(lease)?;
+        .process_lease::<P::Id>(launch.lease_id)?
+        .ok_or(io::Error::other("process lease missing"))?;
+    let lease = store.claim_process(lease)?;
     let project = store
         .get_project(lease.project_id)?
         .ok_or(roost_store::Error::NotFound)?;
-    let profile = store
-        .get_worker_profile(lease.profile_id)?
-        .ok_or(roost_store::Error::NotFound)?;
-    let Ok(php) = roost_process::validate_worker(&project, &profile, &launch.php) else {
-        store.record_worker_state(
+    let profile = P::load(store, lease.profile_id)?.ok_or(roost_store::Error::NotFound)?;
+    let Ok(command) = profile.command(&project, &launch.php) else {
+        store.record_process_state(
             lease,
             WorkerLeaseState::LaunchFailure {
                 failure: LaunchFailure::Validation,
@@ -139,7 +163,7 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
             flag.store(byte[0], Ordering::Release);
         })
     {
-        store.record_worker_state(
+        store.record_process_state(
             lease,
             WorkerLeaseState::LaunchFailure {
                 failure: roost_process::classify_spawn_error(&error),
@@ -150,19 +174,19 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "macos")]
     roost_process::run_guarded(
-        roost_process::worker_command(&project, &profile, &php),
-        Duration::from_secs(u64::from(profile.graceful_stop_seconds)),
+        command,
+        Duration::from_secs(u64::from(profile.grace_seconds())),
         || decode_stop(stopped.load(Ordering::Acquire)),
         |state| {
             store
-                .record_worker_state(lease.clone(), state)
+                .record_process_state(lease.clone(), state)
                 .map_err(io::Error::other)
         },
     )?;
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (php, stopped, Duration::ZERO);
-        store.record_worker_state(
+        let _ = (command, stopped, Duration::ZERO, profile.grace_seconds());
+        store.record_process_state(
             lease,
             WorkerLeaseState::LaunchFailure {
                 failure: LaunchFailure::Validation,

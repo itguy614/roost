@@ -1,5 +1,6 @@
 mod leases;
 mod runtime;
+mod scheduler;
 mod sqlite;
 
 use std::{ffi::CStr, path::Path};
@@ -30,6 +31,13 @@ const RUNTIME: &CStr = match CStr::from_bytes_with_nul(
         "\0"
     )
     .as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
+const SCHEDULER: &CStr = match CStr::from_bytes_with_nul(
+    concat!(include_str!("../migrations/004_scheduler.sql"), "\0").as_bytes(),
 ) {
     Ok(sql) => sql,
     Err(_) => panic!("migration contains NUL"),
@@ -83,13 +91,19 @@ impl Store {
                     store.0.exec(INITIAL)?;
                     store.0.exec(WORKER_LEASES)?;
                     store.0.exec(RUNTIME)?;
+                    store.0.exec(SCHEDULER)?;
                 }
                 Some("1") => {
                     store.0.exec(WORKER_LEASES)?;
                     store.0.exec(RUNTIME)?;
+                    store.0.exec(SCHEDULER)?;
                 }
-                Some("2") => store.0.exec(RUNTIME)?,
-                Some("3") => (),
+                Some("2") => {
+                    store.0.exec(RUNTIME)?;
+                    store.0.exec(SCHEDULER)?;
+                }
+                Some("3") => store.0.exec(SCHEDULER)?,
+                Some("4") => (),
                 _ => return Err(Error::Schema),
             }
             Ok(())
@@ -420,7 +434,7 @@ mod tests {
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["3"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -428,9 +442,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 4").unwrap();
+        store.0.exec(c"PRAGMA user_version = 5").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
     }
 
     #[test]
@@ -443,9 +457,13 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["3"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
-        assert!(old.project_worker_leases(project.id).unwrap().is_empty());
+        assert!(
+            old.project_leases::<roost_core::WorkerProfileId>(project.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -486,8 +504,8 @@ mod tests {
             slot: 0,
             state: WorkerLeaseState::Reserved,
         };
-        old.reserve_worker(&lease).unwrap();
-        let claimed = old.claim_worker(lease).unwrap();
+        old.reserve_process(&lease).unwrap();
+        let claimed = old.claim_process(lease).unwrap();
 
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
@@ -495,13 +513,103 @@ mod tests {
             store.project_intent(project.id).unwrap(),
             ProjectIntent::Stopped
         );
-        assert_eq!(store.worker_lease(claimed.id).unwrap(), Some(claimed));
+        assert_eq!(
+            store
+                .process_lease::<roost_core::WorkerProfileId>(claimed.id)
+                .unwrap(),
+            Some(claimed)
+        );
         assert_eq!(store.begin_daemon_run().unwrap(), DaemonStartup::FirstStart);
         assert!(!store.finish_daemon_run().unwrap());
         assert_eq!(
             store.begin_daemon_run().unwrap(),
             DaemonStartup::AfterInterruptedShutdown
         );
+    }
+
+    #[test]
+    fn upgrades_v3_and_keeps_scheduler_ownership_unique() {
+        use roost_core::{
+            scheduler::{SchedulerIntent, SchedulerMode, SchedulerProfile, SchedulerProfileId},
+            worker_runtime::{ProcessLease, WorkerLeaseState},
+        };
+
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let legacy = Store(sqlite::Connection::open(&db, true).unwrap());
+        legacy.0.exec(INITIAL).unwrap();
+        legacy.0.exec(WORKER_LEASES).unwrap();
+        legacy.0.exec(RUNTIME).unwrap();
+        let project = fixture.project();
+        legacy.create_project(&project).unwrap();
+
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.get_project(project.id).unwrap(),
+            Some(project.clone())
+        );
+        assert_eq!(
+            store.scheduler_intent(project.id).unwrap(),
+            SchedulerIntent::Stopped
+        );
+        let profile = SchedulerProfile {
+            id: SchedulerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            enabled: true,
+            mode: SchedulerMode::ScheduleWork,
+            crash_restart: CrashRestartPolicy::OnFailure,
+            graceful_stop_seconds: 15,
+            revision: Revision(1),
+        };
+        store.create_scheduler(&profile).unwrap();
+        let duplicate = SchedulerProfile {
+            id: SchedulerProfileId(Uuid::new_v4()),
+            ..profile.clone()
+        };
+        assert!(matches!(
+            store.create_scheduler(&duplicate),
+            Err(Error::Duplicate)
+        ));
+
+        let lease = ProcessLease {
+            id: Uuid::new_v4(),
+            project_id: project.id,
+            profile_id: profile.id,
+            slot: 0,
+            state: WorkerLeaseState::Reserved,
+        };
+        store.reserve_process(&lease).unwrap();
+        let waiter = Store::open(&db).unwrap();
+        let duplicate = ProcessLease {
+            id: Uuid::new_v4(),
+            ..lease.clone()
+        };
+        assert!(matches!(
+            waiter.reserve_process(&duplicate),
+            Err(Error::Duplicate)
+        ));
+        let claimed = store.claim_process(lease).unwrap();
+        waiter
+            .cancel_unclaimed_processes::<SchedulerProfileId>()
+            .unwrap();
+        assert_eq!(
+            waiter
+                .process_lease::<SchedulerProfileId>(claimed.id)
+                .unwrap(),
+            Some(claimed.clone())
+        );
+        assert!(matches!(
+            waiter.delete_project(project.id),
+            Err(Error::Reference)
+        ));
+        store
+            .record_process_state(claimed.clone(), WorkerLeaseState::LaunchFailed)
+            .unwrap();
+        waiter
+            .finish_process::<SchedulerProfileId>(claimed.id, None)
+            .unwrap();
+        waiter.reserve_process(&duplicate).unwrap();
     }
 
     #[test]

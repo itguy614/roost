@@ -1,7 +1,10 @@
+use std::ffi::CString;
+
 use roost_core::{
     ProjectId,
     worker_runtime::{
-        CrashReport, DaemonStartup, LaunchIntent, ProjectIntent, WorkerLease, WorkerLeaseState,
+        DaemonStartup, LaunchIntent, ProcessCrash, ProcessLease, ProcessProfileId, ProjectIntent,
+        WorkerLeaseState,
     },
 };
 use uuid::Uuid;
@@ -66,15 +69,20 @@ impl Store {
     pub fn finish_daemon_run(&self) -> Result<bool, Error> {
         self.0.query(
             c"UPDATE daemon_lifecycle SET clean_shutdown = 1 WHERE singleton = 1
-                AND NOT EXISTS(SELECT 1 FROM worker_leases WHERE complete = 0)",
+                AND NOT EXISTS(SELECT 1 FROM worker_leases WHERE complete = 0)
+                AND NOT EXISTS(SELECT 1 FROM scheduler_leases WHERE complete = 0)",
             &[],
         )?;
         Ok(self.0.changes() == 1)
     }
 
-    pub fn finish_worker(&self, id: Uuid, report: Option<&CrashReport>) -> Result<(), Error> {
+    pub fn finish_process<P: ProcessProfileId>(
+        &self,
+        id: Uuid,
+        report: Option<&ProcessCrash<P>>,
+    ) -> Result<(), Error> {
         self.transaction(|store| {
-            store.release_worker(id)?;
+            store.release_completed_process::<P>(id)?;
             if let Some(report) = report {
                 store.insert_crash_report(report)?;
             }
@@ -82,35 +90,44 @@ impl Store {
         })
     }
 
-    pub fn finish_previous_worker(&self, lease: &WorkerLease) -> Result<(), Error> {
+    pub fn finish_previous_process<P: ProcessProfileId>(
+        &self,
+        lease: &ProcessLease<P>,
+    ) -> Result<(), Error> {
         let report = match lease.state {
-            WorkerLeaseState::Exited { exit } if !exit.requested_stop && exit.code != Some(0) => Some(CrashReport {
-                id: lease.id,
-                project_id: lease.project_id,
-                profile_id: lease.profile_id,
-                slot: lease.slot,
-                exit,
-                reason: "worker exit recovered from its guardian lease; output unavailable after daemon interruption".into(),
+            WorkerLeaseState::Exited { exit } if !exit.requested_stop && exit.code != Some(0) => Some(ProcessCrash {
+                id: lease.id, project_id: lease.project_id, profile_id: lease.profile_id, slot: lease.slot, exit,
+                reason: "process exit recovered from its guardian lease; output unavailable after daemon interruption".into(),
                 output: Vec::new(),
             }),
             _ => None,
         };
-        self.finish_worker(lease.id, report.as_ref())
+        self.finish_process(lease.id, report.as_ref())
     }
 
-    pub fn recover_completed_workers(&self) -> Result<(), Error> {
-        let leases: Vec<WorkerLease> =
-            self.all(c"SELECT data FROM worker_leases WHERE complete = 1")?;
-        for lease in leases {
-            self.finish_previous_worker(&lease)?;
+    pub fn recover_completed_processes<P: ProcessProfileId>(&self) -> Result<(), Error> {
+        for lease in self.completed_processes::<P>()? {
+            self.finish_previous_process(&lease)?;
         }
         Ok(())
     }
 
-    pub fn recent_crashes(&self, id: ProjectId) -> Result<Vec<CrashReport>, Error> {
+    pub fn recent_crashes(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<roost_core::worker_runtime::CrashReport>, Error> {
+        self.recent_process_crashes(id)
+    }
+
+    pub fn recent_process_crashes<P: ProcessProfileId>(
+        &self,
+        id: ProjectId,
+    ) -> Result<Vec<ProcessCrash<P>>, Error> {
         self.0
             .query(
-                c"SELECT data FROM worker_crashes WHERE project_id = ?1 ORDER BY sequence DESC",
+                &crash_sql::<P>(
+                    "SELECT data FROM {crashes} WHERE project_id = ?1 ORDER BY sequence DESC",
+                ),
                 &[Some(&id.0.to_string())],
             )?
             .iter()
@@ -118,10 +135,13 @@ impl Store {
             .collect()
     }
 
-    fn insert_crash_report(&self, report: &CrashReport) -> Result<(), Error> {
+    fn insert_crash_report<P: ProcessProfileId>(
+        &self,
+        report: &ProcessCrash<P>,
+    ) -> Result<(), Error> {
         let project = report.project_id.0.to_string();
         self.0.query(
-            c"INSERT INTO worker_crashes (id, project_id, data) VALUES (?1, ?2, ?3)",
+            &crash_sql::<P>("INSERT INTO {crashes} (id, project_id, data) VALUES (?1, ?2, ?3)"),
             &[
                 Some(&report.id.to_string()),
                 Some(&project),
@@ -129,16 +149,25 @@ impl Store {
             ],
         )?;
         self.0.query(
-            c"DELETE FROM worker_crashes WHERE project_id = ?1 AND sequence IN
-                (SELECT sequence FROM worker_crashes WHERE project_id = ?1 ORDER BY sequence DESC LIMIT -1 OFFSET 12)",
+            &crash_sql::<P>("DELETE FROM {crashes} WHERE project_id = ?1 AND sequence IN
+                (SELECT sequence FROM {crashes} WHERE project_id = ?1 ORDER BY sequence DESC LIMIT -1 OFFSET 12)"),
             &[Some(&project)],
         )?;
-        self.0.exec(
-            c"DELETE FROM worker_crashes WHERE sequence IN
-            (SELECT sequence FROM worker_crashes ORDER BY sequence DESC LIMIT -1 OFFSET 128)",
-        )?;
+        self.0.exec(&crash_sql::<P>(
+            "DELETE FROM {crashes} WHERE sequence IN
+            (SELECT sequence FROM {crashes} ORDER BY sequence DESC LIMIT -1 OFFSET 128)",
+        ))?;
         Ok(())
     }
+}
+
+fn crash_sql<P: ProcessProfileId>(template: &str) -> CString {
+    let table = if P::SCHEDULER {
+        "scheduler_crashes"
+    } else {
+        "worker_crashes"
+    };
+    CString::new(template.replace("{crashes}", table)).expect("static crash SQL has no NUL")
 }
 
 #[cfg(test)]
@@ -174,7 +203,7 @@ mod tests {
                     store.create_project(&project)?;
                     ids.push(project.id);
                     for timestamp in 0..14 {
-                        store.insert_crash_report(&CrashReport {
+                        store.insert_crash_report(&ProcessCrash {
                             id: Uuid::new_v4(),
                             project_id: project.id,
                             profile_id: WorkerProfileId(Uuid::new_v4()),

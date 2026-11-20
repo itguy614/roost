@@ -7,8 +7,8 @@ use std::{
 use roost_core::{
     CrashRestartPolicy, DesiredState, ProjectId, WorkerProfile,
     worker_runtime::{
-        CrashReport, LaunchFailure, ObservedState, OutputStream, OutputSummary, ProcessExit,
-        StopCause, WorkerLease, WorkerLeaseState, WorkerStatus,
+        LaunchFailure, ObservedState, OutputStream, OutputSummary, ProcessCrash, ProcessExit,
+        ProcessLease, ProcessProfileId, ProcessStatus, StopCause, WorkerLeaseState,
     },
 };
 use roost_process::DrainResult;
@@ -16,17 +16,17 @@ use roost_store::Store;
 use uuid::Uuid;
 
 use super::{Error, verify_horizon};
-use crate::{backoff, guardian::Guardian};
+use crate::{backoff, guardian::Guardian, supervised::SupervisedProfile};
 
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(10);
 const EXIT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 const MAX_LAUNCH_ATTEMPTS: u8 = 3;
 
-pub(super) struct Slot {
-    profile: WorkerProfile,
+pub(super) struct Slot<P: SupervisedProfile = WorkerProfile> {
+    profile: P,
     php: PathBuf,
     allow_horizon: bool,
-    status: WorkerStatus,
+    status: ProcessStatus<P::Id>,
     guardian: Option<Guardian>,
     pub(super) lease_id: Option<Uuid>,
     since: Instant,
@@ -39,10 +39,10 @@ pub(super) struct Slot {
     launch_failures: u8,
 }
 
-impl Slot {
+impl<P: SupervisedProfile> Slot<P> {
     pub(super) fn new(
         project: ProjectId,
-        profile: WorkerProfile,
+        profile: P,
         index: u32,
         php: PathBuf,
         allow_horizon: bool,
@@ -51,7 +51,7 @@ impl Slot {
             status: status_for(
                 Uuid::new_v4(),
                 project,
-                profile.id,
+                profile.id(),
                 index,
                 DesiredState::Running,
             ),
@@ -83,7 +83,7 @@ impl Slot {
         self.status.recovery_blocked
     }
 
-    pub(super) fn status(&self) -> WorkerStatus {
+    pub(super) fn status(&self) -> ProcessStatus<P::Id> {
         let mut status = self.status.clone();
         status.retry_in_ms = self
             .retry_at
@@ -106,7 +106,7 @@ impl Slot {
     pub(super) fn stop(&mut self, cause: StopCause) {
         self.status.desired_state = DesiredState::Stopped;
         self.retry_at = None;
-        self.status.reason = Some("worker stop requested".into());
+        self.status.reason = Some("process stop requested".into());
         if let Some(guardian) = &mut self.guardian {
             guardian.stop(cause);
             self.status.state = ObservedState::Stopping;
@@ -129,7 +129,9 @@ impl Slot {
         let project = store
             .get_project(self.status.project_id)?
             .ok_or(roost_store::Error::NotFound)?;
-        if let Err(error) = verify_horizon(&project, self.allow_horizon) {
+        if !P::Id::SCHEDULER
+            && let Err(error) = verify_horizon(&project, self.allow_horizon)
+        {
             self.status.state = ObservedState::Failed;
             self.status.reason = Some(error.to_string());
             self.status.last_error = self.status.reason.clone();
@@ -137,19 +139,19 @@ impl Slot {
             self.retry_at = None;
             return Ok(());
         }
-        let lease = WorkerLease {
+        let lease = ProcessLease {
             id: Uuid::new_v4(),
             project_id: self.status.project_id,
             profile_id: self.status.profile_id,
             slot: self.status.slot,
             state: WorkerLeaseState::Reserved,
         };
-        if let Err(error) = store.reserve_worker(&lease) {
+        if let Err(error) = store.reserve_process(&lease) {
             if matches!(
                 error,
                 roost_store::Error::Duplicate | roost_store::Error::Reference
             ) {
-                self.block("worker slot could not be reserved");
+                self.block("process slot could not be reserved");
                 return Ok(());
             }
             return Err(error.into());
@@ -176,10 +178,13 @@ impl Slot {
                 // No guardian was spawned. If the DB update itself fails, the
                 // reservation remains an ownership fence until daemon recovery.
                 if let Err(error) = store
-                    .record_worker_state(lease.clone(), WorkerLeaseState::LaunchFailure { failure })
-                    .and_then(|()| store.finish_worker(lease.id, None))
+                    .record_process_state(
+                        lease.clone(),
+                        WorkerLeaseState::LaunchFailure { failure },
+                    )
+                    .and_then(|()| store.finish_process::<P::Id>(lease.id, None))
                 {
-                    self.block("could not release a failed worker launch reservation");
+                    self.block("could not release a failed process launch reservation");
                     return Err(error.into());
                 }
                 self.lease_id = None;
@@ -197,7 +202,7 @@ impl Slot {
             Ok(status) => status,
             Err(_) => {
                 guardian.stop(StopCause::GuardianWaitFailed);
-                self.block("could not wait for worker guardian");
+                self.block("could not wait for process guardian");
                 return Ok(());
             }
         };
@@ -248,9 +253,9 @@ impl Slot {
             return Ok(());
         }
         let id = self.lease_id.expect("a guardian always has a lease");
-        let lease = store.worker_lease(id)?;
+        let lease = store.process_lease::<P::Id>(id)?;
         if exit.is_none() {
-            if let Some(WorkerLease {
+            if let Some(ProcessLease {
                 state: WorkerLeaseState::Running { identity },
                 ..
             }) = lease
@@ -269,14 +274,14 @@ impl Slot {
                 self.status.state = ObservedState::Stopping;
                 self.startup_timed_out = true;
                 self.status.reason =
-                    Some("worker launch did not confirm readiness; waiting for cleanup".into());
+                    Some("process launch did not confirm readiness; waiting for cleanup".into());
             }
             return Ok(());
         }
         match lease.map(|lease| lease.state) {
             Some(WorkerLeaseState::Reserved) => {
                 // A reaped guardian that never claimed its reservation could not have spawned a worker.
-                let lease = WorkerLease {
+                let lease = ProcessLease {
                     id,
                     project_id: self.status.project_id,
                     profile_id: self.status.profile_id,
@@ -284,14 +289,14 @@ impl Slot {
                     state: WorkerLeaseState::Reserved,
                 };
                 let failure = LaunchFailure::SpawnRejected;
-                store.record_worker_state(lease, WorkerLeaseState::LaunchFailure { failure })?;
+                store.record_process_state(lease, WorkerLeaseState::LaunchFailure { failure })?;
                 // Process the new terminal record next tick if the ledger release fails.
-                store.finish_worker(id, None)?;
+                store.finish_process::<P::Id>(id, None)?;
                 self.detach();
                 self.after_launch_failure(failure);
             }
             Some(WorkerLeaseState::Exited { exit }) => {
-                let report = (!exit.requested_stop && exit.code != Some(0)).then(|| CrashReport {
+                let report = (!exit.requested_stop && exit.code != Some(0)).then(|| ProcessCrash {
                     id,
                     project_id: self.status.project_id,
                     profile_id: self.status.profile_id,
@@ -312,7 +317,7 @@ impl Slot {
                         .cloned()
                         .collect(),
                 });
-                store.finish_worker(id, report.as_ref())?;
+                store.finish_process::<P::Id>(id, report.as_ref())?;
                 self.detach();
                 self.status.last_exit = Some(exit);
                 if exit.stop_cause == Some(StopCause::StatePublicationFailed) {
@@ -326,7 +331,7 @@ impl Slot {
             Some(
                 state @ (WorkerLeaseState::LaunchFailed | WorkerLeaseState::LaunchFailure { .. }),
             ) => {
-                store.finish_worker(id, None)?;
+                store.finish_process::<P::Id>(id, None)?;
                 self.detach();
                 let failure = match state {
                     WorkerLeaseState::LaunchFailure { failure } => failure,
@@ -340,7 +345,7 @@ impl Slot {
             }
             _ => {
                 self.guardian = None;
-                self.block("worker guardian exited before confirming cleanup");
+                self.block("process guardian exited before confirming cleanup");
             }
         }
         Ok(())
@@ -356,7 +361,7 @@ impl Slot {
     fn after_launch_failure(&mut self, failure: LaunchFailure) {
         if self.status.desired_state == DesiredState::Stopped {
             self.status.state = ObservedState::Stopped;
-            self.status.reason = Some("worker launch stopped".into());
+            self.status.reason = Some("process launch stopped".into());
             self.status.last_error = None;
             return;
         }
@@ -364,7 +369,7 @@ impl Slot {
         let reason = failure.reason();
         self.status.launch_failure = Some(failure);
         self.status.last_error = Some(reason.into());
-        if failure.retryable() && self.profile.crash_restart != CrashRestartPolicy::Never {
+        if failure.retryable() && self.profile.crash_restart() != CrashRestartPolicy::Never {
             if self.launch_failures < MAX_LAUNCH_ATTEMPTS {
                 self.retry_at =
                     Some(Instant::now() + Duration::from_secs(u64::from(self.launch_failures)));
@@ -394,7 +399,7 @@ impl Slot {
         if exit.code != Some(0) || exit.requested_stop {
             self.status.last_error = Some(reason.clone());
         }
-        if exit.restartable(self.profile.crash_restart) {
+        if exit.restartable(self.profile.crash_restart()) {
             if let Some(delay) =
                 backoff::delay(&mut self.status.rapid_failures, self.since.elapsed())
             {
@@ -413,7 +418,7 @@ impl Slot {
                 ObservedState::Failed
             };
             self.status.reason = Some(format!(
-                "{reason}; restart policy did not restart the worker"
+                "{reason}; restart policy did not restart the process"
             ));
         }
     }
@@ -429,18 +434,18 @@ impl Slot {
 fn exit_reason(exit: ProcessExit, stderr_seen: bool) -> String {
     if exit.requested_stop {
         let reason = match exit.stop_cause {
-            Some(StopCause::ProjectStop) => "worker stopped on user request",
-            Some(StopCause::ProjectRestart) => "worker stopped for project restart",
-            Some(StopCause::DaemonShutdown) => "worker stopped during daemon shutdown",
+            Some(StopCause::ProjectStop) => "process stopped on user request",
+            Some(StopCause::ProjectRestart) => "process stopped for project restart",
+            Some(StopCause::DaemonShutdown) => "process stopped during daemon shutdown",
             Some(StopCause::DaemonDisconnected) => {
-                "worker stopped after losing its daemon connection"
+                "process stopped after losing its daemon connection"
             }
-            Some(StopCause::StartupTimeout) => "worker stopped after startup timed out",
+            Some(StopCause::StartupTimeout) => "process stopped after startup timed out",
             Some(StopCause::StatePublicationFailed) => {
-                "worker stopped because ownership could not be recorded"
+                "process stopped because ownership could not be recorded"
             }
-            Some(StopCause::GuardianWaitFailed) => "worker stopped after a guardian wait error",
-            None => "worker stopped on request",
+            Some(StopCause::GuardianWaitFailed) => "process stopped after a guardian wait error",
+            None => "process stopped on request",
         };
         return if exit.forced {
             format!("{reason}; SIGKILL was required")
@@ -449,14 +454,14 @@ fn exit_reason(exit: ProcessExit, stderr_seen: bool) -> String {
         };
     }
     if exit.code == Some(0) {
-        return "worker exited cleanly while the project desired running".into();
+        return "process exited cleanly while the project desired running".into();
     }
     let kind = if let Some(signal) = exit.signal {
-        format!("worker exited on signal {signal}")
+        format!("process exited on signal {signal}")
     } else if let Some(code) = exit.code {
-        format!("worker exited with status {code}")
+        format!("process exited with status {code}")
     } else {
-        "worker exited unexpectedly".into()
+        "process exited unexpectedly".into()
     };
     if stderr_seen {
         format!("{kind}; see the captured stderr")
@@ -465,14 +470,14 @@ fn exit_reason(exit: ProcessExit, stderr_seen: bool) -> String {
     }
 }
 
-pub(super) fn status_for(
+pub(super) fn status_for<P>(
     id: Uuid,
     project_id: ProjectId,
-    profile_id: roost_core::WorkerProfileId,
+    profile_id: P,
     slot: u32,
     desired_state: DesiredState,
-) -> WorkerStatus {
-    WorkerStatus {
+) -> ProcessStatus<P> {
+    ProcessStatus {
         id,
         project_id,
         profile_id,

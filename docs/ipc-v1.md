@@ -20,6 +20,13 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` |
 | `queue.discover` | Same parameters as `provider.resolvePhp` | Fresh snapshot with default connection, connection names and drivers, omission count, observation time, and PHP source |
 | `queue.suggestions` | Project UUID `id`, optional `explicit` string array | Incomplete symbolic name suggestions with sources, ordered configured profile queues, and scan coverage flags |
+| `scheduler.configure` | Project UUID `id`, optional `options`, optional `expected_revision` for updates, optional UUID `idempotency_key` | Mutation result with the scheduler profile |
+| `scheduler.status` | Project UUID `id` | Scheduler profile, saved desired state, and optional observed process state |
+| `scheduler.start` | Project UUID `id`, absolute `php` path, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
+| `scheduler.restart` | Same parameters as `scheduler.start` | Queues replacement after cleanup and returns the requested intent |
+| `scheduler.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
+| `scheduler.logs` | Project UUID `id` | Bounded, redacted scheduler output lines |
+| `scheduler.crashes` | Project UUID `id` | Recent persistent scheduler crash reports |
 | `worker.profile.create` | `project_id`, `name`, `connection`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new profile |
 | `worker.profile.list` | Project UUID `id` | Configured worker profiles |
 | `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
@@ -43,6 +50,8 @@ Worker profile `options` accepts the following fields and defaults.
 | `crash_restart` | `"on_failure"` |
 
 Worker mutations use the `operation_id` and `result` envelope. Start, stop, and restart acknowledge intent before the OS transition finishes. A replay returns the historical acknowledgement even across a daemon restart. A replay leaves current intent unchanged. Project reads report saved desired state. A new session resumes saved running intent only when autostart is enabled and the prior lease has confirmed cleanup. A project with active supervision, queued recovery, or unresolved ownership must be stopped before removal. See [worker supervision](supervision.md) for lifecycle and safety details.
+
+Scheduler options are `enabled` (defaults to true), `crash_restart` (defaults to `on_failure`), and `graceful_stop_seconds` (defaults to 15, allowed 1–60). Configuration requires stopped scheduler intent and confirmed cleanup. Local edits to file-owned scheduler settings return a conflict. The scheduler is independently managed from queue workers. See [scheduler lifecycle and demo](scheduler.md).
 
 The `startup` field is `first_start`, `after_clean_shutdown`, or `after_interrupted_shutdown`. Worker exits can also include a `stop_cause` such as `project_stop`, `project_restart`, `daemon_shutdown`, or `daemon_disconnected`. Startup failure classifications include `validation`, `spawn_rejected`, `resource_unavailable`, `readiness_timeout`, `state_publication`, and `cancelled`. The response fields and methods are additive to IPC v1.
 

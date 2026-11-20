@@ -28,19 +28,24 @@ fn main() -> ExitCode {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    assert_eq!(
-        arguments,
-        [
-            "artisan",
-            "queue:work",
-            "database",
-            "--sleep=3",
-            "--tries=1",
-            "--timeout=60",
-            "--queue=critical,default"
-        ]
-    );
-    let behavior = fs::read_to_string("artisan").unwrap();
+    let scheduler = arguments == ["artisan", "schedule:work"];
+    let behavior = if scheduler {
+        fs::read_to_string("scheduler-mode").unwrap_or_else(|_| "graceful".into())
+    } else {
+        assert_eq!(
+            arguments,
+            [
+                "artisan",
+                "queue:work",
+                "database",
+                "--sleep=3",
+                "--tries=1",
+                "--timeout=60",
+                "--queue=critical,default"
+            ]
+        );
+        fs::read_to_string("artisan").unwrap()
+    };
     match behavior.as_str() {
         "fail" => return ExitCode::from(7),
         "clean_exit" => return ExitCode::SUCCESS,
@@ -62,10 +67,18 @@ fn main() -> ExitCode {
         fs::write(&temporary, child.id().to_string()).unwrap();
         fs::rename(temporary, "descendant.pid").unwrap();
     }
-    println!("worker ready");
+    if scheduler {
+        println!("scheduler ready");
+    } else {
+        println!("worker ready");
+    }
     eprintln!("Authorization: Bearer secret-fixture-output");
     while !STOP.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(10));
+    }
+    if scheduler {
+        thread::sleep(Duration::from_millis(120));
+        fs::write(format!("scheduler-stopped-{}", std::process::id()), "").unwrap();
     }
     ExitCode::SUCCESS
 }
