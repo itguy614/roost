@@ -6,7 +6,9 @@ Review the [architecture and acceptance contracts](milestone-4-contracts.md) bef
 
 ## 0. Native notification feasibility spike
 
-After contract approval, run this spike before opening the first implementation PR. Use a disposable bundled native helper, with Swift and UserNotifications as the first candidate. Verify stable app identity, permission prompting, and actual notification presentation in a logged-in macOS session without the main window. Record the bundle and any development signing requirements, the allow and deny paths, and any differences from OS request acceptance. If the spike cannot demonstrate presentation, review the evidence and revise the helper design before proceeding. Full integration remains PR 4. [Apple notification authorization](https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications) · [Apple agent app configuration](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/LaunchServicesKeys.html)
+After contract approval, run this spike before opening the first implementation PR. Use a disposable bundled native helper, with Swift and UserNotifications as the first candidate. Verify stable app identity, permission prompting, and actual notification presentation in a logged-in macOS session without the main window. Exercise manual lifecycle ownership, singleton locking, daemon reconnect, and a helper bundle upgrade with state reuse. Record signing requirements and distinguish OS request acceptance from presentation. Review the evidence before PR 1. Full integration remains PR 4. [Apple notification authorization](https://developer.apple.com/documentation/usernotifications/asking-permission-to-use-notifications) · [Apple agent app configuration](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/LaunchServicesKeys.html)
+
+The first run and the open authorization blocker are recorded in the [spike evidence](milestone-4-notification-spike.md).
 
 ## 1. Process metrics and retention
 
