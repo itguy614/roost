@@ -155,6 +155,7 @@ pub struct Poll {
     pub ready: bool,
     pub pending: bool,
     pub problem: Option<Problem>,
+    pub changed: bool,
     pub changed_at: Option<Instant>,
 }
 
@@ -189,6 +190,7 @@ impl ProjectWatch {
 
     pub fn poll(&mut self, now: Instant, other_roots: &HashSet<PathBuf>) -> Poll {
         let signal = self.signal.swap(0, Ordering::AcqRel);
+        let mut changed = false;
         if signal & BACKEND_ERROR != 0 {
             self.backend = None;
         }
@@ -216,6 +218,7 @@ impl ProjectWatch {
                         .as_ref()
                         .is_some_and(|previous| *previous != current)
                     {
+                        changed = true;
                         self.batch.record(now);
                     }
                     self.baseline = Some(current);
@@ -241,6 +244,7 @@ impl ProjectWatch {
             ready: self.baseline.is_some(),
             pending: self.batch.range.is_some(),
             problem,
+            changed,
             changed_at,
         }
     }

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use roost_core::{Project, ProjectId, Revision};
+use roost_core::{Project, ProjectId, Revision, WatchRules};
 use roost_ipc::watch::WatchState;
 use roost_store::Store;
 use roost_watch::{MAX_PROJECTS, ProjectWatch, Rules};
@@ -22,9 +22,27 @@ pub(super) struct RuntimeStatus {
 
 struct Active {
     revision: Revision,
+    configured_at: Option<Revision>,
+    path: PathBuf,
+    rules: WatchRules,
     nested_roots: HashSet<PathBuf>,
     watch: ProjectWatch,
+    invalidate_snapshot: bool,
     delivery: Option<Instant>,
+}
+
+impl Active {
+    fn matches_scope(
+        &self,
+        project: &Project,
+        configured_at: Option<Revision>,
+        nested_roots: &HashSet<PathBuf>,
+    ) -> bool {
+        self.configured_at == configured_at
+            && self.path == project.path
+            && self.rules == project.watch_rules
+            && &self.nested_roots == nested_roots
+    }
 }
 
 #[derive(Default)]
@@ -65,11 +83,17 @@ impl Watches {
         let now = Instant::now();
         if self.next_config.is_none_or(|next| now >= next) {
             let store = Store::open(&service.db)?;
-            self.refresh(&store.list_projects()?, now);
+            let revisions = service
+                .watch_config_revisions
+                .lock()
+                .map_err(|_| crate::supervisor::Error::Conflict("watch configuration unavailable"))?
+                .clone();
+            self.refresh(&store.list_projects()?, &revisions, now);
             self.next_config = Some(now + Duration::from_millis(500));
         }
         for (&id, active) in &mut self.active {
             let observed = active.watch.poll(Instant::now(), &active.nested_roots);
+            active.invalidate_snapshot |= observed.changed;
             if let Some(changed_at) = observed.changed_at {
                 active.delivery = Some(changed_at);
             }
@@ -97,7 +121,12 @@ impl Watches {
         Ok(())
     }
 
-    fn refresh(&mut self, projects: &[Project], now: Instant) {
+    fn refresh(
+        &mut self,
+        projects: &[Project],
+        revisions: &HashMap<ProjectId, Revision>,
+        now: Instant,
+    ) {
         self.status.clear();
         let mut configured = HashSet::new();
         for (index, project) in projects
@@ -110,9 +139,11 @@ impl Watches {
             }
             configured.insert(project.id);
             let nested_roots = nested_roots(project, projects);
-            if self.active.get(&project.id).is_some_and(|active| {
-                active.revision == project.revision && active.nested_roots == nested_roots
-            }) {
+            let configured_at = revisions.get(&project.id).copied();
+            if let Some(active) = self.active.get_mut(&project.id)
+                && active.matches_scope(project, configured_at, &nested_roots)
+            {
+                active.revision = project.revision;
                 continue;
             }
             self.active.remove(&project.id);
@@ -122,8 +153,12 @@ impl Watches {
                         project.id,
                         Active {
                             revision: project.revision,
+                            configured_at,
+                            path: project.path.clone(),
+                            rules: project.watch_rules.clone(),
                             nested_roots,
                             watch: ProjectWatch::new(project.path.clone(), rules, now),
+                            invalidate_snapshot: false,
                             delivery: None,
                         },
                     );
@@ -145,7 +180,11 @@ impl Watches {
     }
 
     fn deliver(&mut self, service: &DaemonService) -> Result<(), crate::supervisor::Error> {
-        if !self.active.values().any(|active| active.delivery.is_some()) {
+        if !self
+            .active
+            .values()
+            .any(|active| active.invalidate_snapshot || active.delivery.is_some())
+        {
             return Ok(());
         }
         let mut supervisor = service
@@ -153,13 +192,32 @@ impl Watches {
             .lock()
             .map_err(|_| crate::supervisor::Error::Conflict("supervisor unavailable"))?;
         let projects = Store::open(&service.db)?.list_projects()?;
+        let revisions = service
+            .watch_config_revisions
+            .lock()
+            .map_err(|_| crate::supervisor::Error::Conflict("watch configuration unavailable"))?;
         for project in projects.iter().filter(|project| project.watch_enabled) {
             if let Some(active) = self.active.get_mut(&project.id)
-                && let Some(changed_at) = active.delivery.take()
-                && active.revision == project.revision
-                && active.nested_roots == nested_roots(project, &projects)
+                && (active.invalidate_snapshot || active.delivery.is_some())
+                && active.matches_scope(
+                    project,
+                    revisions.get(&project.id).copied(),
+                    &nested_roots(project, &projects),
+                )
             {
-                supervisor.restart_changed_workers(project.id, changed_at);
+                if active.invalidate_snapshot {
+                    service
+                        .snapshots
+                        .lock()
+                        .map_err(|_| {
+                            crate::supervisor::Error::Conflict("discovery cache unavailable")
+                        })?
+                        .invalidate(project.id);
+                    active.invalidate_snapshot = false;
+                }
+                if let Some(changed_at) = active.delivery.take() {
+                    supervisor.restart_changed_workers(project.id, changed_at);
+                }
             }
         }
         Ok(())
@@ -172,4 +230,67 @@ fn nested_roots(project: &Project, projects: &[Project]) -> HashSet<PathBuf> {
         .filter(|other| other.id != project.id && other.path.starts_with(&project.path))
         .map(|other| other.path.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn metadata_revision_preserves_a_batch_during_debounce() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Temp(
+            std::env::temp_dir().join(format!("roost-watch-refresh-{}", uuid::Uuid::new_v4())),
+        );
+        fs::create_dir(&root.0).unwrap();
+        let artisan = root.0.join("artisan");
+        fs::write(&artisan, "before").unwrap();
+        let mut project = Project::register(&root.0).unwrap();
+        project.watch_enabled = true;
+        let id = project.id;
+        let start = Instant::now();
+        let mut watches = Watches::default();
+        let revisions = HashMap::new();
+        watches.refresh(std::slice::from_ref(&project), &revisions, start);
+        let active = watches.active.get_mut(&id).unwrap();
+        let initial = active.watch.poll(start, &active.nested_roots);
+        assert!(initial.ready && !initial.changed);
+
+        fs::write(&artisan, "after").unwrap();
+        let observed_at = start + Duration::from_secs(2);
+        let observed = active.watch.poll(observed_at, &active.nested_roots);
+        assert!(observed.changed && observed.pending && observed.changed_at.is_none());
+
+        project.autostart = true;
+        project.revision = Revision(2);
+        let during_debounce = observed_at + Duration::from_millis(250);
+        watches.refresh(std::slice::from_ref(&project), &revisions, during_debounce);
+        let active = watches.active.get_mut(&id).unwrap();
+        assert_eq!(active.revision, Revision(2));
+        let observed = active.watch.poll(during_debounce, &active.nested_roots);
+        assert!(observed.pending && observed.changed_at.is_none());
+        let due = active.watch.poll(
+            observed_at + Duration::from_millis(500),
+            &active.nested_roots,
+        );
+        assert_eq!(due.changed_at, Some(observed_at));
+
+        fs::write(artisan, "next").unwrap();
+        let next_change = observed_at + Duration::from_secs(2);
+        let observed = active.watch.poll(next_change, &active.nested_roots);
+        assert!(observed.pending);
+        project.watch_rules.include = vec!["config/**/*.php".into()];
+        project.revision = Revision(3);
+        let changed_rules = next_change + Duration::from_millis(50);
+        watches.refresh(&[project], &revisions, changed_rules);
+        let active = watches.active.get_mut(&id).unwrap();
+        let observed = active.watch.poll(changed_rules, &active.nested_roots);
+        assert!(observed.ready && !observed.changed && !observed.pending);
+    }
 }

@@ -17,7 +17,7 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `provider.list` | Omit or use `{}` | Supported provider names |
 | `provider.detect` | Project UUID `id` | Preferred provider, Herd and system availability, and whether an override is configured |
 | `provider.resolvePhp` | Project UUID `id`, optional `provider` or absolute `php` override | Validated executable `path` and `source` |
-| `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` |
+| `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` if absent or invalidated by the watcher |
 | `queue.discover` | Same parameters as `provider.resolvePhp` | Fresh snapshot with default connection, connection names and drivers, omission count, observation time, and PHP source |
 | `queue.suggestions` | Project UUID `id`, optional `explicit` string array | Incomplete symbolic name suggestions with sources, ordered configured profile queues, and scan coverage flags |
 | `scheduler.configure` | Project UUID `id`, optional `options`, optional `expected_revision` for updates, optional UUID `idempotency_key` | Mutation result with the scheduler profile |

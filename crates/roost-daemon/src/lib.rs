@@ -25,7 +25,7 @@ use std::{
 };
 
 use discovery_rpc::{DiscoveryCall, Snapshots};
-use roost_core::{Project, ProjectId, worker_runtime::DaemonStartup};
+use roost_core::{Project, ProjectId, Revision, worker_runtime::DaemonStartup};
 use roost_ipc::{
     self as rpc, AddParams, GetParams, Hello, HelloParams, Mutation, RemoveParams, Removed,
     RpcError, Status, endpoint,
@@ -222,6 +222,8 @@ pub struct DaemonService {
     startup: DaemonStartup,
     workers: Mutex<Supervisor>,
     watch_status: Mutex<HashMap<ProjectId, watch::RuntimeStatus>>,
+    // Distinguishes a watch configuration change from unrelated project edits.
+    watch_config_revisions: Mutex<HashMap<ProjectId, Revision>>,
     snapshots: Mutex<Snapshots>,
     discovery_capacity: Arc<Semaphore>,
 }
@@ -240,7 +242,8 @@ impl DaemonService {
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone(), intents, schedulers)),
             watch_status: Mutex::default(),
-            snapshots: Mutex::new(Snapshots::new()),
+            watch_config_revisions: Mutex::default(),
+            snapshots: Mutex::default(),
             discovery_capacity: Arc::new(Semaphore::new(2)),
             db,
             started: Instant::now(),
@@ -527,6 +530,11 @@ impl ProjectCall {
                 if apply {
                     workers.remove(params.id);
                     workers.remove_scheduler_runtime(params.id);
+                    service
+                        .watch_config_revisions
+                        .lock()
+                        .map_err(|_| internal_error())?
+                        .remove(&params.id);
                 }
                 encode(Mutation {
                     operation_id,

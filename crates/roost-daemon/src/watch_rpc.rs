@@ -143,6 +143,7 @@ fn set_enabled(
     change: WatchChange,
 ) -> Result<Value, RpcError> {
     let supervisor = service.workers.lock().map_err(|_| internal_error())?;
+    let mut applied = false;
     let (operation_id, result) = worker_mutation(store, operation, key, || {
         supervisor.validate_mutation()?;
         let mut project = store.get_project(change.id)?.ok_or(StoreError::NotFound)?;
@@ -172,9 +173,21 @@ fn set_enabled(
             project.watch_enabled = change.enabled;
             project.watch_rules = rules;
             project = store.update_project(project)?;
+            applied = true;
         }
         Ok(project)
     })?;
+    if applied {
+        let mut revisions = service
+            .watch_config_revisions
+            .lock()
+            .map_err(|_| internal_error())?;
+        if result.watch_enabled {
+            revisions.insert(result.id, result.revision);
+        } else {
+            revisions.remove(&result.id);
+        }
+    }
     encode(Mutation {
         operation_id,
         result,
