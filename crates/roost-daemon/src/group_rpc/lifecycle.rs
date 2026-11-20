@@ -19,7 +19,7 @@ use super::{at_revision, group};
 use crate::{
     encode, request_key, store_error,
     supervisor::{Error, Plan, SchedulerPlan, Supervisor},
-    worker_rpc::{worker_error, worker_mutation},
+    worker_rpc::worker_error,
 };
 
 struct Start {
@@ -68,7 +68,7 @@ impl Start {
         })
     }
 
-    fn persist(&self, store: &Store, id: ProjectId) -> Result<GroupOutcome, Error> {
+    fn persist(&self, store: &Store, id: ProjectId) -> Result<(), Error> {
         if let Some(plan) = &self.workers {
             store.set_project_intent(
                 id,
@@ -86,14 +86,18 @@ impl Start {
                 },
             )?;
         }
-        Ok(if self.workers.is_none() && self.scheduler.is_none() {
+        Ok(())
+    }
+
+    fn outcome(&self) -> GroupOutcome {
+        if self.workers.is_none() && self.scheduler.is_none() {
             GroupOutcome::Unchanged
         } else {
             GroupOutcome::Accepted {
                 workers: self.workers.is_some(),
                 scheduler: self.scheduler.is_some(),
             }
-        })
+        }
     }
 
     fn apply(self, supervisor: &mut Supervisor, id: ProjectId) {
@@ -130,50 +134,57 @@ pub(super) fn launch(
             .map_err(worker_error)?;
     }
     let mut plans = Vec::new();
-    let (operation_id, result) = worker_mutation(store, params.idempotency_key, &key, || {
-        at_revision(store, params.id, params.expected_revision)?;
-        let ids: HashSet<_> = members.iter().map(|project| project.id).collect();
-        let mut launches = HashMap::new();
-        for launch in &params.launches {
-            if !ids.contains(&launch.id) || launches.insert(launch.id, launch).is_some() {
-                return Err(Error::Invalid(
-                    "launches must contain distinct group member IDs",
-                ));
-            }
-        }
-        let mut capacity = supervisor.available_capacity();
-        let mut projects = Vec::new();
-        for member in members {
-            let id = member.id;
-            let prepared =
-                Start::prepare(supervisor, store, id, launches.get(&id).copied(), restart)
-                    .and_then(|plan| {
-                        let growth = supervisor.additional_capacity(
-                            id,
-                            plan.workers.as_ref(),
-                            plan.scheduler.as_ref(),
-                        );
-                        capacity = capacity.checked_sub(growth).ok_or(Error::Capacity)?;
-                        Ok(plan)
-                    });
-            let outcome = match prepared {
-                Ok(plan) => {
-                    let outcome = plan.persist(store, id)?;
-                    plans.push((id, plan));
-                    outcome
+    // Intents and the receipt use the same transaction. Only install plans
+    // after commit, so a late write error leaves the runtime untouched.
+    let (operation_id, result) = store
+        .try_mutate(params.idempotency_key, &key, |store| {
+            at_revision(store, params.id, params.expected_revision)?;
+            let ids: HashSet<_> = members.iter().map(|project| project.id).collect();
+            let mut launches = HashMap::new();
+            for launch in &params.launches {
+                if !ids.contains(&launch.id) || launches.insert(launch.id, launch).is_some() {
+                    return Err(Error::Invalid(
+                        "launches must contain distinct group member IDs",
+                    ));
                 }
-                Err(error @ Error::Store(_)) => return Err(error),
-                Err(error) => GroupOutcome::Failed {
-                    error: worker_error(error),
-                },
-            };
-            projects.push(GroupProjectResult { id, outcome });
-        }
-        Ok(GroupLifecycle {
-            id: params.id,
-            projects,
+            }
+            let mut capacity = supervisor.available_capacity();
+            let mut projects = Vec::new();
+            for member in members {
+                let id = member.id;
+                let prepared =
+                    Start::prepare(supervisor, store, id, launches.get(&id).copied(), restart)
+                        .and_then(|plan| {
+                            let growth = supervisor.additional_capacity(
+                                id,
+                                plan.workers.as_ref(),
+                                plan.scheduler.as_ref(),
+                            );
+                            capacity = capacity.checked_sub(growth).ok_or(Error::Capacity)?;
+                            Ok(plan)
+                        });
+                let outcome = match prepared {
+                    Ok(plan) => {
+                        let outcome = plan.outcome();
+                        plans.push((id, plan));
+                        outcome
+                    }
+                    Err(error @ Error::Store(_)) => return Err(error),
+                    Err(error) => GroupOutcome::Failed {
+                        error: worker_error(error),
+                    },
+                };
+                projects.push(GroupProjectResult { id, outcome });
+            }
+            for (id, plan) in &plans {
+                plan.persist(store, *id)?;
+            }
+            Ok(GroupLifecycle {
+                id: params.id,
+                projects,
+            })
         })
-    })?;
+        .map_err(worker_error)?;
     for (id, plan) in plans {
         plan.apply(supervisor, id);
     }
@@ -190,30 +201,32 @@ pub(super) fn stop(
 ) -> Result<Value, RpcError> {
     let key = request_key("group.stop", &params)?;
     let mut stopped = Vec::new();
-    let (operation_id, result) = worker_mutation(store, params.idempotency_key, &key, || {
-        group(store, params.id)?;
-        let mut projects = Vec::new();
-        for member in store.group_projects(params.id)? {
-            let id = member.id;
-            let scheduler = store.project_scheduler(id)?.is_some();
-            store.set_project_intent(id, &ProjectIntent::Stopped)?;
-            if scheduler {
-                store.set_scheduler_intent(id, &SchedulerIntent::Stopped)?;
+    let (operation_id, result) = store
+        .try_mutate(params.idempotency_key, &key, |store| {
+            group(store, params.id)?;
+            let mut projects = Vec::new();
+            for member in store.group_projects(params.id)? {
+                let id = member.id;
+                let scheduler = store.project_scheduler(id)?.is_some();
+                store.set_project_intent(id, &ProjectIntent::Stopped)?;
+                if scheduler {
+                    store.set_scheduler_intent(id, &SchedulerIntent::Stopped)?;
+                }
+                stopped.push((id, scheduler));
+                projects.push(GroupProjectResult {
+                    id,
+                    outcome: GroupOutcome::Accepted {
+                        workers: true,
+                        scheduler,
+                    },
+                });
             }
-            stopped.push((id, scheduler));
-            projects.push(GroupProjectResult {
-                id,
-                outcome: GroupOutcome::Accepted {
-                    workers: true,
-                    scheduler,
-                },
-            });
-        }
-        Ok(GroupLifecycle {
-            id: params.id,
-            projects,
+            Ok(GroupLifecycle {
+                id: params.id,
+                projects,
+            })
         })
-    })?;
+        .map_err(worker_error)?;
     for (id, scheduler) in stopped {
         supervisor.apply_stop(id);
         if scheduler {

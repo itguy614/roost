@@ -1,7 +1,10 @@
-use roost_core::{ConfigOwner, ProjectId, Revision, WatchRules};
+use roost_core::{ConfigOwner, Group, Project, ProjectId, Revision, WatchRules};
 use roost_ipc::{
     Mutation, RpcError,
-    watch::{CodeRestartParams, DisableWatchParams, EnableWatchParams, WatchState, WatchStatus},
+    watch::{
+        CodeRestartParams, DisableWatchParams, EnableWatchParams, SharedWatchStatus, WatchState,
+        WatchStatus,
+    },
     workers::ProjectParams,
 };
 use roost_store::{Error as StoreError, Store};
@@ -39,6 +42,12 @@ impl WatchCall {
                     .get_project(params.id)
                     .map_err(store_error)?
                     .ok_or_else(|| store_error(StoreError::NotFound))?;
+                let group = project
+                    .group_id
+                    .map(|id| store.get_group(id))
+                    .transpose()
+                    .map_err(store_error)?
+                    .flatten();
                 let runtime = service.watch_status.lock().map_err(|_| internal_error())?;
                 let runtime = runtime.get(&params.id).filter(|runtime| {
                     project.watch_enabled && runtime.revision == project.revision
@@ -51,6 +60,11 @@ impl WatchCall {
                     },
                     |runtime| runtime.state,
                 );
+                let shared = shared_status(
+                    &project,
+                    group,
+                    runtime.map_or(&[], |runtime| &runtime.shared),
+                );
                 encode(WatchStatus {
                     id: params.id,
                     revision: project.revision,
@@ -60,7 +74,7 @@ impl WatchCall {
                     problem: runtime
                         .and_then(|runtime| runtime.problem)
                         .map(str::to_owned),
-                    shared: runtime.map_or_else(Vec::new, |runtime| runtime.shared.clone()),
+                    shared,
                 })
             }
             Self::Enable(params) => {
@@ -127,6 +141,37 @@ impl WatchCall {
             }
         }
     }
+}
+
+fn shared_status(
+    project: &Project,
+    group: Option<Group>,
+    observed: &[SharedWatchStatus],
+) -> Vec<SharedWatchStatus> {
+    let Some(group) = group else {
+        return Vec::new();
+    };
+    let mut status = Vec::new();
+    for mapping in group.shared_paths {
+        if mapping.projects.contains(&project.id) {
+            let current = observed
+                .iter()
+                .find(|entry| entry.group_id == group.id && entry.path == mapping.path);
+            status.push(current.cloned().unwrap_or(SharedWatchStatus {
+                group_id: group.id,
+                path: mapping.path,
+                state: if project.watch_enabled {
+                    WatchState::Initializing
+                } else {
+                    WatchState::Disabled
+                },
+                pending: false,
+                problem: None,
+            }));
+        }
+    }
+    status.sort_by(|a, b| a.path.cmp(&b.path));
+    status
 }
 
 struct WatchChange {

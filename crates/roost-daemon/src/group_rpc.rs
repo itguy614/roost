@@ -229,14 +229,14 @@ fn configure(store: &Store, mut group: Group, options: GroupOptions) -> Result<G
     }
     let root = group.root_path.as_ref().expect("validated group root");
     let projects = store.list_projects()?;
-    let mut occupied = Vec::new();
+    let mut accepted_paths = Vec::new();
     for other in store
         .list_groups()?
         .into_iter()
         .filter(|other| other.id != group.id)
     {
         if let Some(root) = &other.root_path {
-            occupied.extend(
+            accepted_paths.extend(
                 other
                     .shared_paths
                     .iter()
@@ -244,7 +244,7 @@ fn configure(store: &Store, mut group: Group, options: GroupOptions) -> Result<G
             );
         }
     }
-    if occupied.len() + group.shared_paths.len() > MAX_SHARED_WATCHES {
+    if accepted_paths.len() + group.shared_paths.len() > MAX_SHARED_WATCHES {
         return Err(Error::Conflict(
             "daemon shared watch capacity is 16 directories",
         ));
@@ -259,7 +259,7 @@ fn configure(store: &Store, mut group: Group, options: GroupOptions) -> Result<G
                 "a shared directory cannot be a registered project root",
             ));
         }
-        if occupied
+        if accepted_paths
             .iter()
             .any(|other| path.starts_with(other) || other.starts_with(&path))
         {
@@ -276,7 +276,8 @@ fn configure(store: &Store, mut group: Group, options: GroupOptions) -> Result<G
                 "shared watch targets must be group members under the group root",
             ));
         }
-        occupied.push(path);
+        // Later mappings in this group must also be disjoint from this one.
+        accepted_paths.push(path);
     }
     Ok(group)
 }

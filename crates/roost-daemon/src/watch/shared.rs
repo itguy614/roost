@@ -122,9 +122,6 @@ impl SharedWatches {
                 }
             }
         }
-        for status in statuses.values_mut() {
-            status.shared.sort_by(|a, b| a.path.cmp(&b.path));
-        }
     }
 
     pub(super) fn has_changes(&self) -> bool {

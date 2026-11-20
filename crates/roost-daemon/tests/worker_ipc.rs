@@ -1557,6 +1557,7 @@ async fn group_membership_and_shared_paths_are_revisioned_and_durable() {
     let other_app = h.app("other", "graceful");
     let shared = h.root.join("shared");
     fs::create_dir(&shared).unwrap();
+    fs::create_dir(shared.join("nested")).unwrap();
     let (mut daemon, mut client) = h.daemon().await;
     let id = h
         .register(&mut client, &app, 1, CrashRestartPolicy::Never)
@@ -1606,6 +1607,25 @@ async fn group_membership_and_shared_paths_are_revisioned_and_durable() {
     assert!(matches!(symlink, Err(ClientError::Rpc(error)) if error.code == INVALID_PARAMS));
     let outside = client.update_group(&update("shared", vec![other])).await;
     assert!(matches!(outside, Err(ClientError::Rpc(error)) if error.code == CONFLICT));
+    for (first, second) in [("shared", "shared/nested"), ("shared/nested", "shared")] {
+        let mut overlap = update(first, vec![id]);
+        overlap.options.shared_paths.push(SharedWatchPath {
+            path: second.into(),
+            projects: vec![id],
+        });
+        let denied = client.update_group(&overlap).await;
+        assert!(
+            matches!(denied, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("overlap"))
+        );
+        assert_eq!(
+            client
+                .get_group(&GroupParams { id: group.id })
+                .await
+                .unwrap()
+                .group,
+            group
+        );
+    }
     let group = client
         .update_group(&update("shared", vec![id]))
         .await
@@ -1690,7 +1710,7 @@ async fn group_lifecycle_reports_partial_failure_and_shared_edits_restart_only_m
             name: "Monorepo".into(),
             expected_revision: group.revision,
             options: GroupOptions {
-                root_path: group.root_path,
+                root_path: group.root_path.clone(),
                 shared_paths: vec![SharedWatchPath {
                     path: "beta/shared".into(),
                     projects: vec![id],
@@ -1813,6 +1833,52 @@ async fn group_lifecycle_reports_partial_failure_and_shared_edits_restart_only_m
     assert_eq!(worker_pid(&mut client, other).await, other_worker);
     assert_eq!(scheduler_ready(&mut client, id, None).await, scheduler);
 
+    let other_params = ProjectParams { id: other };
+    let enabled = client.watch_status(&other_params).await.unwrap();
+    client
+        .disable_watch(&DisableWatchParams {
+            id: other,
+            expected_revision: enabled.revision,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    client
+        .update_group(&UpdateGroupParams {
+            id: group.id,
+            name: group.name.clone(),
+            expected_revision: group.revision,
+            options: GroupOptions {
+                root_path: group.root_path.clone(),
+                shared_paths: vec![SharedWatchPath {
+                    path: "beta/shared".into(),
+                    projects: vec![id, other],
+                }],
+                ..GroupOptions::default()
+            },
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    let opted_out = client.watch_status(&other_params).await.unwrap();
+    assert_eq!(opted_out.state, WatchState::Disabled);
+    assert!(!opted_out.pending);
+    assert_eq!(opted_out.shared.len(), 1);
+    let mapping = &opted_out.shared[0];
+    assert_eq!(mapping.group_id, group.id);
+    assert_eq!(mapping.path, Path::new("beta/shared"));
+    assert_eq!(mapping.state, WatchState::Disabled);
+    assert!(!mapping.pending && mapping.problem.is_none());
+    assert_eq!(
+        client
+            .watch_status(&ProjectParams { id })
+            .await
+            .unwrap()
+            .shared[0]
+            .state,
+        WatchState::Watching
+    );
+
     fs::write(&file, "<?php // another shared change").unwrap();
     until_watch(&mut client, id, |status| {
         status.shared.iter().any(|mapping| mapping.pending)
@@ -1927,4 +1993,117 @@ async fn group_start_reserves_combined_capacity_before_applying_any_runtime_plan
         Some(DesiredState::Running)
     );
     assert_eq!(view.members[1].project.desired_state, DesiredState::Stopped);
+}
+
+#[tokio::test]
+async fn group_launch_rolls_back_all_intents_when_a_late_write_fails() {
+    let h = Harness::new();
+    let first = h.app("first", "graceful");
+    let second = h.app("second", "graceful");
+    let service = h.service();
+    // Observe installed plans over IPC without starting guardians.
+    let (mut client, _task) = Harness::client(&service).await;
+    let first = h
+        .register(&mut client, &first, 1, CrashRestartPolicy::Never)
+        .await;
+    let second = h
+        .register(&mut client, &second, 1, CrashRestartPolicy::Never)
+        .await;
+    for id in [first, second] {
+        client
+            .configure_scheduler(&scheduler_config(id, CrashRestartPolicy::Never))
+            .await
+            .unwrap();
+    }
+    let group = group_members(&mut client, &h.root, &[first, second]).await;
+    let key = Uuid::new_v4();
+    let launch = GroupLaunchParams {
+        id: group.id,
+        expected_revision: group.revision,
+        launches: [first, second]
+            .into_iter()
+            .map(|id| GroupProjectLaunch {
+                id,
+                php: h.php.clone(),
+                allow_horizon: false,
+            })
+            .collect(),
+        idempotency_key: Some(key),
+    };
+    let sql = |statement: &str| {
+        let output = Command::new("/usr/bin/sqlite3")
+            .arg(&h.db)
+            .arg(statement)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    // Each trigger confirms the earlier writes are visible inside the transaction
+    // before aborting the late scheduler write or the receipt write.
+    for trigger in [
+        format!(
+            "CREATE TRIGGER test_late_write BEFORE INSERT ON scheduler_intents
+                 WHEN NEW.project_id = '{}' AND
+                     (SELECT count(*) FROM project_intents) = 2 AND
+                     (SELECT count(*) FROM scheduler_intents) = 1
+                 BEGIN SELECT RAISE(ABORT, 'test scheduler intent failure'); END;",
+            second.0
+        ),
+        format!(
+            "CREATE TRIGGER test_late_write BEFORE INSERT ON mutation_receipts
+                 WHEN NEW.id = '{key}' AND
+                     (SELECT count(*) FROM project_intents) = 2 AND
+                     (SELECT count(*) FROM scheduler_intents) = 2
+                 BEGIN SELECT RAISE(ABORT, 'test receipt failure'); END;"
+        ),
+    ] {
+        sql(&trigger);
+        let failed = client.start_group(&launch).await;
+        assert!(matches!(failed, Err(ClientError::Rpc(error)) if error.code == CONFLICT));
+        let store = Store::open(&h.db).unwrap();
+        for id in [first, second] {
+            assert_eq!(store.project_intent(id).unwrap(), ProjectIntent::Stopped);
+            assert_eq!(
+                store.scheduler_intent(id).unwrap(),
+                SchedulerIntent::Stopped
+            );
+            let params = ProjectParams { id };
+            assert!(client.list_processes(&params).await.unwrap().is_empty());
+            assert!(
+                client
+                    .scheduler_status(&params)
+                    .await
+                    .unwrap()
+                    .process
+                    .is_none()
+            );
+        }
+        sql("DROP TRIGGER test_late_write;");
+    }
+    let committed = client.start_group(&launch).await.unwrap();
+    assert_eq!(committed.operation_id, key);
+    assert_eq!(committed.result.projects.len(), 2);
+    assert!(committed.result.projects.iter().all(|entry| matches!(
+        entry.outcome,
+        GroupOutcome::Accepted {
+            workers: true,
+            scheduler: true
+        }
+    )));
+    let store = Store::open(&h.db).unwrap();
+    for id in [first, second] {
+        assert_eq!(
+            store.project_intent(id).unwrap().desired(),
+            DesiredState::Running
+        );
+        assert_eq!(
+            store.scheduler_intent(id).unwrap().desired(),
+            DesiredState::Running
+        );
+    }
+    assert_eq!(client.start_group(&launch).await.unwrap().operation_id, key);
 }
