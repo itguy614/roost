@@ -12,21 +12,21 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-Expect 20 tests to pass. The automated tests cover the SQLite upgrade, concurrent commands, crash backoff, manual stop, process-group cleanup after daemon SIGKILL, and private socket permissions. If the socket test fails at `bind` with `Operation not permitted`, run the remaining suite with the command below. The socket test and the smoke test still need a session that permits filesystem Unix sockets.
+The automated suite covers SQLite upgrades, concurrent commands, crash backoff, output redaction, durable intent, daemon SIGTERM and SIGKILL, process-group cleanup, and private socket permissions. If filesystem sockets are blocked with `Operation not permitted`, the command below runs the tests that do not need a named socket. The skipped tests and the smoke test still need a session that permits filesystem Unix sockets.
 
 ```sh
-cargo test --workspace --locked -- --skip protects_private_endpoint_and_recovers_a_stale_socket
+cargo test --workspace --locked -- --skip protects_private_endpoint_and_recovers_a_stale_socket --skip real_daemon_signals_recover_only_opted_in_intent_after_cleanup
 ```
 
 ## 2. Test the CLI against a real daemon socket
 
-Run the script from the checkout. It builds the CLI and daemon for the current Mac before running them, so binaries left by an earlier milestone cannot affect the test. It also builds a Rust worker fixture, uses disposable daemon state, and checks the worker PID change, manual stop, output summaries, and registration persistence.
+Run the script from the checkout. It builds the CLI and daemon for the current Mac before running them, so binaries left by an earlier milestone cannot affect the test. It also builds a Rust worker fixture, uses disposable daemon state, and checks the worker PID change, manual stop, bounded output lines, and registration persistence.
 
 ```sh
 ./m2-test.sh
 ```
 
-Expect two different worker PIDs, a `stopped` state after manual stop, and a final `Milestone 2 CLI smoke test passed.` The fixture produces output summaries. A failed run leaves its temporary state and prints the daemon log for diagnosis.
+Expect two different worker PIDs, a `stopped` state after manual stop, and a final `Milestone 2 CLI smoke test passed.` The fixture produces bounded output lines. A failed run leaves its temporary state and prints the daemon log for diagnosis.
 
 ## 3. Repeat with a local Laravel app
 

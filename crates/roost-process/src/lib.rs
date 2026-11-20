@@ -1,21 +1,17 @@
 use std::{
-    collections::VecDeque,
     ffi::CString,
-    io::{self, Read},
-    os::{
-        fd::AsRawFd,
-        unix::{ffi::OsStrExt, process::CommandExt},
-    },
+    io,
+    os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command},
     ptr,
 };
 
 use roost_core::worker_runtime::{MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCES};
-use roost_core::{
-    Project, WorkerProfile, unix_timestamp,
-    worker_runtime::{OutputStream, OutputSummary},
-};
+use roost_core::{Project, WorkerProfile, worker_runtime::LaunchFailure};
+
+mod output;
+pub use output::OutputPipe;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -110,54 +106,30 @@ pub fn spawn_in_session(mut command: Command) -> io::Result<Child> {
     command.spawn()
 }
 
-pub struct OutputPipe<R>(R);
-
-impl<R: Read + AsRawFd> OutputPipe<R> {
-    pub fn new(reader: R) -> io::Result<Self> {
-        let fd = reader.as_raw_fd();
-        // SAFETY: reader owns a valid pipe descriptor.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(reader))
+/// Only clearly temporary resource errors qualify for automatic launch retries.
+pub fn classify_spawn_error(error: &io::Error) -> LaunchFailure {
+    match error.raw_os_error() {
+        Some(
+            libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::ETXTBSY | libc::EINTR,
+        ) => LaunchFailure::ResourceUnavailable,
+        _ => LaunchFailure::SpawnRejected,
     }
+}
 
-    /// Drain at most 64 KiB per tick so a noisy child cannot monopolize the supervisor.
-    pub fn drain(
-        &mut self,
-        stream: OutputStream,
-        status: &roost_core::worker_runtime::WorkerStatus,
-        entries: &mut VecDeque<OutputSummary>,
-    ) -> bool {
-        let mut buffer = [0; 8192];
-        let mut bytes = 0;
-        let mut newlines = 0;
-        for _ in 0..8 {
-            match self.0.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => {
-                    bytes += count as u32;
-                    newlines += buffer[..count]
-                        .iter()
-                        .filter(|&&byte| byte == b'\n')
-                        .count() as u32;
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_only_known_temporary_spawn_errors() {
+        for code in [libc::EAGAIN, libc::EMFILE, libc::ENOMEM, libc::EINTR] {
+            assert!(classify_spawn_error(&io::Error::from_raw_os_error(code)).retryable());
         }
-        if bytes > 0 {
-            if entries.len() >= 64 {
-                entries.pop_front();
-            }
-            entries.push_back(OutputSummary {
-                instance_id: status.id,
-                generation: status.generation,
-                at: unix_timestamp(),
-                stream,
-                bytes,
-                newlines,
-            });
+        for code in [libc::ENOENT, libc::ENOEXEC, libc::EPERM, libc::EACCES] {
+            assert_eq!(
+                classify_spawn_error(&io::Error::from_raw_os_error(code)),
+                LaunchFailure::SpawnRejected
+            );
         }
-        bytes > 0
     }
 }

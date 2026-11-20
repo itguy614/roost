@@ -27,11 +27,25 @@ pub struct ProcessIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopCause {
+    ProjectStop,
+    ProjectRestart,
+    DaemonShutdown,
+    DaemonDisconnected,
+    StartupTimeout,
+    StatePublicationFailed,
+    GuardianWaitFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessExit {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub at: u64,
     pub requested_stop: bool,
+    #[serde(default)]
+    pub stop_cause: Option<StopCause>,
     pub forced: bool,
 }
 
@@ -46,6 +60,36 @@ impl ProcessExit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchFailure {
+    Validation,
+    SpawnRejected,
+    ResourceUnavailable,
+    ReadinessTimeout,
+    StatePublication,
+    Cancelled,
+}
+
+impl LaunchFailure {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Validation => "worker configuration or PHP path failed validation",
+            Self::SpawnRejected => "the OS rejected the worker launch",
+            Self::ResourceUnavailable => "OS resources were temporarily unavailable during launch",
+            Self::ReadinessTimeout => "startup timed out and worker cleanup was confirmed",
+            Self::StatePublication => {
+                "could not persist worker ownership; worker cleanup was confirmed"
+            }
+            Self::Cancelled => "worker launch was cancelled before execution",
+        }
+    }
+
+    pub fn retryable(self) -> bool {
+        matches!(self, Self::ResourceUnavailable | Self::ReadinessTimeout)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WorkerLeaseState {
@@ -54,6 +98,7 @@ pub enum WorkerLeaseState {
     Running { identity: ProcessIdentity },
     Exited { exit: ProcessExit },
     LaunchFailed,
+    LaunchFailure { failure: LaunchFailure },
     Uncertain { identity: Option<ProcessIdentity> },
 }
 
@@ -83,6 +128,10 @@ pub struct WorkerStatus {
     pub retry_in_ms: Option<u64>,
     pub recovery_blocked: bool,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub launch_failure: Option<LaunchFailure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +149,8 @@ pub struct OutputSummary {
     pub stream: OutputStream,
     pub bytes: u32,
     pub newlines: u32,
+    #[serde(default)]
+    pub text: String,
 }
 
 #[cfg(test)]
@@ -113,6 +164,7 @@ mod tests {
             signal: None,
             at: 0,
             requested_stop: false,
+            stop_cause: None,
             forced: false,
         };
         let failed = ProcessExit {
@@ -149,4 +201,46 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchIntent {
+    pub php: std::path::PathBuf,
+    pub allow_horizon: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectIntent {
+    #[default]
+    Stopped,
+    Running(LaunchIntent),
+}
+
+impl ProjectIntent {
+    pub fn desired(&self) -> DesiredState {
+        match self {
+            Self::Stopped => DesiredState::Stopped,
+            Self::Running(_) => DesiredState::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonStartup {
+    FirstStart,
+    AfterCleanShutdown,
+    AfterInterruptedShutdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrashReport {
+    pub id: Uuid,
+    pub project_id: ProjectId,
+    pub profile_id: WorkerProfileId,
+    pub slot: u32,
+    pub exit: ProcessExit,
+    pub reason: String,
+    pub output: Vec<OutputSummary>,
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use std::{
@@ -11,7 +12,9 @@ use std::{
 
 use roost_core::{
     DesiredState, ProjectId, WorkerProfile,
-    worker_runtime::{ObservedState, OutputSummary, WorkerLeaseState, WorkerStatus},
+    worker_runtime::{
+        LaunchIntent, ObservedState, OutputSummary, StopCause, WorkerLeaseState, WorkerStatus,
+    },
 };
 use roost_store::Store;
 
@@ -19,6 +22,7 @@ mod slot;
 use slot::{Slot, status_for};
 
 const MAX_ACTIVE: usize = 32;
+const MAX_OUTPUT_SLOTS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -28,6 +32,10 @@ pub enum Error {
     Invalid(&'static str),
     #[error("{0}")]
     Conflict(&'static str),
+    #[error("worker recovery is blocked until the previous guardian confirms cleanup")]
+    RecoveryBlocked,
+    #[error("daemon capacity is 32 worker instances")]
+    Capacity,
 }
 
 pub struct Supervisor {
@@ -35,6 +43,9 @@ pub struct Supervisor {
     db: PathBuf,
     projects: HashMap<ProjectId, ProjectRuntime>,
     closing: bool,
+    recovering: Vec<(ProjectId, LaunchIntent)>,
+    recovery_errors: HashMap<ProjectId, String>,
+    next_recovery: Instant,
 }
 
 struct ProjectRuntime {
@@ -49,13 +60,22 @@ pub struct Plan {
     slots: Vec<(WorkerProfile, u32)>,
 }
 
+impl Plan {
+    pub fn php(&self) -> &Path {
+        &self.php
+    }
+}
+
 impl Supervisor {
-    pub fn new(binary: PathBuf, db: PathBuf) -> Self {
+    pub fn new(binary: PathBuf, db: PathBuf, recovering: Vec<(ProjectId, LaunchIntent)>) -> Self {
         Self {
             binary,
             db,
             projects: HashMap::new(),
             closing: false,
+            recovering,
+            recovery_errors: HashMap::new(),
+            next_recovery: Instant::now(),
         }
     }
 
@@ -74,7 +94,9 @@ impl Supervisor {
 
     pub fn validate_config_change(&self, store: &Store, id: ProjectId) -> Result<(), Error> {
         self.validate_mutation()?;
-        if self.desired(id) == DesiredState::Running || !store.project_worker_leases(id)?.is_empty()
+        if self.desired(id) == DesiredState::Running
+            || self.recovering.iter().any(|(project, _)| *project == id)
+            || !store.project_worker_leases(id)?.is_empty()
         {
             return Err(Error::Conflict(
                 "stop the project and wait for worker cleanup first",
@@ -105,9 +127,7 @@ impl Supervisor {
                         && !matches!(lease.state, WorkerLeaseState::Uncertain { .. })
                 })
             }) {
-                return Err(Error::Conflict(
-                    "worker recovery is blocked until the previous guardian confirms cleanup",
-                ));
+                return Err(Error::RecoveryBlocked);
             }
         }
         if !restart && self.desired(id) == DesiredState::Running {
@@ -145,7 +165,7 @@ impl Supervisor {
             .map(|(_, runtime)| runtime.reserved_capacity())
             .sum();
         if other_count + slots.len() > MAX_ACTIVE {
-            return Err(Error::Conflict("daemon capacity is 32 worker instances"));
+            return Err(Error::Capacity);
         }
         Ok(Some(Plan {
             php,
@@ -154,36 +174,70 @@ impl Supervisor {
         }))
     }
 
+    pub fn cancel_recovery(&mut self, id: ProjectId) {
+        self.recovering.retain(|(project, _)| *project != id);
+        self.recovery_errors.remove(&id);
+    }
+
+    fn recover_projects(&mut self, store: &Store) {
+        self.next_recovery = Instant::now() + Duration::from_secs(1);
+        for (id, launch) in std::mem::take(&mut self.recovering) {
+            let result = self
+                .clean_previous(store, id)
+                .and_then(|()| self.prepare(store, id, &launch.php, launch.allow_horizon, false));
+            match result {
+                Ok(Some(plan)) => self.apply_start(id, plan),
+                Ok(None) => {}
+                Err(error @ (Error::RecoveryBlocked | Error::Capacity)) => {
+                    self.recovery_errors.insert(id, error.to_string());
+                    self.recovering.push((id, launch));
+                }
+                Err(Error::Store(_)) => {
+                    self.recovery_errors
+                        .insert(id, "could not read worker recovery state".into());
+                    self.recovering.push((id, launch));
+                }
+                Err(error) => {
+                    self.recovery_errors.insert(id, error.to_string());
+                }
+            }
+        }
+    }
+
     pub fn apply_start(&mut self, id: ProjectId, plan: Plan) {
+        self.cancel_recovery(id);
         let runtime = self.projects.entry(id).or_insert_with(|| ProjectRuntime {
             desired: DesiredState::Stopped,
             replacement: None,
             slots: Vec::new(),
         });
-        runtime.stop_slots();
+        runtime.stop_slots(StopCause::ProjectRestart);
         runtime.desired = DesiredState::Running;
         runtime.replacement = Some(plan);
         runtime.install_replacement(id);
     }
 
     pub fn apply_stop(&mut self, id: ProjectId) {
+        self.cancel_recovery(id);
         if let Some(project) = self.projects.get_mut(&id) {
             project.desired = DesiredState::Stopped;
             project.replacement = None;
-            project.stop_slots();
+            project.stop_slots(StopCause::ProjectStop);
         }
     }
 
     pub fn remove(&mut self, id: ProjectId) {
+        self.cancel_recovery(id);
         self.projects.remove(&id);
     }
 
     pub fn shutdown(&mut self) {
         self.closing = true;
+        self.recovering.clear();
         for runtime in self.projects.values_mut() {
             runtime.replacement = None;
             runtime.desired = DesiredState::Stopped;
-            runtime.stop_slots();
+            runtime.stop_slots(StopCause::DaemonShutdown);
         }
     }
 
@@ -200,6 +254,7 @@ impl Supervisor {
             .into_iter()
             .flat_map(|runtime| runtime.slots.iter().map(Slot::status))
             .collect();
+        let desired = store.project_intent(id)?.desired();
         for lease in store.project_worker_leases(id)? {
             if lease_is_complete(&lease.state)
                 || self.projects.get(&id).is_some_and(|runtime| {
@@ -222,15 +277,32 @@ impl Supervisor {
                     state: ObservedState::Failed,
                     recovery_blocked: true,
                     last_error: Some("previous guardian has not confirmed worker cleanup".into()),
+                    reason: Some("previous guardian has not confirmed worker cleanup".into()),
                     ..status_for(
                         lease.id,
                         lease.project_id,
                         lease.profile_id,
                         lease.slot,
-                        DesiredState::Stopped,
+                        desired,
                     )
                 }
             });
+        }
+        if statuses.is_empty()
+            && let Some(error) = self.recovery_errors.get(&id)
+        {
+            for profile in store
+                .list_worker_profiles(id)?
+                .into_iter()
+                .filter(|p| p.enabled && p.desired_instances > 0)
+            {
+                statuses.push(WorkerStatus {
+                    state: ObservedState::Failed,
+                    reason: Some(error.clone()),
+                    last_error: Some(error.clone()),
+                    ..status_for(profile.id.0, id, profile.id, 0, desired)
+                });
+            }
         }
         Ok(statuses)
     }
@@ -252,10 +324,14 @@ impl Supervisor {
                     .iter()
                     .any(|slot| slot.has_guardian() || slot.should_launch())
         });
-        if !pending {
+        let recover_now = !self.recovering.is_empty() && Instant::now() >= self.next_recovery;
+        if !pending && !recover_now {
             return Ok(());
         }
         let store = Store::open(&self.db)?;
+        if recover_now {
+            self.recover_projects(&store);
+        }
         let mut outcome = Ok(());
         for (&id, runtime) in &mut self.projects {
             for slot in &mut runtime.slots {
@@ -272,7 +348,24 @@ impl Supervisor {
                 }
             }
         }
+        self.trim_output();
         outcome
+    }
+
+    fn trim_output(&mut self) {
+        let mut retained: Vec<_> = self
+            .projects
+            .values_mut()
+            .flat_map(|runtime| &mut runtime.slots)
+            .filter_map(|slot| slot.output_priority().map(|priority| (priority, slot)))
+            .collect();
+        if retained.len() > MAX_OUTPUT_SLOTS {
+            retained.sort_unstable_by_key(|(priority, _)| *priority);
+            let excess = retained.len() - MAX_OUTPUT_SLOTS;
+            for (_, slot) in retained.into_iter().take(excess) {
+                slot.discard_output();
+            }
+        }
     }
 
     pub fn clean_previous(&self, store: &Store, id: ProjectId) -> Result<(), Error> {
@@ -286,7 +379,7 @@ impl Supervisor {
                         .any(|slot| slot.lease_id == Some(lease.id))
                 })
             {
-                store.release_worker(lease.id)?;
+                store.finish_previous_worker(&lease)?;
             }
         }
         Ok(())
@@ -296,7 +389,9 @@ impl Supervisor {
 fn lease_is_complete(state: &WorkerLeaseState) -> bool {
     matches!(
         state,
-        WorkerLeaseState::Exited { .. } | WorkerLeaseState::LaunchFailed
+        WorkerLeaseState::Exited { .. }
+            | WorkerLeaseState::LaunchFailed
+            | WorkerLeaseState::LaunchFailure { .. }
     )
 }
 
@@ -329,9 +424,9 @@ impl ProjectRuntime {
         current.max(self.replacement.as_ref().map_or(0, |plan| plan.slots.len()))
     }
 
-    fn stop_slots(&mut self) {
+    fn stop_slots(&mut self, cause: StopCause) {
         for slot in &mut self.slots {
-            slot.stop();
+            slot.stop(cause);
         }
     }
 }

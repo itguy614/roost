@@ -44,7 +44,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ = terminate.recv() => Ok(()),
             _ = interrupt.recv() => Ok(()),
         };
-        daemon.shutdown().await;
+        daemon.shutdown(result.is_ok()).await;
         result?;
         Ok(())
     });

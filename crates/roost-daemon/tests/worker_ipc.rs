@@ -10,12 +10,17 @@ use std::{
 
 use roost_core::{
     CrashRestartPolicy, DesiredState, ProjectId,
-    worker_runtime::{ObservedState, WorkerLeaseState, WorkerStatus},
+    worker_runtime::{
+        DaemonStartup, LaunchFailure, LaunchIntent, ObservedState, ProjectIntent, StopCause,
+        WorkerLeaseState, WorkerStatus,
+    },
 };
 use roost_daemon::DaemonService;
 use roost_ipc::{
     AddParams, CONFLICT, Client, ClientError, RemoveParams,
-    workers::{CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions},
+    workers::{
+        AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
+    },
 };
 use roost_store::Store;
 use tokio::{net::UnixStream, task::JoinHandle};
@@ -32,10 +37,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("roost-m2-{}", Uuid::new_v4()));
+        let root = Path::new("/private/tmp").join(format!("roost-m2-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let db = root.join("roost.sqlite3");
         Store::initialize(&db).unwrap();
@@ -73,6 +75,35 @@ impl Harness {
     fn poll(service: &Arc<DaemonService>) -> JoinHandle<()> {
         let service = service.clone();
         tokio::spawn(async move { service.poll_workers().await })
+    }
+
+    async fn daemon(&self) -> (OwnedChild, Client) {
+        let dir = self.root.join("daemon");
+        let mut child = OwnedChild(
+            Command::new(GUARDIAN)
+                .arg("--state-dir")
+                .arg(&dir)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let limit = Instant::now() + TOTAL_WAIT;
+        loop {
+            if let Ok(mut client) = Client::connect(&dir).await
+                && client
+                    .status()
+                    .await
+                    .is_ok_and(|status| status.pid == child.0.id())
+            {
+                return (child, client);
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "daemon exited during startup"
+            );
+            assert!(Instant::now() < limit, "daemon socket did not become ready");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     async fn register(
@@ -198,9 +229,15 @@ async fn concurrent_start_restart_stop_and_redacted_output() {
     let timeout = Instant::now() + TOTAL_WAIT;
     loop {
         let output = a.tail_logs(&ProjectParams { id }).await.unwrap();
-        if output.len() >= 2 {
+        if output.iter().any(|line| line.text == "worker ready")
+            && output
+                .iter()
+                .any(|line| line.text.contains("line redacted"))
+        {
             let encoded = serde_json::to_string(&output).unwrap();
             assert!(!encoded.contains("secret-fixture-output"));
+            assert!(encoded.contains("worker ready"));
+            assert!(encoded.contains("line redacted"));
             assert!(
                 output
                     .iter()
@@ -297,92 +334,160 @@ impl Drop for OwnedChild {
     }
 }
 
+async fn worker_pid(client: &mut Client, id: ProjectId) -> u32 {
+    until_status(client, id, all_in(ObservedState::Running, 1)).await[0]
+        .identity
+        .unwrap()
+        .pid
+}
+
+async fn descendant_pid(app: &Path) -> u32 {
+    let mut pid = None;
+    eventually(|| {
+        pid = fs::read_to_string(app.join("descendant.pid"))
+            .ok()
+            .and_then(|text| text.parse().ok());
+        pid.is_some()
+    })
+    .await;
+    pid.unwrap()
+}
+
+async fn terminate(daemon: &mut OwnedChild) {
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    // SAFETY: daemon is our unreaped Child, and try_wait confirmed it was still running.
+    assert_eq!(
+        unsafe { libc::kill(daemon.0.id() as i32, libc::SIGTERM) },
+        0
+    );
+    eventually(|| daemon.0.try_wait().unwrap().is_some()).await;
+    assert!(daemon.0.wait().unwrap().success());
+}
+
 #[tokio::test]
-async fn sigkill_daemon_owner_cleans_worker_group_before_relaunch() {
-    // Run the same service behind a connected socket in a real subprocess.
-    // The parent owns this subprocess and can safely simulate a daemon crash.
-    if let Some(db) = std::env::var_os("ROOST_TEST_OWNER_DB").map(PathBuf::from) {
-        let id = ProjectId(
-            Uuid::parse_str(&std::env::var("ROOST_TEST_OWNER_PROJECT").unwrap()).unwrap(),
-        );
-        let root = db.parent().unwrap();
-        let service = Arc::new(DaemonService::new(db.clone(), PathBuf::from(GUARDIAN)).unwrap());
-        let _poll = Harness::poll(&service);
-        let (mut client, _) = Harness::client(&service).await;
-        client
-            .start_project(&LaunchParams {
-                id,
-                php: root.join("php"),
-                allow_horizon: false,
-                idempotency_key: None,
-            })
-            .await
-            .unwrap();
-        let running = until_status(&mut client, id, all_in(ObservedState::Running, 1)).await;
-        let worker = running[0].identity.unwrap().pid;
-        eventually(|| root.join("app/descendant.pid").exists()).await;
-        fs::write(root.join("owner.ready.tmp"), worker.to_string()).unwrap();
-        fs::rename(root.join("owner.ready.tmp"), root.join("owner.ready")).unwrap();
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        panic!("test owner was not interrupted");
-    }
+async fn real_daemon_signals_recover_only_opted_in_intent_after_cleanup() {
+    use std::os::unix::process::ExitStatusExt;
 
     let h = Harness::new();
     let app = h.app("app", "ignore");
-    let service = h.service();
-    let (mut client, serve) = Harness::client(&service).await;
+    let other_app = h.app("other", "graceful");
+    let mut bystander = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+    let (mut daemon, mut client) = h.daemon().await;
+    assert_eq!(
+        client.status().await.unwrap().startup,
+        Some(DaemonStartup::FirstStart)
+    );
     let id = h
         .register(&mut client, &app, 1, CrashRestartPolicy::Never)
         .await;
-    drop(client);
-    serve.await.unwrap();
-    drop(service);
+    let other = h
+        .register(&mut client, &other_app, 1, CrashRestartPolicy::Never)
+        .await;
 
-    let mut bystander = OwnedChild(Command::new("/bin/sleep").arg("30").spawn().unwrap());
-    let mut owner = OwnedChild(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "sigkill_daemon_owner_cleans_worker_group_before_relaunch",
-            ])
-            .env("ROOST_TEST_OWNER_DB", &h.db)
-            .env("ROOST_TEST_OWNER_PROJECT", id.0.to_string())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    eventually(|| h.root.join("owner.ready").exists()).await;
-    let worker: u32 = fs::read_to_string(h.root.join("owner.ready"))
-        .unwrap()
-        .parse()
+    client
+        .set_autostart(&AutostartParams {
+            id,
+            enabled: true,
+            idempotency_key: None,
+        })
+        .await
         .unwrap();
-    let descendant: u32 = fs::read_to_string(app.join("descendant.pid"))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert!(exists(worker) && exists(descendant));
+    let launch = h.launch(id);
+    client.start_project(&launch).await.unwrap();
+    client.start_project(&h.launch(other)).await.unwrap();
+    let first = worker_pid(&mut client, id).await;
+    let first_descendant = descendant_pid(&app).await;
+    let other_worker = worker_pid(&mut client, other).await;
 
-    owner.0.kill().unwrap();
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(owner.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    terminate(&mut daemon).await;
+    assert!(!exists(first) && !exists(other_worker));
+    eventually(|| !exists(first_descendant)).await;
+    fs::remove_file(app.join("descendant.pid")).unwrap();
 
-    let replacement = h.service();
-    let (mut client, _) = Harness::client(&replacement).await;
-    let first = client.start_project(&h.launch(id)).await;
-    assert!(matches!(first, Err(ClientError::Rpc(error)) if error.code == CONFLICT));
-    let store = Store::open(&h.db).unwrap();
-    eventually(|| store.project_worker_leases(id).unwrap().iter().any(|lease| {
-        matches!(lease.state, WorkerLeaseState::Exited { exit } if exit.forced && exit.requested_stop)
-    })).await;
-    assert!(!exists(worker));
-    // A descendant can briefly remain as a zombie awaiting the reaper.
-    eventually(|| !exists(descendant)).await;
-    assert!(bystander.0.try_wait().unwrap().is_none());
+    let (mut daemon, mut client) = h.daemon().await;
     assert_eq!(
-        client.list_projects().await.unwrap()[0].desired_state,
-        DesiredState::Stopped
+        client.status().await.unwrap().startup,
+        Some(DaemonStartup::AfterCleanShutdown)
     );
-    client.start_project(&h.launch(id)).await.unwrap();
+    let second = worker_pid(&mut client, id).await;
+    let second_descendant = descendant_pid(&app).await;
+    assert_ne!(first, second);
+    let dormant = client
+        .list_projects()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|project| project.id == other)
+        .unwrap();
+    assert_eq!(dormant.desired_state, DesiredState::Running);
+    assert!(!dormant.autostart);
+    assert!(
+        client
+            .list_processes(&ProjectParams { id: other })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fs::remove_file(app.join("descendant.pid")).unwrap();
+
+    daemon.0.kill().unwrap();
+    assert_eq!(daemon.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let (mut daemon, mut client) = h.daemon().await;
+    assert_eq!(
+        client.status().await.unwrap().startup,
+        Some(DaemonStartup::AfterInterruptedShutdown)
+    );
+    let denied = client.start_project(&h.launch(id)).await;
+    assert!(
+        matches!(denied, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("cleanup"))
+    );
+    let third = worker_pid(&mut client, id).await;
+    assert_ne!(second, third);
+    assert!(!exists(second));
+    eventually(|| !exists(second_descendant)).await;
+    assert!(bystander.0.try_wait().unwrap().is_none());
+
+    client
+        .stop_project(&StopParams {
+            id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    let stopped = until_status(&mut client, id, all_in(ObservedState::Stopped, 1)).await;
+    assert_eq!(
+        stopped[0].last_exit.unwrap().stop_cause,
+        Some(StopCause::ProjectStop)
+    );
+    terminate(&mut daemon).await;
+    let (mut daemon, mut client) = h.daemon().await;
+    // A successful, old start receipt acknowledges history and cannot re-apply intent.
+    assert_eq!(
+        client
+            .start_project(&launch)
+            .await
+            .unwrap()
+            .result
+            .desired_state,
+        DesiredState::Running
+    );
+    assert!(
+        client
+            .list_processes(&ProjectParams { id })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let stopped = client
+        .list_projects()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|project| project.id == id)
+        .unwrap();
+    assert_eq!(stopped.desired_state, DesiredState::Stopped);
+    assert!(stopped.autostart);
+    terminate(&mut daemon).await;
 }
 
 #[tokio::test]
@@ -395,7 +500,7 @@ async fn horizon_requires_explicit_confirmation_and_unconfirmed_lease_blocks_sta
     )
     .unwrap();
     let service = h.service();
-    let (mut client, _) = Harness::client(&service).await;
+    let (mut client, serve) = Harness::client(&service).await;
     let id = h
         .register(&mut client, &app, 1, CrashRestartPolicy::Always)
         .await;
@@ -431,6 +536,47 @@ async fn horizon_requires_explicit_confirmation_and_unconfirmed_lease_blocks_sta
         matches!(denied, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("recovery"))
     );
     assert!(client.list_processes(&ProjectParams { id }).await.unwrap()[0].recovery_blocked);
+
+    client
+        .set_autostart(&AutostartParams {
+            id,
+            enabled: true,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    store
+        .set_project_intent(
+            id,
+            &ProjectIntent::Running(LaunchIntent {
+                php: h.php.clone(),
+                allow_horizon: true,
+            }),
+        )
+        .unwrap();
+    drop(client);
+    serve.await.unwrap();
+    drop(service);
+    let recovered = h.service();
+    let poll = Harness::poll(&recovered);
+    let (mut client, _) = Harness::client(&recovered).await;
+    let blocked = until_status(&mut client, id, |workers| {
+        workers.iter().any(|worker| worker.recovery_blocked)
+    })
+    .await;
+    assert_eq!(blocked[0].desired_state, DesiredState::Running);
+    assert!(blocked[0].identity.is_none());
+    assert_eq!(store.project_worker_leases(id).unwrap().len(), 1);
+
+    client
+        .stop_project(&StopParams {
+            id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.project_intent(id).unwrap(), ProjectIntent::Stopped);
+    poll.abort();
 }
 
 #[tokio::test]
@@ -454,7 +600,72 @@ async fn invalid_executable_is_reported_without_a_shell_fallback() {
     let failed = until_status(&mut client, id, all_in(ObservedState::Failed, 1)).await;
     assert_eq!(failed[0].generation, 1);
     assert!(failed[0].last_exit.is_none());
+    assert_eq!(failed[0].launch_failure, Some(LaunchFailure::SpawnRejected));
     assert!(!failed[0].recovery_blocked);
     assert!(!app.join("should-not-exist").exists());
     poll.abort();
+}
+
+#[tokio::test]
+async fn keeps_useful_crash_output_across_reopen_and_explains_clean_exit() {
+    let h = Harness::new();
+    let trace = h.app("trace", "trace_fail");
+    let clean = h.app("clean", "clean_exit");
+    let service = h.service();
+    let poll = Harness::poll(&service);
+    let (mut client, serve) = Harness::client(&service).await;
+    let crashed = h
+        .register(&mut client, &trace, 1, CrashRestartPolicy::Never)
+        .await;
+    let finished = h
+        .register(&mut client, &clean, 1, CrashRestartPolicy::OnFailure)
+        .await;
+    client.start_project(&h.launch(crashed)).await.unwrap();
+    client.start_project(&h.launch(finished)).await.unwrap();
+
+    let failed = until_status(&mut client, crashed, all_in(ObservedState::Failed, 1)).await;
+    assert!(failed[0].reason.as_ref().unwrap().contains("status 7"));
+    let stopped = until_status(&mut client, finished, all_in(ObservedState::Stopped, 1)).await;
+    assert_eq!(stopped[0].desired_state, DesiredState::Running);
+    assert_eq!(stopped[0].last_exit.unwrap().code, Some(0));
+    assert!(
+        stopped[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("exited cleanly")
+    );
+    assert!(
+        stopped[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("restart policy")
+    );
+    assert!(
+        client
+            .recent_crashes(&ProjectParams { id: finished })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    poll.abort();
+    let _ = poll.await;
+    drop(client);
+    serve.await.unwrap();
+    drop(service);
+    let service = h.service();
+    let (mut client, _) = Harness::client(&service).await;
+    let reports = client
+        .recent_crashes(&ProjectParams { id: crashed })
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].exit.code, Some(7));
+    let report = serde_json::to_string(&reports[0]).unwrap();
+    assert!(report.contains("RuntimeException: queue connection unavailable"));
+    assert!(report.contains("#0 src/Queue.php(20): connect()"));
+    assert!(report.contains("line redacted"));
+    assert!(!report.contains("secret-fixture-output"));
 }

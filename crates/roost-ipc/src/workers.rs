@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use roost_core::{
-    CrashRestartPolicy, DesiredState, ProjectId, WorkerProfile,
-    worker_runtime::{OutputSummary, WorkerStatus},
+    CrashRestartPolicy, DesiredState, Project, ProjectId, WorkerProfile,
+    worker_runtime::{CrashReport, OutputSummary, WorkerStatus},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -75,7 +75,29 @@ impl Default for WorkerOptions {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutostartParams {
+    pub id: ProjectId,
+    pub enabled: bool,
+    pub idempotency_key: Option<Uuid>,
+}
+
 impl Client {
+    pub async fn set_autostart(
+        &mut self,
+        params: &AutostartParams,
+    ) -> Result<Mutation<Project>, ClientError> {
+        self.request("project.setAutostart", params).await
+    }
+
+    pub async fn recent_crashes(
+        &mut self,
+        params: &ProjectParams,
+    ) -> Result<Vec<CrashReport>, ClientError> {
+        self.request("worker.crashes", params).await
+    }
+
     pub async fn create_worker(
         &mut self,
         params: &CreateWorkerParams,

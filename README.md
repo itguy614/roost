@@ -62,4 +62,4 @@ target/debug/roost project stop PROJECT_UUID
 target/debug/roost process list PROJECT_UUID
 ```
 
-Use `--state-dir "$smoke_dir/state"` before the subcommand if you started an isolated daemon. Poll `process list` for the worker's observed state. `log tail` shows bounded output summaries. Use `worker profile create ... --options-json '{"instances":2,"queues":["high","default"],"crash_restart":"on_failure"}'` to override the defaults. See [worker supervision](docs/supervision.md) for ownership, recovery, and logging behavior.
+Use `--state-dir "$smoke_dir/state"` before the subcommand if you started an isolated daemon. Poll `process list` for the worker's observed state. `log tail` shows bounded, redacted output lines. Use `roost worker crashes ID` for recent crash reports or `roost project autostart ID on` to opt a project into resuming saved running intent on daemon startup. Use `worker profile create ... --options-json '{"instances":2,"queues":["high","default"],"crash_restart":"on_failure"}'` to override the defaults. See [worker supervision](docs/supervision.md) for ownership, recovery, and logging behavior.

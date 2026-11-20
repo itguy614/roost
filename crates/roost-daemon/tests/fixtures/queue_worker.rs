@@ -40,8 +40,16 @@ fn main() -> ExitCode {
         ]
     );
     let behavior = fs::read_to_string("artisan").unwrap();
-    if behavior == "fail" {
-        return ExitCode::from(7);
+    match behavior.as_str() {
+        "fail" => return ExitCode::from(7),
+        "clean_exit" => return ExitCode::SUCCESS,
+        "trace_fail" => {
+            eprintln!("RuntimeException: queue connection unavailable");
+            eprintln!("DB_PASSWORD=secret-fixture-output");
+            eprintln!("#0 src/Queue.php(20): connect()");
+            return ExitCode::from(7);
+        }
+        _ => {}
     }
     unsafe { signal(15, if behavior == "ignore" { ignore } else { stop }) };
     if behavior == "ignore" {
@@ -49,10 +57,12 @@ fn main() -> ExitCode {
             .arg("descendant")
             .spawn()
             .unwrap();
-        fs::write("descendant.pid", child.id().to_string()).unwrap();
+        let temporary = format!("descendant-{}.tmp", std::process::id());
+        fs::write(&temporary, child.id().to_string()).unwrap();
+        fs::rename(temporary, "descendant.pid").unwrap();
     }
-    println!("secret-fixture-output");
-    eprintln!("secret-fixture-output");
+    println!("worker ready");
+    eprintln!("Authorization: Bearer secret-fixture-output");
     while !STOP.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(10));
     }

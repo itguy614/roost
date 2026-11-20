@@ -3,7 +3,9 @@ use std::{ffi::OsString, io, path::PathBuf};
 use roost_core::ProjectId;
 use roost_ipc::{
     Client,
-    workers::{CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions},
+    workers::{
+        AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
+    },
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -13,6 +15,8 @@ pub enum Command {
     Profiles(ProjectParams),
     Processes(ProjectParams),
     Logs(ProjectParams),
+    Crashes(ProjectParams),
+    Autostart(AutostartParams),
     Start(LaunchParams),
     Stop(StopParams),
     Restart(LaunchParams),
@@ -41,6 +45,21 @@ impl Command {
                 } else {
                     Self::Restart(params)
                 }
+            }
+            (Some("project"), Some("autostart"), [id, value]) => {
+                let enabled = match value.to_str() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(io::Error::other("autostart expects on or off")),
+                };
+                Self::Autostart(AutostartParams {
+                    id: parse_id(id)?,
+                    enabled,
+                    idempotency_key: Some(Uuid::new_v4()),
+                })
+            }
+            (Some("worker"), Some("crashes"), [id]) => {
+                Self::Crashes(ProjectParams { id: parse_id(id)? })
             }
             (Some("project"), Some("stop"), [id]) => Self::Stop(StopParams {
                 id: parse_id(id)?,
@@ -87,6 +106,8 @@ impl Command {
             Self::Create(params) => serde_json::to_value(client.create_worker(&params).await?)?,
             Self::Profiles(params) => serde_json::to_value(client.list_profiles(&params).await?)?,
             Self::Processes(params) => serde_json::to_value(client.list_processes(&params).await?)?,
+            Self::Autostart(params) => serde_json::to_value(client.set_autostart(&params).await?)?,
+            Self::Crashes(params) => serde_json::to_value(client.recent_crashes(&params).await?)?,
             Self::Logs(params) => serde_json::to_value(client.tail_logs(&params).await?)?,
             Self::Start(params) => serde_json::to_value(client.start_project(&params).await?)?,
             Self::Stop(params) => serde_json::to_value(client.stop_project(&params).await?)?,

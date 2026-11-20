@@ -4,12 +4,12 @@ use std::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
 
-use roost_core::worker_runtime::{WorkerLease, WorkerLeaseState};
+use roost_core::worker_runtime::{LaunchFailure, StopCause, WorkerLease, WorkerLeaseState};
 use roost_process::OutputPipe;
 use roost_store::Store;
 use serde::{Deserialize, Serialize};
@@ -64,8 +64,33 @@ impl Guardian {
         })
     }
 
-    pub fn stop(&mut self) {
-        self.control.take();
+    pub fn stop(&mut self, cause: StopCause) {
+        if let Some(mut control) = self.control.take() {
+            let _ = control.write_all(&[encode_stop(cause)]);
+        }
+    }
+}
+
+fn encode_stop(cause: StopCause) -> u8 {
+    match cause {
+        StopCause::ProjectStop => 1,
+        StopCause::ProjectRestart => 2,
+        StopCause::DaemonShutdown => 3,
+        StopCause::StartupTimeout => 4,
+        StopCause::GuardianWaitFailed => 5,
+        _ => 6,
+    }
+}
+
+fn decode_stop(byte: u8) -> Option<StopCause> {
+    match byte {
+        0 => None,
+        1 => Some(StopCause::ProjectStop),
+        2 => Some(StopCause::ProjectRestart),
+        3 => Some(StopCause::DaemonShutdown),
+        4 => Some(StopCause::StartupTimeout),
+        5 => Some(StopCause::GuardianWaitFailed),
+        _ => Some(StopCause::DaemonDisconnected),
     }
 }
 
@@ -93,25 +118,41 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .get_worker_profile(lease.profile_id)?
         .ok_or(roost_store::Error::NotFound)?;
     let Ok(php) = roost_process::validate_worker(&project, &profile, &launch.php) else {
-        store.record_worker_state(lease, WorkerLeaseState::LaunchFailed)?;
+        store.record_worker_state(
+            lease,
+            WorkerLeaseState::LaunchFailure {
+                failure: LaunchFailure::Validation,
+            },
+        )?;
         return Ok(());
     };
 
-    let stopped = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicU8::new(0));
     let flag = Arc::clone(&stopped);
-    std::thread::Builder::new()
+    if let Err(error) = std::thread::Builder::new()
         .name("roost-guardian-control".into())
         .spawn(move || {
             let mut byte = [0; 1];
-            let _ = input.read(&mut byte);
-            flag.store(true, Ordering::Release);
-        })?;
+            if input.read_exact(&mut byte).is_err() || byte[0] == 0 {
+                byte[0] = encode_stop(StopCause::DaemonDisconnected);
+            }
+            flag.store(byte[0], Ordering::Release);
+        })
+    {
+        store.record_worker_state(
+            lease,
+            WorkerLeaseState::LaunchFailure {
+                failure: roost_process::classify_spawn_error(&error),
+            },
+        )?;
+        return Ok(());
+    }
 
     #[cfg(target_os = "macos")]
     roost_process::run_guarded(
         roost_process::worker_command(&project, &profile, &php),
         Duration::from_secs(u64::from(profile.graceful_stop_seconds)),
-        || stopped.load(Ordering::Acquire),
+        || decode_stop(stopped.load(Ordering::Acquire)),
         |state| {
             store
                 .record_worker_state(lease.clone(), state)
@@ -121,7 +162,12 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (php, stopped, Duration::ZERO);
-        store.record_worker_state(lease, WorkerLeaseState::LaunchFailed)?;
+        store.record_worker_state(
+            lease,
+            WorkerLeaseState::LaunchFailure {
+                failure: LaunchFailure::Validation,
+            },
+        )?;
         return Err(io::Error::other("worker supervision is currently supported on macOS").into());
     }
     Ok(())

@@ -12,12 +12,14 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] project remove ID
   roost [--state-dir ABSOLUTE_PATH] project start ID PHP_PATH [--allow-horizon]
   roost [--state-dir ABSOLUTE_PATH] project stop ID
+  roost [--state-dir ABSOLUTE_PATH] project autostart ID on|off
   roost [--state-dir ABSOLUTE_PATH] project restart ID PHP_PATH [--allow-horizon]
   roost [--state-dir ABSOLUTE_PATH] worker profile create ID NAME CONNECTION [QUEUE ...]
   roost [--state-dir ABSOLUTE_PATH] worker profile create ID NAME CONNECTION --options-json JSON
   roost [--state-dir ABSOLUTE_PATH] worker profile list ID
   roost [--state-dir ABSOLUTE_PATH] process list ID
-  roost [--state-dir ABSOLUTE_PATH] log tail ID";
+  roost [--state-dir ABSOLUTE_PATH] log tail ID
+  roost [--state-dir ABSOLUTE_PATH] worker crashes ID";
 
 enum Command {
     Status,
