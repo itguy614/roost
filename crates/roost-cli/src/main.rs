@@ -1,5 +1,6 @@
 mod discovery;
 mod scheduler;
+mod watch;
 mod workers;
 
 use std::{ffi::OsString, io, path::PathBuf, process::ExitCode};
@@ -19,6 +20,10 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] worker profile create ID NAME CONNECTION [QUEUE ...]
   roost [--state-dir ABSOLUTE_PATH] worker profile create ID NAME CONNECTION --options-json JSON
   roost [--state-dir ABSOLUTE_PATH] worker profile list ID
+  roost [--state-dir ABSOLUTE_PATH] worker profile set-code-restart PROFILE_ID never|on-change --revision REV
+  roost [--state-dir ABSOLUTE_PATH] watch status ID
+  roost [--state-dir ABSOLUTE_PATH] watch enable ID --revision REV [--rules-json JSON]
+  roost [--state-dir ABSOLUTE_PATH] watch disable ID --revision REV
   roost [--state-dir ABSOLUTE_PATH] process list ID
   roost [--state-dir ABSOLUTE_PATH] log tail ID
   roost [--state-dir ABSOLUTE_PATH] worker crashes ID
@@ -44,6 +49,7 @@ enum Command {
     Worker(workers::Command),
     Discovery(discovery::Command),
     Scheduler(scheduler::Command),
+    Watch(watch::Command),
 }
 
 fn main() -> ExitCode {
@@ -86,6 +92,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Command::Discovery(command)
             } else if let Some(command) = scheduler::Command::parse(args)? {
                 Command::Scheduler(command)
+            } else if let Some(command) = watch::Command::parse(args)? {
+                Command::Watch(command)
             } else {
                 Command::Worker(
                     workers::Command::parse(args)?.ok_or_else(|| io::Error::other(USAGE))?,
@@ -135,6 +143,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
             Command::Scheduler(command) => command.execute(&mut client).await?,
+            Command::Watch(command) => command.execute(&mut client).await?,
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
         Ok(())

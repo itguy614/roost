@@ -238,6 +238,18 @@ impl Supervisor {
         }
     }
 
+    pub(crate) fn restart_changed_workers(&mut self, id: ProjectId, changed_at: Instant) {
+        if !self.closing
+            && let Some(runtime) = self.projects.get_mut(&id)
+            && runtime.desired == DesiredState::Running
+            && runtime.replacement.is_none()
+        {
+            for slot in &mut runtime.slots {
+                slot.request_code_restart(changed_at);
+            }
+        }
+    }
+
     pub fn remove(&mut self, id: ProjectId) {
         self.cancel_recovery(id);
         self.projects.remove(&id);

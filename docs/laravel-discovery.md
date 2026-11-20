@@ -30,6 +30,8 @@ target/debug/roost worker profile list PROJECT_UUID
 
 The default state directory on macOS is `~/Library/Application Support/Roost`. If you started the daemon with a custom `--state-dir`, pass the same absolute directory before the CLI subcommand. A missing socket usually means the daemon has yet to start for that directory. Add `--php /absolute/path/to/php` to discovery to use a specific executable, or use `--provider system` when system PHP is installed. `queue connections` returns `null` until discovery succeeds. Profile listing shows that discovery creates no workers or profiles.
 
+When watching is enabled, a change matching the project's watch rules invalidates its in-memory snapshot. `queue connections` then returns `null` until you rerun `queue discover`. If watching detects a change during discovery, retry the request to get a fresh snapshot.
+
 ## Effective connection discovery
 
 An explicit discovery request runs a short PHP process with fixed arguments to load the app's Composer autoloader and Laravel console kernel. It reads effective `queue.default` and `queue.connections` through Laravel's config repository, including deliberate cached configuration. The probe receives a minimal environment. Values supplied only through the caller's shell environment can differ from the values Laravel reads from its project files.

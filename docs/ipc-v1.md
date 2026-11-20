@@ -17,7 +17,7 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `provider.list` | Omit or use `{}` | Supported provider names |
 | `provider.detect` | Project UUID `id` | Preferred provider, Herd and system availability, and whether an override is configured |
 | `provider.resolvePhp` | Project UUID `id`, optional `provider` or absolute `php` override | Validated executable `path` and `source` |
-| `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` |
+| `queue.connections` | Project UUID `id` | Latest successful in-memory snapshot for the current project revision, or `null` if absent or invalidated by the watcher |
 | `queue.discover` | Same parameters as `provider.resolvePhp` | Fresh snapshot with default connection, connection names and drivers, omission count, observation time, and PHP source |
 | `queue.suggestions` | Project UUID `id`, optional `explicit` string array | Incomplete symbolic name suggestions with sources, ordered configured profile queues, and scan coverage flags |
 | `scheduler.configure` | Project UUID `id`, optional `options`, optional `expected_revision` for updates, optional UUID `idempotency_key` | Mutation result with the scheduler profile |
@@ -29,6 +29,10 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `scheduler.crashes` | Project UUID `id` | Recent persistent scheduler crash reports |
 | `worker.profile.create` | `project_id`, `name`, `connection`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new profile |
 | `worker.profile.list` | Project UUID `id` | Configured worker profiles |
+| `worker.profile.setCodeRestart` | Worker profile UUID `id`, integer `expected_revision`, `policy` (`never` or `on_change`), optional UUID `idempotency_key` | Mutation result containing the worker profile |
+| `watch.status` | Project UUID `id` | Project `id`, current project `revision`, saved `rules`, `state`, `pending` batch flag, and nullable `problem` |
+| `watch.enable` | Project UUID `id`, integer `expected_revision`, optional `rules`, optional UUID `idempotency_key` | Mutation result containing the project with watching enabled |
+| `watch.disable` | Project UUID `id`, integer `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the project with watching disabled |
 | `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
 | `project.restart` | Same parameters as `project.start` | Queues replacement after cleanup and returns the requested intent |
 | `project.setAutostart` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result containing the project record |
@@ -53,6 +57,8 @@ Worker mutations use the `operation_id` and `result` envelope. Start, stop, and 
 
 Scheduler options are `enabled` (defaults to true), `crash_restart` (defaults to `on_failure`), and `graceful_stop_seconds` (defaults to 15, allowed 1–60). Configuration requires stopped scheduler intent and confirmed cleanup. Local edits to file-owned scheduler settings return a conflict. The scheduler is independently managed from queue workers. See [scheduler lifecycle and demo](scheduler.md).
 
+Watch rules contain `include` and `exclude` arrays of relative globs. Omitting `rules` preserves the saved rules. Watch state is `disabled`, `initializing`, `watching`, or `degraded`. The project watcher and profile policy both default to off. Changing a profile policy requires the project's queue workers to be stopped and their leases cleaned up. File-owned settings and stale revisions return conflicts. See [file watching](file-watching.md).
+
 The `startup` field is `first_start`, `after_clean_shutdown`, or `after_interrupted_shutdown`. Worker exits can also include a `stop_cause` such as `project_stop`, `project_restart`, `daemon_shutdown`, or `daemon_disconnected`. Startup failure classifications include `validation`, `spawn_rejected`, `resource_unavailable`, `readiness_timeout`, `state_publication`, and `cancelled`. The response fields and methods are additive to IPC v1.
 
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
@@ -69,7 +75,7 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32000` | Handshake required |
 | `-32001` | Unsupported protocol version, with `error.data.supported` |
 | `-32002` | Request or response exceeds its size limit |
-| `-32003` | Project not found |
+| `-32003` | Project or profile not found |
 | `-32004` | Already registered, mutation identity or revision conflict, or a worker safety constraint |
 | `-32005` | PHP provider or discovery unavailable, or the probe failed or returned invalid data |
 | `-32006` | Probe timed out |

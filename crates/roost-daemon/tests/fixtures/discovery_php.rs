@@ -40,6 +40,16 @@ fn main() -> ExitCode {
                 r#"{{"default":null,"connections":[],"omitted_connections":0,"password":"private-fixture-value"}}"#
             );
         }
+        "from_env" => {
+            let connection = match fs::read_to_string(".env").unwrap().trim() {
+                "QUEUE_CONNECTION=database" => "database",
+                "QUEUE_CONNECTION=redis" => "redis",
+                _ => return ExitCode::FAILURE,
+            };
+            println!(
+                r#"{{"default":"{connection}","connections":[{{"name":"{connection}","driver":"{connection}"}}],"omitted_connections":0}}"#
+            );
+        }
         _ => {
             eprintln!("database://user:private-fixture-value@localhost");
             println!(

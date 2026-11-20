@@ -67,3 +67,7 @@ Use `--state-dir "$smoke_dir/state"` before the subcommand if you started an iso
 ## Run a Laravel scheduler
 
 Configure and run one scheduler per registered project using `roost scheduler`. See the [scheduler commands and macOS walkthrough](docs/scheduler.md).
+
+## Restart workers on file changes
+
+Enable the project watcher and opt in the worker profiles that should restart. See [file watching and targeted restarts](docs/file-watching.md) for the rules, status commands, and macOS demo.

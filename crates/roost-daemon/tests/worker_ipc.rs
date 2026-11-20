@@ -9,7 +9,8 @@ use std::{
 };
 
 use roost_core::{
-    CrashRestartPolicy, DesiredState, ProjectId, Revision, WorkerProfileId,
+    CodeRestartPolicy, CrashRestartPolicy, DesiredState, ProjectId, Revision, WatchRules,
+    WorkerProfileId,
     scheduler::{SchedulerIntent, SchedulerLease, SchedulerProcessStatus, SchedulerProfileId},
     worker_runtime::{
         DaemonStartup, LaunchFailure, LaunchIntent, ObservedState, ProjectIntent, StopCause,
@@ -18,8 +19,9 @@ use roost_core::{
 };
 use roost_daemon::DaemonService;
 use roost_ipc::{
-    AddParams, CONFLICT, Client, ClientError, RemoveParams,
+    AddParams, CONFLICT, Client, ClientError, INVALID_PARAMS, RemoveParams,
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
+    watch::{CodeRestartParams, DisableWatchParams, EnableWatchParams, WatchState, WatchStatus},
     workers::{
         AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
     },
@@ -341,6 +343,25 @@ async fn worker_pid(client: &mut Client, id: ProjectId) -> u32 {
         .identity
         .unwrap()
         .pid
+}
+
+async fn until_watch(
+    client: &mut Client,
+    id: ProjectId,
+    condition: impl Fn(&WatchStatus) -> bool,
+) -> WatchStatus {
+    let limit = Instant::now() + TOTAL_WAIT;
+    loop {
+        let status = client.watch_status(&ProjectParams { id }).await.unwrap();
+        if condition(&status) {
+            return status;
+        }
+        assert!(
+            Instant::now() < limit,
+            "unexpected watch status: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn descendant_pid(app: &Path) -> u32 {
@@ -1235,4 +1256,263 @@ async fn scheduler_crash_backoff_and_diagnostics_do_not_enter_worker_history() {
     })
     .await;
     assert_eq!(stopped.generation, 2);
+}
+
+#[tokio::test]
+async fn atomic_saves_and_deletions_restart_only_opted_in_workers_in_the_owning_project() {
+    let h = Harness::new();
+    let app = h.app("app", "graceful");
+    let nested = h.app("app/nested", "graceful");
+    let file = app.join("Example.php");
+    let nested_file = nested.join("Example.php");
+    fs::write(&file, "parent original").unwrap();
+    fs::write(&nested_file, "child original").unwrap();
+    fs::create_dir(app.join("vendor")).unwrap();
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let child = h
+        .register(&mut client, &nested, 1, CrashRestartPolicy::Never)
+        .await;
+    let pinned = client
+        .create_worker(&CreateWorkerParams {
+            project_id: id,
+            name: "Pinned worker".into(),
+            connection: "database".into(),
+            options: WorkerOptions {
+                queues: vec!["critical".into(), "default".into()],
+                graceful_stop_seconds: 1,
+                crash_restart: CrashRestartPolicy::Never,
+                ..WorkerOptions::default()
+            },
+            idempotency_key: None,
+        })
+        .await
+        .unwrap()
+        .result;
+    let mut watched = Vec::new();
+    for project in [id, child] {
+        let profile = client
+            .list_profiles(&ProjectParams { id: project })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.name == "Queue Worker")
+            .unwrap();
+        client
+            .set_code_restart(&CodeRestartParams {
+                id: profile.id,
+                expected_revision: profile.revision,
+                policy: CodeRestartPolicy::OnChange,
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+        watched.push(profile.id);
+        let status = client
+            .watch_status(&ProjectParams { id: project })
+            .await
+            .unwrap();
+        client
+            .enable_watch(&EnableWatchParams {
+                id: project,
+                expected_revision: status.revision,
+                rules: None,
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+        until_watch(&mut client, project, |status| {
+            status.state == WatchState::Watching
+        })
+        .await;
+        client.start_project(&h.launch(project)).await.unwrap();
+    }
+    let opted = watched[0];
+    let old = until_status(&mut client, id, all_in(ObservedState::Running, 2)).await;
+    let old_pid = |profile| {
+        old.iter()
+            .find(|s| s.profile_id == profile)
+            .unwrap()
+            .identity
+            .unwrap()
+            .pid
+    };
+    let child_pid = worker_pid(&mut client, child).await;
+    client
+        .configure_scheduler(&scheduler_config(id, CrashRestartPolicy::Never))
+        .await
+        .unwrap();
+    client
+        .start_scheduler(&scheduler_launch(&h, id))
+        .await
+        .unwrap();
+    let scheduler = scheduler_ready(&mut client, id, None).await;
+    fs::write(app.join("vendor/excluded.php"), "ignored").unwrap();
+    let temporary = app.join("editor.tmp");
+    fs::write(&temporary, "atomically replaced PHP").unwrap();
+    fs::rename(temporary, &file).unwrap();
+    let running_after_save = until_status(&mut client, id, |workers| {
+        all_in(ObservedState::Running, 2)(workers)
+            && workers
+                .iter()
+                .any(|worker| worker.profile_id == opted && worker.generation == 2)
+    })
+    .await;
+    let replacement = running_after_save
+        .iter()
+        .find(|s| s.profile_id == opted)
+        .unwrap()
+        .identity
+        .unwrap()
+        .pid;
+    assert_ne!(replacement, old_pid(opted));
+    assert!(!exists(old_pid(opted)));
+    assert!(
+        running_after_save
+            .iter()
+            .any(|s| s.profile_id == pinned.id && s.identity.unwrap().pid == old_pid(pinned.id))
+    );
+    assert_eq!(worker_pid(&mut client, child).await, child_pid);
+    assert_eq!(scheduler_ready(&mut client, id, None).await, scheduler);
+
+    fs::remove_file(nested_file).unwrap();
+    let nested_replacement = until_status(&mut client, child, |workers| {
+        all_in(ObservedState::Running, 1)(workers) && workers[0].generation == 2
+    })
+    .await[0]
+        .identity
+        .unwrap()
+        .pid;
+    assert_ne!(nested_replacement, child_pid);
+    assert!(!exists(child_pid));
+    let parent = client.list_processes(&ProjectParams { id }).await.unwrap();
+    assert!(
+        parent
+            .iter()
+            .any(|s| s.profile_id == opted && s.identity.unwrap().pid == replacement)
+    );
+
+    fs::write(&file, "pending manual stop").unwrap();
+    until_watch(&mut client, id, |status| status.pending).await;
+    client
+        .stop_project(&StopParams {
+            id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    until_status(&mut client, id, all_in(ObservedState::Stopped, 2)).await;
+    until_watch(&mut client, id, |status| !status.pending).await;
+    let statuses = client.list_processes(&ProjectParams { id }).await.unwrap();
+    assert!(all_in(ObservedState::Stopped, 2)(&statuses));
+    let store = Store::open(&h.root.join("daemon/roost.sqlite3")).unwrap();
+    assert_eq!(store.project_intent(id).unwrap(), ProjectIntent::Stopped);
+    assert!(
+        store
+            .project_leases::<WorkerProfileId>(id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(scheduler_ready(&mut client, id, None).await, scheduler);
+    terminate(&mut daemon).await;
+}
+
+#[tokio::test]
+async fn watch_configuration_is_revisioned_durable_and_file_ownership_is_enforced() {
+    let h = Harness::new();
+    let app = h.app("app", "graceful");
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let params = ProjectParams { id };
+    let disabled = client.watch_status(&params).await.unwrap();
+    assert_eq!(disabled.state, WatchState::Disabled);
+    let invalid = client
+        .enable_watch(&EnableWatchParams {
+            id,
+            expected_revision: disabled.revision,
+            rules: Some(WatchRules {
+                include: vec!["../*.php".into()],
+                exclude: vec![],
+            }),
+            idempotency_key: None,
+        })
+        .await;
+    assert!(matches!(invalid, Err(ClientError::Rpc(error)) if error.code == INVALID_PARAMS));
+    let enable = EnableWatchParams {
+        id,
+        expected_revision: disabled.revision,
+        rules: Some(WatchRules {
+            include: vec!["config/**/*.php".into()],
+            exclude: vec![],
+        }),
+        idempotency_key: Some(Uuid::new_v4()),
+    };
+    let receipt = client.enable_watch(&enable).await.unwrap();
+    assert_eq!(
+        client.enable_watch(&enable).await.unwrap().operation_id,
+        receipt.operation_id
+    );
+    let stale = client
+        .disable_watch(&DisableWatchParams {
+            id,
+            expected_revision: disabled.revision,
+            idempotency_key: None,
+        })
+        .await;
+    assert!(matches!(stale, Err(ClientError::Rpc(error)) if error.code == CONFLICT));
+    terminate(&mut daemon).await;
+
+    let (mut daemon, mut client) = h.daemon().await;
+    let watching = until_watch(&mut client, id, |status| {
+        status.state == WatchState::Watching
+    })
+    .await;
+    assert_eq!(watching.revision, receipt.result.revision);
+    assert_eq!(watching.rules, receipt.result.watch_rules);
+    assert!(!watching.pending);
+    assert!(client.list_processes(&params).await.unwrap().is_empty());
+    let mut project = client
+        .disable_watch(&DisableWatchParams {
+            id,
+            expected_revision: watching.revision,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap()
+        .result;
+    assert_eq!(
+        client.watch_status(&params).await.unwrap().state,
+        WatchState::Disabled
+    );
+    project.config_owner = roost_core::ConfigOwner::File;
+    let store = Store::open(&h.root.join("daemon/roost.sqlite3")).unwrap();
+    let project = store.update_project(project).unwrap();
+    let denied = client
+        .enable_watch(&EnableWatchParams {
+            id,
+            expected_revision: project.revision,
+            rules: None,
+            idempotency_key: None,
+        })
+        .await;
+    assert!(
+        matches!(denied, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("file-owned"))
+    );
+    let profile = client.list_profiles(&params).await.unwrap().remove(0);
+    let denied = client
+        .set_code_restart(&CodeRestartParams {
+            id: profile.id,
+            expected_revision: profile.revision,
+            policy: CodeRestartPolicy::OnChange,
+            idempotency_key: None,
+        })
+        .await;
+    assert!(
+        matches!(denied, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("file-owned"))
+    );
+    terminate(&mut daemon).await;
 }

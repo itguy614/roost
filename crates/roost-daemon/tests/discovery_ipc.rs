@@ -6,11 +6,12 @@ use roost_core::{
     PhpProvider,
     discovery::{PhpSource, SuggestionSource},
 };
-use roost_daemon::DaemonService;
+use roost_daemon::{Daemon, DaemonService};
 use roost_ipc::{
     AddParams, Client, ClientError, DISCOVERY_BUSY, DISCOVERY_OUTPUT_LIMIT, DISCOVERY_TIMEOUT,
     DISCOVERY_UNAVAILABLE, INVALID_PARAMS,
     discovery::{ResolvePhpParams, SuggestQueueParams},
+    watch::{EnableWatchParams, WatchState},
     workers::{CreateWorkerParams, ProjectParams, WorkerOptions},
 };
 use roost_store::Store;
@@ -25,10 +26,8 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("roost-discovery-{}", Uuid::new_v4()));
+        let root =
+            PathBuf::from("/private/tmp").join(format!("roost-discovery-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let db = root.join("roost.sqlite3");
         Store::initialize(&db).unwrap();
@@ -88,6 +87,79 @@ impl Harness {
             php: Some(self.php.clone()),
         }
     }
+}
+
+#[tokio::test]
+async fn a_watched_env_change_invalidates_only_that_projects_discovery_snapshot() {
+    let h = Harness::new();
+    let state_dir = h.root.join("daemon");
+    let daemon = Daemon::bind(&state_dir).await.unwrap();
+    let task = tokio::spawn(async move { daemon.run().await });
+    let mut client = Client::connect(&state_dir).await.unwrap();
+    let watched = h.project(&mut client, "watched", "from_env").await;
+    let other = h.project(&mut client, "other", "ok").await;
+    let watched_params = ProjectParams { id: watched.id };
+    let other_params = ProjectParams { id: other.id };
+    let path = h.root.join("watched/.env");
+    fs::write(&path, "QUEUE_CONNECTION=database\n").unwrap();
+    let status = client.watch_status(&watched_params).await.unwrap();
+    client
+        .enable_watch(&EnableWatchParams {
+            id: watched.id,
+            expected_revision: status.revision,
+            rules: None,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.watch_status(&watched_params).await.unwrap().state != WatchState::Watching {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("watch baseline did not become ready");
+
+    let before = client.discover_queues(&watched).await.unwrap();
+    assert_eq!(before.default.as_deref(), Some("database"));
+    client.discover_queues(&other).await.unwrap();
+    assert!(
+        client
+            .queue_connections(&watched_params)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fs::write(path, "QUEUE_CONNECTION=redis\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client
+            .queue_connections(&watched_params)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("watcher did not invalidate the discovery snapshot");
+    assert!(
+        client
+            .queue_connections(&other_params)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let after = client.discover_queues(&watched).await.unwrap();
+    assert_eq!(after.default.as_deref(), Some("redis"));
+    let cached = client
+        .queue_connections(&watched_params)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.default, after.default);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
 }
 
 impl Drop for Harness {
