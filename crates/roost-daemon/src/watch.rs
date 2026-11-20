@@ -5,19 +5,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use roost_core::{Project, ProjectId, Revision, WatchRules};
-use roost_ipc::watch::WatchState;
+use roost_core::{Group, Project, ProjectId, Revision, WatchRules};
+use roost_ipc::watch::{SharedWatchStatus, WatchState};
 use roost_store::Store;
-use roost_watch::{MAX_PROJECTS, ProjectWatch, Rules};
+use roost_watch::{MAX_PROJECTS, Poll, ProjectWatch, Rules};
 
 use crate::DaemonService;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct RuntimeStatus {
     pub revision: Revision,
     pub state: WatchState,
     pub pending: bool,
     pub problem: Option<&'static str>,
+    pub shared: Vec<SharedWatchStatus>,
 }
 
 struct Active {
@@ -27,8 +28,39 @@ struct Active {
     rules: WatchRules,
     nested_roots: HashSet<PathBuf>,
     watch: ProjectWatch,
+    changes: Changes,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Changes {
     invalidate_snapshot: bool,
     delivery: Option<Instant>,
+}
+
+impl Changes {
+    fn observe(&mut self, observed: &Poll) {
+        self.invalidate_snapshot |= observed.changed;
+        self.delivery = self.delivery.max(observed.changed_at);
+    }
+
+    fn pending(self) -> bool {
+        self.invalidate_snapshot || self.delivery.is_some()
+    }
+
+    fn merge(&mut self, changes: Self) {
+        self.invalidate_snapshot |= changes.invalidate_snapshot;
+        self.delivery = self.delivery.max(changes.delivery);
+    }
+}
+
+fn watch_state(observed: &Poll) -> WatchState {
+    if observed.problem.is_some() {
+        WatchState::Degraded
+    } else if observed.ready {
+        WatchState::Watching
+    } else {
+        WatchState::Initializing
+    }
 }
 
 impl Active {
@@ -48,6 +80,7 @@ impl Active {
 #[derive(Default)]
 struct Watches {
     active: HashMap<ProjectId, Active>,
+    shared: shared::SharedWatches,
     status: HashMap<ProjectId, RuntimeStatus>,
     next_config: Option<Instant>,
 }
@@ -88,32 +121,32 @@ impl Watches {
                 .lock()
                 .map_err(|_| crate::supervisor::Error::Conflict("watch configuration unavailable"))?
                 .clone();
-            self.refresh(&store.list_projects()?, &revisions, now);
+            self.refresh(
+                &store.list_projects()?,
+                &store.list_groups()?,
+                &revisions,
+                now,
+            );
             self.next_config = Some(now + Duration::from_millis(500));
         }
         for (&id, active) in &mut self.active {
             let observed = active.watch.poll(Instant::now(), &active.nested_roots);
-            active.invalidate_snapshot |= observed.changed;
-            if let Some(changed_at) = observed.changed_at {
-                active.delivery = Some(changed_at);
-            }
-            let state = if observed.problem.is_some() {
-                WatchState::Degraded
-            } else if observed.ready {
-                WatchState::Watching
-            } else {
-                WatchState::Initializing
-            };
+            active.changes.observe(&observed);
             self.status.insert(
                 id,
                 RuntimeStatus {
                     revision: active.revision,
-                    state,
-                    pending: observed.pending || active.delivery.is_some(),
+                    state: watch_state(&observed),
+                    pending: observed.pending || active.changes.delivery.is_some(),
                     problem: observed.problem.map(|problem| problem.message()),
+                    shared: Vec::new(),
                 },
             );
         }
+        for status in self.status.values_mut() {
+            status.shared.clear();
+        }
+        self.shared.poll(&mut self.status);
         self.deliver(service)?;
         if let Ok(mut status) = service.watch_status.lock() {
             *status = self.status.clone();
@@ -124,10 +157,12 @@ impl Watches {
     fn refresh(
         &mut self,
         projects: &[Project],
+        groups: &[Group],
         revisions: &HashMap<ProjectId, Revision>,
         now: Instant,
     ) {
         self.status.clear();
+        let shared_scopes = shared::scopes(groups, projects, revisions);
         let mut configured = HashSet::new();
         for (index, project) in projects
             .iter()
@@ -138,7 +173,7 @@ impl Watches {
                 continue;
             }
             configured.insert(project.id);
-            let nested_roots = nested_roots(project, projects);
+            let nested_roots = boundaries(project, projects, &shared_scopes);
             let configured_at = revisions.get(&project.id).copied();
             if let Some(active) = self.active.get_mut(&project.id)
                 && active.matches_scope(project, configured_at, &nested_roots)
@@ -158,8 +193,7 @@ impl Watches {
                             rules: project.watch_rules.clone(),
                             nested_roots,
                             watch: ProjectWatch::new(project.path.clone(), rules, now),
-                            invalidate_snapshot: false,
-                            delivery: None,
+                            changes: Changes::default(),
                         },
                     );
                 }
@@ -171,19 +205,19 @@ impl Watches {
                             state: WatchState::Degraded,
                             pending: false,
                             problem: Some("stored watch rules are invalid"),
+                            shared: Vec::new(),
                         },
                     );
                 }
             }
         }
         self.active.retain(|id, _| configured.contains(id));
+        self.shared.refresh(shared_scopes, now);
     }
 
     fn deliver(&mut self, service: &DaemonService) -> Result<(), crate::supervisor::Error> {
-        if !self
-            .active
-            .values()
-            .any(|active| active.invalidate_snapshot || active.delivery.is_some())
+        if !self.active.values().any(|active| active.changes.pending())
+            && !self.shared.has_changes()
         {
             return Ok(());
         }
@@ -191,44 +225,58 @@ impl Watches {
             .workers
             .lock()
             .map_err(|_| crate::supervisor::Error::Conflict("supervisor unavailable"))?;
-        let projects = Store::open(&service.db)?.list_projects()?;
+        let store = Store::open(&service.db)?;
+        let projects = store.list_projects()?;
+        let groups = store.list_groups()?;
         let revisions = service
             .watch_config_revisions
             .lock()
             .map_err(|_| crate::supervisor::Error::Conflict("watch configuration unavailable"))?;
+        let shared_scopes = shared::scopes(&groups, &projects, &revisions);
+        let mut cache = service
+            .snapshots
+            .lock()
+            .map_err(|_| crate::supervisor::Error::Conflict("discovery cache unavailable"))?;
+        let mut changes = HashMap::new();
         for project in projects.iter().filter(|project| project.watch_enabled) {
             if let Some(active) = self.active.get_mut(&project.id)
-                && (active.invalidate_snapshot || active.delivery.is_some())
+                && active.changes.pending()
                 && active.matches_scope(
                     project,
                     revisions.get(&project.id).copied(),
-                    &nested_roots(project, &projects),
+                    &boundaries(project, &projects, &shared_scopes),
                 )
             {
-                if active.invalidate_snapshot {
-                    service
-                        .snapshots
-                        .lock()
-                        .map_err(|_| {
-                            crate::supervisor::Error::Conflict("discovery cache unavailable")
-                        })?
-                        .invalidate(project.id);
-                    active.invalidate_snapshot = false;
-                }
-                if let Some(changed_at) = active.delivery.take() {
-                    supervisor.restart_changed_workers(project.id, changed_at);
-                }
+                changes.insert(project.id, std::mem::take(&mut active.changes));
+            }
+        }
+        self.shared.collect(&shared_scopes, &mut changes);
+        for (&id, change) in &changes {
+            if change.invalidate_snapshot {
+                cache.invalidate(id);
+            }
+        }
+        drop(cache);
+        for (id, change) in changes {
+            if let Some(changed_at) = change.delivery {
+                supervisor.restart_changed_workers(id, changed_at);
             }
         }
         Ok(())
     }
 }
 
-fn nested_roots(project: &Project, projects: &[Project]) -> HashSet<PathBuf> {
+fn boundaries(
+    project: &Project,
+    projects: &[Project],
+    shared: &HashMap<PathBuf, shared::Scope>,
+) -> HashSet<PathBuf> {
     projects
         .iter()
-        .filter(|other| other.id != project.id && other.path.starts_with(&project.path))
-        .map(|other| other.path.clone())
+        .map(|other| &other.path)
+        .chain(shared.keys())
+        .filter(|path| shared::excludes_from(&project.path, path))
+        .cloned()
         .collect()
 }
 
@@ -257,7 +305,7 @@ mod tests {
         let start = Instant::now();
         let mut watches = Watches::default();
         let revisions = HashMap::new();
-        watches.refresh(std::slice::from_ref(&project), &revisions, start);
+        watches.refresh(std::slice::from_ref(&project), &[], &revisions, start);
         let active = watches.active.get_mut(&id).unwrap();
         let initial = active.watch.poll(start, &active.nested_roots);
         assert!(initial.ready && !initial.changed);
@@ -270,7 +318,12 @@ mod tests {
         project.autostart = true;
         project.revision = Revision(2);
         let during_debounce = observed_at + Duration::from_millis(250);
-        watches.refresh(std::slice::from_ref(&project), &revisions, during_debounce);
+        watches.refresh(
+            std::slice::from_ref(&project),
+            &[],
+            &revisions,
+            during_debounce,
+        );
         let active = watches.active.get_mut(&id).unwrap();
         assert_eq!(active.revision, Revision(2));
         let observed = active.watch.poll(during_debounce, &active.nested_roots);
@@ -288,9 +341,10 @@ mod tests {
         project.watch_rules.include = vec!["config/**/*.php".into()];
         project.revision = Revision(3);
         let changed_rules = next_change + Duration::from_millis(50);
-        watches.refresh(&[project], &revisions, changed_rules);
+        watches.refresh(&[project], &[], &revisions, changed_rules);
         let active = watches.active.get_mut(&id).unwrap();
         let observed = active.watch.poll(changed_rules, &active.nested_roots);
         assert!(observed.ready && !observed.changed && !observed.pending);
     }
 }
+mod shared;

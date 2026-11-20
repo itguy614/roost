@@ -56,12 +56,16 @@ impl Rules {
     }
 
     fn excluded(&self, path: &Path) -> bool {
-        path.components().any(|part| {
-            matches!(part, Component::Normal(name) if [".git", "vendor", "node_modules", "build", "dist", "target"].iter().any(|dir| name == *dir))
-        }) || path.ancestors().any(|ancestor| {
-            ancestor.ends_with("storage/logs") || ancestor.ends_with("storage/framework")
-        }) || self.exclude.is_match(path)
+        excluded_by_default(path) || self.exclude.is_match(path)
     }
+}
+
+pub fn excluded_by_default(path: &Path) -> bool {
+    path.components().any(|part| {
+        matches!(part, Component::Normal(name) if [".git", "vendor", "node_modules", "build", "dist", "target"].iter().any(|dir| name == *dir))
+    }) || path.ancestors().any(|ancestor| {
+        ancestor.ends_with("storage/logs") || ancestor.ends_with("storage/framework")
+    })
 }
 
 fn globs(patterns: impl IntoIterator<Item = impl AsRef<str>>) -> Result<GlobSet, InvalidRules> {
@@ -198,8 +202,10 @@ impl ProjectWatch {
             self.next_scan = now + RECONCILE;
             let identity = self
                 .root
-                .symlink_metadata()
+                .canonicalize()
                 .ok()
+                .filter(|real| real == &self.root)
+                .and_then(|path| path.symlink_metadata().ok())
                 .filter(fs::Metadata::is_dir)
                 .map(|metadata| (metadata.dev(), metadata.ino()));
             if identity != self.root_identity {
@@ -211,7 +217,10 @@ impl ProjectWatch {
                 self.next_attach = now + RECONCILE;
                 self.backend = attach(&self.root, &self.rules, &self.signal).ok();
             }
-            match snapshot(&self.root, &self.rules, other_roots) {
+            let result = identity
+                .ok_or(Problem::RootUnavailable)
+                .and_then(|_| snapshot(&self.root, &self.rules, other_roots));
+            match result {
                 Ok(current) => {
                     if self
                         .baseline
@@ -356,7 +365,7 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("roost-watch-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
 
         fn write(&self, relative: &str) {
@@ -480,7 +489,9 @@ mod tests {
         assert_eq!(watch.poll(at(599), &nested).changed_at, None);
         assert_eq!(watch.poll(at(600), &nested).changed_at, Some(at(100)));
 
-        fs::rename(&root, project.0.join("removed")).unwrap();
+        let moved = project.0.join("removed");
+        fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
         watch
             .signal
             .fetch_or(DIRTY | BACKEND_ERROR, Ordering::Release);
@@ -488,6 +499,7 @@ mod tests {
             watch.poll(at(700), &nested).problem,
             Some(Problem::RootUnavailable)
         );
+        fs::remove_file(&root).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(&file, b"restored").unwrap();
         let periodic = watch.poll(at(3000), &nested);

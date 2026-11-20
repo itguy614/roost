@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use roost_core::{
     CodeRestartPolicy, Project, ProjectId, Revision, WatchRules, WorkerProfile, WorkerProfileId,
 };
@@ -47,6 +49,17 @@ pub struct WatchStatus {
     pub revision: Revision,
     pub state: WatchState,
     pub rules: WatchRules,
+    pub pending: bool,
+    pub problem: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<SharedWatchStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedWatchStatus {
+    pub group_id: roost_core::GroupId,
+    pub path: PathBuf,
+    pub state: WatchState,
     pub pending: bool,
     pub problem: Option<String>,
 }

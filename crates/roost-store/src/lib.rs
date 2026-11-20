@@ -297,6 +297,17 @@ impl Store {
         self.all(c"SELECT data FROM projects ORDER BY path")
     }
 
+    pub fn group_projects(&self, group: GroupId) -> Result<Vec<Project>, Error> {
+        self.0
+            .query(
+                c"SELECT data FROM projects WHERE group_id = ?1 ORDER BY path",
+                &[Some(&group.0.to_string())],
+            )?
+            .iter()
+            .map(|row| serde_json::from_str(row).map_err(Error::from))
+            .collect()
+    }
+
     pub fn update_project(&self, mut project: Project) -> Result<Project, Error> {
         project.validate()?;
         let current = self.get_project(project.id)?.ok_or(Error::NotFound)?;
@@ -453,12 +464,26 @@ mod tests {
         let db = fixture.db();
         let old = Store(sqlite::Connection::open(&db, true).unwrap());
         old.0.exec(INITIAL).unwrap();
-        let project = fixture.project();
+        let group = Group::new("Legacy group".into()).unwrap();
+        old.create_group(&group).unwrap();
+        let group_json = old
+            .0
+            .query(c"SELECT data FROM groups", &[])
+            .unwrap()
+            .remove(0);
+        assert!(!group_json.contains("shared_paths"));
+        let mut project = fixture.project();
+        project.group_id = Some(group.id);
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
+        assert_eq!(old.get_group(group.id).unwrap(), Some(group.clone()));
+        assert_eq!(
+            old.group_projects(group.id).unwrap(),
+            std::slice::from_ref(&project)
+        );
         assert!(
             old.project_leases::<roost_core::WorkerProfileId>(project.id)
                 .unwrap()

@@ -60,6 +60,7 @@ impl WatchCall {
                     problem: runtime
                         .and_then(|runtime| runtime.problem)
                         .map(str::to_owned),
+                    shared: runtime.map_or_else(Vec::new, |runtime| runtime.shared.clone()),
                 })
             }
             Self::Enable(params) => {

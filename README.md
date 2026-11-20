@@ -71,3 +71,7 @@ Configure and run one scheduler per registered project using `roost scheduler`. 
 ## Restart workers on file changes
 
 Enable the project watcher and opt in the worker profiles that should restart. See [file watching and targeted restarts](docs/file-watching.md) for the rules, status commands, and macOS demo.
+
+## Run a project group
+
+Use `roost group` to manage queue workers and schedulers across multiple projects. A monorepo group can also map a shared directory to specific members for code-change restarts. See the [group commands and Milestone 3 walkthrough](docs/project-groups.md).
