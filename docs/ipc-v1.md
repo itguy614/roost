@@ -15,9 +15,31 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `project.get` | Project UUID `id` | Project record |
 | `project.remove` | Project UUID `id`, optional UUID `idempotency_key` | `operation_id` and `result` containing the removed record's `id` |
 
+| `worker.profile.create` | `project_id`, `name`, `connection`, optional `options`, optional UUID `idempotency_key` | Mutation result containing the new profile |
+| `worker.profile.list` | Project UUID `id` | Configured worker profiles |
+| `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
+| `project.restart` | Same parameters as `project.start` | Queues replacement after cleanup and returns the requested intent |
+| `project.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
+| `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit and recovery block |
+| `log.tail` | Project UUID `id` | Bounded output summaries with instance ID, generation, timestamp, stream, byte count, and newline count |
+
+Worker profile `options` accepts the following fields and defaults.
+
+| Field | Default |
+| --- | --- |
+| `queues` | `[]` |
+| `instances` | `1` |
+| `sleep_seconds` | `3` |
+| `tries` | `1` |
+| `timeout_seconds` | `60` |
+| `graceful_stop_seconds` | `15` |
+| `crash_restart` | `"on_failure"` |
+
+Worker mutations use the `operation_id` and `result` envelope. Start, stop, and restart acknowledge intent before the OS transition finishes. A replay returns the historical acknowledgement even across a daemon restart. The new daemon session starts stopped and needs a fresh start request. A project with active intent or unresolved ownership cannot be removed. See [worker supervision](supervision.md) for lifecycle and safety details.
+
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
 
-Mutations complete synchronously before the response. With an idempotency key, the daemon uses it as the operation ID and can replay a committed success after a lost response or restart. Retry with the same method and arguments. Reusing a committed key for different arguments or a different method returns a conflict. Without a key, the server generates a fresh operation ID. There is no separate operation lookup in v1.
+Configuration mutations commit before the response. Worker lifecycle mutations acknowledge acceptance before the process reaches the requested state. With an idempotency key, the daemon uses it as the operation ID and can replay a committed success after a lost response or restart. Retry with the same method and arguments. Reusing a committed key for different arguments or a different method returns a conflict. Without a key, the server generates a fresh operation ID. There is no separate operation lookup in v1.
 
 | Code | Meaning |
 | --- | --- |
@@ -30,6 +52,6 @@ Mutations complete synchronously before the response. With an idempotency key, t
 | `-32001` | Unsupported protocol version, with `error.data.supported` |
 | `-32002` | Request or response exceeds its size limit |
 | `-32003` | Project not found |
-| `-32004` | Already registered, or mutation identity or revision conflict |
+| `-32004` | Already registered, mutation identity or revision conflict, or a worker safety constraint |
 
 The endpoint uses a user-owned state directory with mode `0700`, a socket with mode `0600`, peer UID validation, and an exclusive lock for the daemon. The server accepts up to 32 active connections. Requests are capped at 64 KiB and responses at 4 MiB, excluding delimiters. Reads and writes have five-second deadlines. The server closes idle connections and connections that send an oversized request.

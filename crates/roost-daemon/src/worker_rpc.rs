@@ -10,7 +10,9 @@ use roost_store::{Error as StoreError, Store};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Service, decode, encode, internal_error, request_key, rpc, store_error, supervisor};
+use crate::{
+    DaemonService, decode, encode, internal_error, request_key, rpc, store_error, supervisor,
+};
 
 pub enum WorkerCall {
     Create(CreateWorkerParams),
@@ -35,7 +37,7 @@ impl WorkerCall {
         }
     }
 
-    pub fn execute(self, service: &Service) -> Result<Value, RpcError> {
+    pub fn execute(self, service: &DaemonService) -> Result<Value, RpcError> {
         let mut supervisor = service.workers.lock().map_err(|_| internal_error())?;
         let store = Store::open(&service.db).map_err(store_error)?;
         match self {

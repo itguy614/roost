@@ -41,7 +41,7 @@ pub struct Daemon {
     listener: UnixListener,
     _socket: SocketGuard,
     _lock: File,
-    service: Arc<Service>,
+    service: Arc<DaemonService>,
 }
 
 impl Daemon {
@@ -73,7 +73,7 @@ impl Daemon {
         let db = dir.join("roost.sqlite3");
         drop(private_file(&db)?);
         Store::initialize(&db)?;
-        let service = Arc::new(Service::new(db, std::env::current_exe()?)?);
+        let service = Arc::new(DaemonService::new(db, std::env::current_exe()?)?);
         let listener = StdListener::bind(&path)?;
         let metadata = endpoint::owned_socket(&path)?;
         let socket = SocketGuard {
@@ -139,14 +139,10 @@ impl Daemon {
                 Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => continue,
                 Err(error) => return Err(error),
             };
-            if let Err(error) = endpoint::verify_peer(&stream) {
-                tracing::warn!(kind = ?error.kind(), "IPC peer rejected");
-                continue;
-            }
             let service = self.service.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                serve(stream, service).await;
+                service.serve_client(stream).await;
             });
         }
     }
@@ -204,15 +200,19 @@ impl Drop for SocketGuard {
     }
 }
 
-struct Service {
+/// Daemon application service shared by the listener and connected transports.
+pub struct DaemonService {
     db: PathBuf,
     started: Instant,
     workers: Mutex<Supervisor>,
 }
 
-impl Service {
-    fn new(db: PathBuf, binary: PathBuf) -> Result<Self, StoreError> {
-        Store::open(&db)?.clear_completed_worker_leases()?;
+impl DaemonService {
+    /// Open the service after taking an exclusive state-directory lock and migrating SQLite.
+    pub fn new(db: PathBuf, binary: PathBuf) -> Result<Self, StoreError> {
+        let store = Store::open(&db)?;
+        store.cancel_unclaimed_workers()?;
+        store.clear_completed_worker_leases()?;
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone())),
             db,
@@ -220,7 +220,15 @@ impl Service {
         })
     }
 
-    async fn poll_workers(self: &Arc<Self>) {
+    pub async fn serve_client(self: &Arc<Self>, stream: UnixStream) {
+        if let Err(error) = endpoint::verify_peer(&stream) {
+            tracing::warn!(kind = ?error.kind(), "IPC peer rejected");
+            return;
+        }
+        serve(stream, self.clone()).await;
+    }
+
+    pub async fn poll_workers(self: &Arc<Self>) {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut failed = false;
@@ -247,7 +255,7 @@ impl Service {
     }
 }
 
-async fn serve(stream: UnixStream, service: Arc<Service>) {
+async fn serve(stream: UnixStream, service: Arc<DaemonService>) {
     let mut reader = BufReader::new(stream);
     let mut negotiated = false;
     loop {
@@ -291,7 +299,11 @@ async fn send(reader: &mut BufReader<UnixStream>, response: Value) -> io::Result
     timeout(rpc::IO_TIMEOUT, rpc::write_frame(reader.get_mut(), &bytes)).await?
 }
 
-async fn handle(frame: &[u8], service: &Arc<Service>, negotiated: &mut bool) -> Option<Value> {
+async fn handle(
+    frame: &[u8],
+    service: &Arc<DaemonService>,
+    negotiated: &mut bool,
+) -> Option<Value> {
     let request: Value = match serde_json::from_slice(frame) {
         Ok(request) => request,
         Err(_) => {
@@ -319,7 +331,7 @@ async fn handle(frame: &[u8], service: &Arc<Service>, negotiated: &mut bool) -> 
 }
 
 async fn dispatch(
-    service: &Arc<Service>,
+    service: &Arc<DaemonService>,
     negotiated: &mut bool,
     method: &str,
     params: Value,
@@ -400,7 +412,7 @@ impl ProjectCall {
         }
     }
 
-    fn execute(self, service: &Service) -> Result<Value, RpcError> {
+    fn execute(self, service: &DaemonService) -> Result<Value, RpcError> {
         let store = Store::open(&service.db).map_err(store_error)?;
         match self {
             Self::List => {

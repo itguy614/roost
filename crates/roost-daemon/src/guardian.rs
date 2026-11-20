@@ -36,13 +36,15 @@ impl Guardian {
             php: php.to_owned(),
         })?;
         launch.push(b'\n');
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .arg(ARG)
             .arg(db)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // Separate the guardian from terminal interrupts to the foreground daemon.
+        let mut child = roost_process::spawn_in_session(command)?;
         let stdout = child
             .stdout
             .take()
@@ -83,9 +85,7 @@ pub fn run(db: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let lease = store
         .worker_lease(launch.lease_id)?
         .ok_or(io::Error::other("worker lease missing"))?;
-    if lease.state != WorkerLeaseState::Reserved {
-        return Err(io::Error::other("worker lease is not reserved").into());
-    }
+    let lease = store.claim_worker(lease)?;
     let project = store
         .get_project(lease.project_id)?
         .ok_or(roost_store::Error::NotFound)?;

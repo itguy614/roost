@@ -1,7 +1,7 @@
 use std::{
     io,
     mem::{MaybeUninit, size_of},
-    os::unix::process::{CommandExt, ExitStatusExt},
+    os::unix::process::ExitStatusExt,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -30,24 +30,22 @@ pub fn run_guarded(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // SAFETY: setsid and errno retrieval are async-signal-safe between fork and exec.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    let Ok(mut child) = command.spawn() else {
+    let Ok(mut child) = crate::spawn_in_session(command) else {
         return record(WorkerLeaseState::LaunchFailed);
     };
 
-    let result = supervise(&mut child, grace, stop, &mut record);
+    let mut last_identity = None;
+    let result = supervise(&mut child, grace, stop, &mut |state| {
+        if let WorkerLeaseState::Running { identity } = state {
+            last_identity = Some(identity);
+        }
+        record(state)
+    });
     if result.is_err() {
         // An unconfirmed group is never made eligible for replacement.
-        record(WorkerLeaseState::Uncertain)?;
+        record(WorkerLeaseState::Uncertain {
+            identity: last_identity,
+        })?;
     }
     result
 }
@@ -108,14 +106,25 @@ fn supervise(
 
     // waitid(WNOWAIT) still pins the leader PID here. It cannot be reused as a
     // different session/process-group ID until reaping. No foreign session can join it.
-    let until = Instant::now() + KILL_DEADLINE;
-    while group_has_live_members(pid)? {
-        send_group(pid, libc::SIGKILL)?;
-        forced = true;
-        if Instant::now() >= until {
-            return Err(io::Error::other("worker process group did not empty"));
+    if group_has_live_members(pid)? {
+        let graceful_deadline = if let Some(deadline) = deadline {
+            deadline
+        } else {
+            send_group(pid, libc::SIGTERM)?;
+            Instant::now() + grace
+        };
+        while Instant::now() < graceful_deadline && group_has_live_members(pid)? {
+            thread::sleep(TICK);
         }
-        thread::sleep(TICK);
+        let until = Instant::now() + KILL_DEADLINE;
+        while group_has_live_members(pid)? {
+            send_group(pid, libc::SIGKILL)?;
+            forced = true;
+            if Instant::now() >= until {
+                return Err(io::Error::other("worker process group did not empty"));
+            }
+            thread::sleep(TICK);
+        }
     }
     let status = child.wait()?;
     record(WorkerLeaseState::Exited {
@@ -215,10 +224,17 @@ fn group_has_live_members(leader: libc::pid_t) -> io::Result<bool> {
         ));
     }
     for &pid in &pids[..count as usize / size_of::<libc::pid_t>()] {
-        if pid != 0 && pid != leader && unsafe { libc::getpgid(pid) } == leader {
-            if inspect(pid).is_ok_and(|info| info.pbi_status == libc::SZOMB) {
-                continue;
-            }
+        if pid == 0 || pid == leader {
+            continue;
+        }
+        // The listed PID can disappear or be reused in another group.
+        let group = unsafe { libc::getpgid(pid) };
+        if group < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::other(
+                "worker group member could not be verified",
+            ));
+        }
+        if group == leader && !inspect(pid).is_ok_and(|info| info.pbi_status == libc::SZOMB) {
             return Ok(true);
         }
     }

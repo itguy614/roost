@@ -46,6 +46,47 @@ impl Store {
             .collect()
     }
 
+    /// Atomically claim a reservation before spawning any worker.
+    pub fn claim_worker(&self, mut lease: WorkerLease) -> Result<WorkerLease, Error> {
+        if lease.state != WorkerLeaseState::Reserved {
+            return Err(Error::RevisionConflict);
+        }
+        let reserved = serde_json::to_string(&lease)?;
+        lease.state = WorkerLeaseState::Claimed;
+        self.0.query(
+            c"UPDATE worker_leases SET data = ?3 WHERE id = ?1 AND data = ?2 AND complete = 0",
+            &[
+                Some(&lease.id.to_string()),
+                Some(&reserved),
+                Some(&serde_json::to_string(&lease)?),
+            ],
+        )?;
+        if self.0.changes() == 0 {
+            return Err(Error::RevisionConflict);
+        }
+        Ok(lease)
+    }
+
+    /// A previous daemon may have died before handing its reservation to a guardian.
+    /// Deleting only the exact unclaimed state prevents a delayed guardian from spawning.
+    pub fn cancel_unclaimed_workers(&self) -> Result<(), Error> {
+        let leases: Vec<WorkerLease> =
+            self.all(c"SELECT data FROM worker_leases WHERE complete = 0")?;
+        for lease in leases
+            .into_iter()
+            .filter(|lease| lease.state == WorkerLeaseState::Reserved)
+        {
+            self.0.query(
+                c"DELETE FROM worker_leases WHERE id = ?1 AND data = ?2 AND complete = 0",
+                &[
+                    Some(&lease.id.to_string()),
+                    Some(&serde_json::to_string(&lease)?),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn record_worker_state(
         &self,
         mut lease: WorkerLease,

@@ -50,10 +50,11 @@ impl ProcessExit {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum WorkerLeaseState {
     Reserved,
+    Claimed,
     Running { identity: ProcessIdentity },
     Exited { exit: ProcessExit },
     LaunchFailed,
-    Uncertain,
+    Uncertain { identity: Option<ProcessIdentity> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,4 +100,53 @@ pub struct OutputSummary {
     pub stream: OutputStream,
     pub bytes: u32,
     pub newlines: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_policy_distinguishes_success_failure_and_requested_stops() {
+        let success = ProcessExit {
+            code: Some(0),
+            signal: None,
+            at: 0,
+            requested_stop: false,
+            forced: false,
+        };
+        let failed = ProcessExit {
+            code: Some(1),
+            ..success
+        };
+        let killed = ProcessExit {
+            code: None,
+            signal: Some(9),
+            ..success
+        };
+        let manual = ProcessExit {
+            requested_stop: true,
+            ..killed
+        };
+
+        for policy in [
+            CrashRestartPolicy::Never,
+            CrashRestartPolicy::OnFailure,
+            CrashRestartPolicy::Always,
+        ] {
+            assert!(!manual.restartable(policy));
+            assert_eq!(
+                success.restartable(policy),
+                policy == CrashRestartPolicy::Always
+            );
+            assert_eq!(
+                failed.restartable(policy),
+                policy != CrashRestartPolicy::Never
+            );
+            assert_eq!(
+                killed.restartable(policy),
+                policy != CrashRestartPolicy::Never
+            );
+        }
+    }
 }

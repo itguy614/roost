@@ -1,10 +1,10 @@
 # Roost
 
-Roost is a macOS-first supervisor for local Laravel queue workers and schedulers. Milestone 1 registers Laravel projects through a Rust CLI and a per-user daemon. The daemon owns SQLite and serves versioned JSON-RPC over a private Unix socket.
+Roost is a macOS-first supervisor for local Laravel queue workers and schedulers. The Rust CLI and per-user daemon register Laravel projects and supervise queue workers. The daemon owns SQLite and serves versioned JSON-RPC over a private Unix socket.
 
 ## Developer setup
 
-Use a regular macOS user account, Apple Command Line Tools, and a Rust toolchain with Cargo, rustfmt and Clippy. Milestone 1 was built with Rust 1.96 on Apple Silicon. The build links the SQLite library from the macOS SDK. PHP, Herd, Node.js and Tauri are unnecessary for registration.
+Use a regular macOS user account, Apple Command Line Tools, and a Rust toolchain with Cargo, rustfmt and Clippy. Milestone 1 was built with Rust 1.96 on Apple Silicon. The build links the SQLite library from the macOS SDK. Worker supervision requires a PHP executable and a Laravel app. Registration and the automated tests run with the Rust toolchain and Apple Command Line Tools.
 
 ```sh
 xcode-select --install  # If Apple Command Line Tools are missing
@@ -46,3 +46,20 @@ The first list contains one record and the final list is `[]`. Adding `"$smoke_d
 The default macOS state directory is `~/Library/Application Support/Roost`. For an isolated instance or if the default socket path exceeds macOS's Unix socket length limit, pass the same short absolute `--state-dir` to both binaries. Its parent must exist. The daemon runs in the foreground and handles SIGTERM and SIGINT so a future per-user LaunchAgent can manage it.
 
 See [IPC v1](docs/ipc-v1.md), [storage and domain schema](docs/storage.md), and the [product specification](SPEC.md).
+
+## Run a queue worker on macOS
+
+Start the daemon as above and register a Laravel app with a configured queue connection. Use the project UUID returned by `project add` and the absolute path of the PHP executable for that project.
+
+```sh
+target/debug/roost project add /path/to/laravel
+target/debug/roost worker profile create PROJECT_UUID Default database default
+target/debug/roost project start PROJECT_UUID /path/to/php
+target/debug/roost process list PROJECT_UUID
+target/debug/roost log tail PROJECT_UUID
+target/debug/roost project restart PROJECT_UUID /path/to/php
+target/debug/roost project stop PROJECT_UUID
+target/debug/roost process list PROJECT_UUID
+```
+
+Use `--state-dir "$smoke_dir/state"` before the subcommand if you started an isolated daemon. Poll `process list` for the worker's observed state. `log tail` shows bounded output summaries. Use `worker profile create ... --options-json '{"instances":2,"queues":["high","default"],"crash_restart":"on_failure"}'` to override the defaults. See [worker supervision](docs/supervision.md) for ownership, recovery, and logging behavior.

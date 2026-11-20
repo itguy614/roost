@@ -23,21 +23,21 @@ impl Fixture {
         path
     }
 
-    fn service(&self) -> Arc<Service> {
+    fn service(&self) -> Arc<DaemonService> {
         let db = self.0.join("test.sqlite3");
         Store::initialize(&db).unwrap();
-        Arc::new(Service::new(db, std::env::current_exe().unwrap()).unwrap())
+        Arc::new(DaemonService::new(db, std::env::current_exe().unwrap()).unwrap())
     }
 }
 
-fn pair(service: &Arc<Service>) -> UnixStream {
+fn pair(service: &Arc<DaemonService>) -> UnixStream {
     let (server, client) = UnixStream::pair().unwrap();
     endpoint::verify_peer(&server).unwrap();
     tokio::spawn(serve(server, service.clone()));
     client
 }
 
-async fn connect(service: &Arc<Service>) -> Client {
+async fn connect(service: &Arc<DaemonService>) -> Client {
     Client::negotiate(pair(service)).await.unwrap()
 }
 

@@ -1,9 +1,14 @@
 use std::{
     collections::VecDeque,
+    ffi::CString,
     io::{self, Read},
-    os::fd::AsRawFd,
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, process::CommandExt},
+    },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
+    ptr,
 };
 
 use roost_core::worker_runtime::{MAX_GRACEFUL_STOP_SECONDS, MAX_PROFILE_INSTANCES};
@@ -70,6 +75,39 @@ pub fn worker_command(project: &Project, profile: &WorkerProfile, php: &Path) ->
         command.arg(format!("--queue={}", profile.queues.join(",")));
     }
     command
+}
+
+/// Start an absolute executable in a new session. Calling execv directly
+/// prevents execvp from falling back to a shell on an invalid executable.
+pub fn spawn_in_session(mut command: Command) -> io::Result<Child> {
+    const MAX_ARGV: usize = 16;
+    if !Path::new(command.get_program()).is_absolute() {
+        return Err(io::Error::other(
+            "session executable must use an absolute path",
+        ));
+    }
+    let args = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| CString::new(arg.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if args.len() >= MAX_ARGV {
+        return Err(io::Error::other("too many session arguments"));
+    }
+    // SAFETY: args are owned before fork. The hook uses stack storage and
+    // async-signal-safe syscalls only. Command sets up cwd and stdio before this hook.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let argv: [*const libc::c_char; MAX_ARGV] = std::array::from_fn(|index| {
+                args.get(index).map_or(ptr::null(), |arg| arg.as_ptr())
+            });
+            libc::execv(argv[0], argv.as_ptr());
+            Err(io::Error::last_os_error())
+        });
+    }
+    command.spawn()
 }
 
 pub struct OutputPipe<R>(R);
