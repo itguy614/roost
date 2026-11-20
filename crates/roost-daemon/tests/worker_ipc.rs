@@ -9,8 +9,8 @@ use std::{
 };
 
 use roost_core::{
-    CrashRestartPolicy, DesiredState, ProjectId, Revision,
-    scheduler::{SchedulerIntent, SchedulerProcessStatus, SchedulerProfileId},
+    CrashRestartPolicy, DesiredState, ProjectId, Revision, WorkerProfileId,
+    scheduler::{SchedulerIntent, SchedulerLease, SchedulerProcessStatus, SchedulerProfileId},
     worker_runtime::{
         DaemonStartup, LaunchFailure, LaunchIntent, ObservedState, ProjectIntent, StopCause,
         WorkerLeaseState, WorkerStatus,
@@ -987,6 +987,201 @@ async fn real_daemon_recovery_waits_for_scheduler_group_and_honors_saved_stop() 
     assert_eq!(dormant.desired_state, DesiredState::Stopped);
     assert!(dormant.process.is_none());
     terminate(&mut daemon).await;
+}
+
+#[tokio::test]
+async fn scheduler_restart_after_terminal_failure_waits_for_lease_confirmation() {
+    let h = Harness::new();
+    let app = h.app("app", "graceful");
+    let mode = app.join("scheduler-mode");
+    fs::write(&mode, "fail").unwrap();
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let params = ProjectParams { id };
+    let profile = client
+        .configure_scheduler(&scheduler_config(id, CrashRestartPolicy::Never))
+        .await
+        .unwrap()
+        .result;
+    client
+        .start_scheduler(&scheduler_launch(&h, id))
+        .await
+        .unwrap();
+    let failed = until_scheduler(&mut client, id, |status| {
+        status.state == ObservedState::Failed
+    })
+    .await;
+    assert_eq!(failed.last_exit.unwrap().code, Some(7));
+    assert!(failed.identity.is_none());
+    assert!(failed.retry_in_ms.is_none());
+    assert!(!failed.recovery_blocked);
+    let store = Store::open(&h.root.join("daemon/roost.sqlite3")).unwrap();
+    assert!(
+        store
+            .project_leases::<SchedulerProfileId>(id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Inject an outstanding guardian claim while the daemon retains the
+    // terminal runtime. The claim has no child, so no process can leak.
+    let lease = SchedulerLease {
+        id: Uuid::new_v4(),
+        project_id: id,
+        profile_id: profile.id,
+        slot: 0,
+        state: WorkerLeaseState::Reserved,
+    };
+    store.reserve_process(&lease).unwrap();
+    let pending = store.claim_process(lease).unwrap();
+    fs::write(&mode, "graceful").unwrap();
+    let restart = scheduler_launch(&h, id);
+    let blocked = client.restart_scheduler(&restart).await;
+    assert!(
+        matches!(blocked, Err(ClientError::Rpc(error)) if error.code == CONFLICT && error.message.contains("cleanup"))
+    );
+    let retained = client
+        .scheduler_status(&params)
+        .await
+        .unwrap()
+        .process
+        .unwrap();
+    assert_eq!(retained.id, failed.id);
+    assert_eq!(retained.state, ObservedState::Failed);
+    assert_eq!(retained.generation, failed.generation);
+    assert_eq!(
+        store.project_leases::<SchedulerProfileId>(id).unwrap(),
+        vec![pending.clone()]
+    );
+
+    // Publish the terminal record a guardian would write after confirming
+    // that it cancelled before spawning. Retry the exact rejected request.
+    store
+        .record_process_state(
+            pending.clone(),
+            WorkerLeaseState::LaunchFailure {
+                failure: LaunchFailure::Cancelled,
+            },
+        )
+        .unwrap();
+    client.restart_scheduler(&restart).await.unwrap();
+    let pid = scheduler_ready(&mut client, id, None).await;
+    let status = client
+        .scheduler_status(&params)
+        .await
+        .unwrap()
+        .process
+        .unwrap();
+    assert_ne!(status.id, failed.id);
+    assert_eq!(status.generation, 1);
+    let [replacement] = store
+        .project_leases::<SchedulerProfileId>(id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_ne!(replacement.id, pending.id);
+    assert_eq!(
+        replacement.state,
+        WorkerLeaseState::Running {
+            identity: status.identity.unwrap(),
+        }
+    );
+    assert_eq!(client.scheduler_crashes(&params).await.unwrap().len(), 1);
+    terminate(&mut daemon).await;
+    assert!(!exists(pid));
+}
+
+#[tokio::test]
+async fn real_daemon_recovers_scheduler_and_queue_worker_for_the_same_project() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let h = Harness::new();
+    let app = h.app("app", "graceful");
+    fs::write(app.join("scheduler-mode"), "ignore").unwrap();
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    client
+        .configure_scheduler(&scheduler_config(id, CrashRestartPolicy::Never))
+        .await
+        .unwrap();
+    client
+        .set_autostart(&AutostartParams {
+            id,
+            enabled: true,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    client.start_project(&h.launch(id)).await.unwrap();
+    client
+        .start_scheduler(&scheduler_launch(&h, id))
+        .await
+        .unwrap();
+    let old_worker = worker_pid(&mut client, id).await;
+    let old_scheduler = scheduler_ready(&mut client, id, None).await;
+    let old_descendant = descendant_pid(&app).await;
+    assert!(exists(old_worker) && exists(old_scheduler) && exists(old_descendant));
+    let store = Store::open(&h.root.join("daemon/roost.sqlite3")).unwrap();
+    let [old_worker_lease] = store
+        .project_leases::<WorkerProfileId>(id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let [old_scheduler_lease] = store
+        .project_leases::<SchedulerProfileId>(id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let worker_intent = store.project_intent(id).unwrap();
+    let scheduler_intent = store.scheduler_intent(id).unwrap();
+    assert!(matches!(worker_intent, ProjectIntent::Running(_)));
+    assert!(matches!(scheduler_intent, SchedulerIntent::Running { .. }));
+
+    fs::remove_file(app.join("descendant.pid")).unwrap();
+    daemon.0.kill().unwrap();
+    assert_eq!(daemon.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let (mut daemon, mut client) = h.daemon().await;
+    assert_eq!(
+        client.status().await.unwrap().startup,
+        Some(DaemonStartup::AfterInterruptedShutdown)
+    );
+    let worker = worker_pid(&mut client, id).await;
+    let scheduler = scheduler_ready(&mut client, id, Some(old_scheduler)).await;
+    let descendant = descendant_pid(&app).await;
+    assert_ne!(worker, old_worker);
+    assert_ne!(descendant, old_descendant);
+    assert_ne!(worker, scheduler);
+    assert!(!exists(old_worker) && !exists(old_scheduler));
+    eventually(|| !exists(old_descendant)).await;
+    assert!(exists(worker) && exists(scheduler) && exists(descendant));
+    let [worker_lease] = store
+        .project_leases::<WorkerProfileId>(id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let [scheduler_lease] = store
+        .project_leases::<SchedulerProfileId>(id)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_ne!(worker_lease.id, old_worker_lease.id);
+    assert_ne!(scheduler_lease.id, old_scheduler_lease.id);
+    for (state, pid) in [
+        (worker_lease.state, worker),
+        (scheduler_lease.state, scheduler),
+    ] {
+        assert!(matches!(state, WorkerLeaseState::Running { identity } if identity.pid == pid));
+    }
+    assert_eq!(store.project_intent(id).unwrap(), worker_intent);
+    assert_eq!(store.scheduler_intent(id).unwrap(), scheduler_intent);
+
+    terminate(&mut daemon).await;
+    assert!(!exists(worker) && !exists(scheduler));
+    eventually(|| !exists(descendant)).await;
 }
 
 #[tokio::test]
