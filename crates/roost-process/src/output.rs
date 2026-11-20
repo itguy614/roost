@@ -8,7 +8,7 @@ use std::{
 use regex::Regex;
 use roost_core::{
     unix_timestamp,
-    worker_runtime::{OutputStream, OutputSummary, WorkerStatus},
+    worker_runtime::{OutputStream, OutputSummary, ProcessStatus},
 };
 
 const LINE_LIMIT: usize = 512;
@@ -59,7 +59,7 @@ impl<R: Read> OutputPipe<R> {
     pub fn drain(
         &mut self,
         stream: OutputStream,
-        status: &WorkerStatus,
+        status: &ProcessStatus<impl Sized>,
         entries: &mut VecDeque<OutputSummary>,
         guardian_exited: bool,
     ) -> DrainResult {
@@ -122,7 +122,7 @@ impl Capture {
         &mut self,
         chunk: &[u8],
         stream: OutputStream,
-        status: &WorkerStatus,
+        status: &ProcessStatus<impl Sized>,
         entries: &mut VecDeque<OutputSummary>,
     ) {
         for fragment in chunk.split_inclusive(|byte| *byte == b'\n') {
@@ -145,7 +145,7 @@ impl Capture {
     fn finish(
         &mut self,
         stream: OutputStream,
-        status: &WorkerStatus,
+        status: &ProcessStatus<impl Sized>,
         entries: &mut VecDeque<OutputSummary>,
     ) {
         if self.bytes != 0 {
@@ -157,7 +157,7 @@ impl Capture {
         &mut self,
         newline: bool,
         stream: OutputStream,
-        status: &WorkerStatus,
+        status: &ProcessStatus<impl Sized>,
         entries: &mut VecDeque<OutputSummary>,
     ) {
         let text = sanitize(&self.pending, self.dropped, &mut self.private_key);
@@ -212,7 +212,10 @@ fn sanitize(bytes: &[u8], dropped: bool, private_key: &mut bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roost_core::{DesiredState, ProjectId, WorkerProfileId, worker_runtime::ObservedState};
+    use roost_core::{
+        DesiredState, ProjectId, WorkerProfileId,
+        worker_runtime::{ObservedState, WorkerStatus},
+    };
 
     fn status() -> WorkerStatus {
         let id = "3dd8a878-24e3-4ccf-b55f-cfcd05bb22ec".parse().unwrap();

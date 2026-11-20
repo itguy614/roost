@@ -39,6 +39,25 @@ pub fn validate_worker(
             "worker profile exceeds supervision limits",
         ));
     }
+    validate_php(php_path)
+}
+
+pub fn validate_scheduler(
+    project: &Project,
+    profile: &roost_core::scheduler::SchedulerProfile,
+    php_path: &Path,
+) -> io::Result<PathBuf> {
+    project.validate_location().map_err(io::Error::other)?;
+    profile.validate().map_err(io::Error::other)?;
+    if profile.project_id != project.id || !profile.enabled {
+        return Err(io::Error::other(
+            "scheduler profile is not enabled for this project",
+        ));
+    }
+    validate_php(php_path)
+}
+
+fn validate_php(php_path: &Path) -> io::Result<PathBuf> {
     if !php_path.is_absolute() {
         return Err(io::Error::other("PHP executable path must be absolute"));
     }
@@ -72,6 +91,14 @@ pub fn worker_command(project: &Project, profile: &WorkerProfile, php: &Path) ->
     if !profile.queues.is_empty() {
         command.arg(format!("--queue={}", profile.queues.join(",")));
     }
+    command
+}
+
+pub fn scheduler_command(project: &Project, php: &Path) -> Command {
+    let mut command = Command::new(php);
+    command
+        .current_dir(&project.path)
+        .args(["artisan", "schedule:work"]);
     command
 }
 

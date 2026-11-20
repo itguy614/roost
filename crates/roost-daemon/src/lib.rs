@@ -1,6 +1,8 @@
 mod backoff;
 mod discovery_rpc;
 pub mod guardian;
+mod scheduler_rpc;
+mod supervised;
 mod supervisor;
 mod worker_rpc;
 
@@ -223,12 +225,15 @@ impl DaemonService {
     /// Open the service after taking an exclusive state-directory lock and migrating SQLite.
     pub fn new(db: PathBuf, binary: PathBuf) -> Result<Self, StoreError> {
         let store = Store::open(&db)?;
-        store.cancel_unclaimed_workers()?;
-        store.recover_completed_workers()?;
+        store.cancel_unclaimed_processes::<roost_core::WorkerProfileId>()?;
+        store.cancel_unclaimed_processes::<roost_core::scheduler::SchedulerProfileId>()?;
+        store.recover_completed_processes::<roost_core::WorkerProfileId>()?;
+        store.recover_completed_processes::<roost_core::scheduler::SchedulerProfileId>()?;
         let intents = store.autostart_intents()?;
+        let schedulers = store.autostart_schedulers()?;
         let startup = store.begin_daemon_run()?;
         Ok(Self {
-            workers: Mutex::new(Supervisor::new(binary, db.clone(), intents)),
+            workers: Mutex::new(Supervisor::new(binary, db.clone(), intents, schedulers)),
             snapshots: Mutex::new(Snapshots::new()),
             discovery_capacity: Arc::new(Semaphore::new(2)),
             db,
@@ -406,6 +411,9 @@ async fn dispatch(
             let _permit = permit;
             call.execute(&service)
         })
+    } else if method.starts_with("scheduler.") {
+        let call = scheduler_rpc::SchedulerCall::decode(method, params)?;
+        tokio::task::spawn_blocking(move || call.execute(&service))
     } else {
         let call = WorkerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
@@ -493,10 +501,14 @@ impl ProjectCall {
                 workers
                     .clean_previous(&store, params.id)
                     .map_err(worker_error)?;
+                workers
+                    .clean_previous_scheduler(&store, params.id)
+                    .map_err(worker_error)?;
                 let mut apply = false;
                 let (operation_id, result) = store
                     .try_mutate::<_, supervisor::Error>(params.idempotency_key, &request, |store| {
                         workers.validate_config_change(store, params.id)?;
+                        workers.scheduler_clear_for_change(store, params.id)?;
                         store.delete_project(params.id)?;
                         apply = true;
                         Ok(Removed { id: params.id })
@@ -504,6 +516,7 @@ impl ProjectCall {
                     .map_err(worker_error)?;
                 if apply {
                     workers.remove(params.id);
+                    workers.remove_scheduler_runtime(params.id);
                 }
                 encode(Mutation {
                     operation_id,

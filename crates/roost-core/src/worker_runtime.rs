@@ -74,14 +74,14 @@ pub enum LaunchFailure {
 impl LaunchFailure {
     pub fn reason(self) -> &'static str {
         match self {
-            Self::Validation => "worker configuration or PHP path failed validation",
-            Self::SpawnRejected => "the OS rejected the worker launch",
+            Self::Validation => "process configuration or PHP path failed validation",
+            Self::SpawnRejected => "the OS rejected the process launch",
             Self::ResourceUnavailable => "OS resources were temporarily unavailable during launch",
-            Self::ReadinessTimeout => "startup timed out and worker cleanup was confirmed",
+            Self::ReadinessTimeout => "startup timed out and process cleanup was confirmed",
             Self::StatePublication => {
-                "could not persist worker ownership; worker cleanup was confirmed"
+                "could not persist process ownership; process cleanup was confirmed"
             }
-            Self::Cancelled => "worker launch was cancelled before execution",
+            Self::Cancelled => "process launch was cancelled before execution",
         }
     }
 
@@ -102,20 +102,47 @@ pub enum WorkerLeaseState {
     Uncertain { identity: Option<ProcessIdentity> },
 }
 
+impl WorkerLeaseState {
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::Exited { .. } | Self::LaunchFailed | Self::LaunchFailure { .. }
+        )
+    }
+}
+
+pub trait ProcessProfileId: Copy + Serialize + serde::de::DeserializeOwned {
+    const SCHEDULER: bool;
+
+    fn uuid(self) -> Uuid;
+}
+
+impl ProcessProfileId for WorkerProfileId {
+    const SCHEDULER: bool = false;
+
+    fn uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+pub type WorkerLease = ProcessLease<WorkerProfileId>;
+pub type WorkerStatus = ProcessStatus<WorkerProfileId>;
+pub type CrashReport = ProcessCrash<WorkerProfileId>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerLease {
+pub struct ProcessLease<P> {
     pub id: Uuid,
     pub project_id: ProjectId,
-    pub profile_id: WorkerProfileId,
+    pub profile_id: P,
     pub slot: u32,
     pub state: WorkerLeaseState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerStatus {
+pub struct ProcessStatus<P> {
     pub id: Uuid,
     pub project_id: ProjectId,
-    pub profile_id: WorkerProfileId,
+    pub profile_id: P,
     pub slot: u32,
     pub generation: u64,
     pub desired_state: DesiredState,
@@ -235,10 +262,10 @@ pub enum DaemonStartup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrashReport {
+pub struct ProcessCrash<P> {
     pub id: Uuid,
     pub project_id: ProjectId,
-    pub profile_id: WorkerProfileId,
+    pub profile_id: P,
     pub slot: u32,
     pub exit: ProcessExit,
     pub reason: String,
