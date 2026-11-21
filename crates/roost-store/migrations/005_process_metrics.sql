@@ -61,6 +61,15 @@ CREATE TABLE process_lifecycle_totals (
     PRIMARY KEY (project_id, kind, profile_id, slot)
 ) WITHOUT ROWID;
 
+-- A confirmed running lease is evidence of a prior launch, not a restart at
+-- migration. Claimed, uncertain and completed leases do not prove publication.
+INSERT INTO process_lifecycle_totals (project_id, kind, profile_id, slot, launches, crashes)
+SELECT project_id, 'worker', profile_id, slot, 1, 0
+FROM worker_leases WHERE complete = 0 AND json_extract(data, '$.state.state') = 'running'
+UNION ALL
+SELECT project_id, 'scheduler', profile_id, slot, 1, 0
+FROM scheduler_leases WHERE complete = 0 AND json_extract(data, '$.state.state') = 'running';
+
 CREATE TRIGGER count_worker_metric_launch
 AFTER UPDATE OF data ON worker_leases
 WHEN json_extract(NEW.data, '$.state.state') = 'running'

@@ -621,6 +621,30 @@ mod tests {
             .unwrap();
         assert!(matches!(expired, HistoryPage::Expired(s) if s.pruned == 2));
         store.0.exec(c"DROP TRIGGER fail_rollup").unwrap();
+
+        // A rollback-journal reader can let the writes proceed but block COMMIT.
+        let reader = Store::open(&db).unwrap();
+        reader.0.exec(c"BEGIN").unwrap();
+        reader
+            .0
+            .query(c"SELECT count(*) FROM process_metric_raw", &[])
+            .unwrap();
+        let writer = Store::open_for_metric_writes(&db).unwrap();
+        assert!(matches!(
+            writer.maintain_process_metrics(base + RAW_SECONDS + 300),
+            Err(Error::Sql(error)) if error.code == 5
+        ));
+        reader.0.exec(c"COMMIT").unwrap();
+        assert_eq!(
+            store
+                .0
+                .query(c"SELECT count(*) FROM process_metric_rollups", &[])
+                .unwrap(),
+            ["0"]
+        );
+        assert!(
+            matches!(page(Resolution::Raw,0,Some(&state.lineage)), HistoryPage::Rows { rows, .. } if rows.len() == 2)
+        );
         store
             .maintain_process_metrics(base + RAW_SECONDS + 300)
             .unwrap();
@@ -647,6 +671,236 @@ mod tests {
         assert!(
             matches!(page(Resolution::FiveMinutes,0,Some(&state.lineage)), HistoryPage::Expired(s) if s.pruned == 1)
         );
+    }
+
+    #[test]
+    fn history_enforces_timestamp_and_scope_inside_the_sequence_window() {
+        use metrics::{HistoryPage, HistoryQuery, Resolution};
+
+        let fixture = Fixture::new();
+        let (project, other) = (fixture.project(), Fixture::new());
+        let other_project = other.project();
+        Store::initialize(&fixture.db()).unwrap();
+        let store = Store::open(&fixture.db()).unwrap();
+        store.create_project(&project).unwrap();
+        store.create_project(&other_project).unwrap();
+        for (id, project, profile) in [
+            ("1", project.id, "target"),
+            ("2", project.id, "sibling"),
+            ("3", other_project.id, "target"),
+        ] {
+            store
+                .0
+                .query(
+                    c"INSERT INTO process_metric_series VALUES (?1,?2,'worker',?3,0,?1,1)",
+                    &[Some(id), Some(&project.0.to_string()), Some(profile)],
+                )
+                .unwrap();
+        }
+
+        // Put out-of-range records inside the sequence window explicitly. The
+        // normal writers append in time order, so they cannot create this fixture.
+        for (series, observed_at, bucket) in [
+            ("1", "1800000300", "1800000300"),
+            ("1", "1800000299", "1800000000"),
+            ("3", "1800000301", "1800000300"),
+            ("2", "1800000302", "1800000300"),
+            ("1", "1800000900", "1800000900"),
+            ("1", "1800000899", "1800000600"),
+        ] {
+            store
+                .0
+                .query(
+                    c"INSERT INTO process_metric_raw (series_id,observed_at) VALUES (?1,?2)",
+                    &[Some(series), Some(observed_at)],
+                )
+                .unwrap();
+            store.0.query(
+                c"INSERT INTO process_metric_rollups VALUES (NULL,?1,?2,0,NULL,NULL,NULL,0,NULL,NULL,NULL,NULL,NULL)",
+                &[Some(series), Some(bucket)],
+            ).unwrap();
+        }
+
+        for resolution in [Resolution::Raw, Resolution::FiveMinutes] {
+            let read = |profile, after, limit, to| {
+                let HistoryPage::Rows { rows, .. } = store
+                    .process_history(HistoryQuery {
+                        project_id: project.id,
+                        profile,
+                        resolution,
+                        from: 1_800_000_300,
+                        to,
+                        after,
+                        retention_floor: 0,
+                        high: Some(6),
+                        lineage: None,
+                        limit,
+                    })
+                    .unwrap()
+                else {
+                    panic!("expected a history page");
+                };
+                rows.into_iter()
+                    .map(|row| row["sequence"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(read(Some("target"), 0, 1, 1_800_000_900), ["1"]);
+            assert_eq!(read(Some("target"), 1, 2, 1_800_000_900), ["6"]);
+            assert_eq!(read(None, 0, 8, 1_800_000_900), ["1", "4", "6"]);
+            assert_eq!(read(Some("target"), 0, 8, 1_800_000_899), ["1"]);
+        }
+    }
+
+    #[test]
+    fn migration_counts_replacements_for_preexisting_running_leases_only() {
+        use roost_core::{
+            scheduler::{SchedulerMode, SchedulerProfile, SchedulerProfileId},
+            worker_runtime::{
+                ProcessExit, ProcessIdentity, ProcessLease, ProcessProfileId, WorkerLeaseState,
+            },
+        };
+
+        fn record_running<P: ProcessProfileId>(
+            store: &Store,
+            lease: ProcessLease<P>,
+        ) -> ProcessLease<P> {
+            store.reserve_process(&lease).unwrap();
+            let claimed = store.claim_process(lease).unwrap();
+            let running = WorkerLeaseState::Running {
+                identity: ProcessIdentity {
+                    pid: 123,
+                    group: 123,
+                    uid: 501,
+                    started_seconds: 1,
+                    started_microseconds: 0,
+                },
+            };
+            store
+                .record_process_state(claimed.clone(), running)
+                .unwrap();
+            store.process_lease(claimed.id).unwrap().unwrap()
+        }
+
+        fn retire<P: ProcessProfileId>(store: &Store, lease: ProcessLease<P>) -> ProcessLease<P> {
+            let replacement = ProcessLease {
+                id: Uuid::new_v4(),
+                state: WorkerLeaseState::Reserved,
+                ..lease.clone()
+            };
+            let id = lease.id;
+            store
+                .record_process_state(
+                    lease,
+                    WorkerLeaseState::Exited {
+                        exit: ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                            at: 2,
+                            requested_stop: true,
+                            stop_cause: None,
+                            forced: false,
+                        },
+                    },
+                )
+                .unwrap();
+            store.finish_process::<P>(id, None).unwrap();
+            replacement
+        }
+
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let old = Store(sqlite::Connection::open(&db, true).unwrap());
+        for migration in [INITIAL, WORKER_LEASES, RUNTIME, SCHEDULER] {
+            old.0.exec(migration).unwrap();
+        }
+        let project = fixture.project();
+        old.create_project(&project).unwrap();
+        let worker = WorkerProfile {
+            id: WorkerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            name: "Worker".into(),
+            connection: "database".into(),
+            queues: Vec::new(),
+            desired_instances: 2,
+            sleep_seconds: 3,
+            tries: 1,
+            timeout_seconds: 60,
+            graceful_stop_seconds: 1,
+            crash_restart: CrashRestartPolicy::Never,
+            code_restart: CodeRestartPolicy::Never,
+            notifications: false,
+            enabled: true,
+            revision: Revision(1),
+        };
+        let scheduler = SchedulerProfile {
+            id: SchedulerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            enabled: true,
+            mode: SchedulerMode::ScheduleWork,
+            crash_restart: CrashRestartPolicy::Never,
+            graceful_stop_seconds: 1,
+            revision: Revision(1),
+        };
+        old.create_worker_profile(&worker).unwrap();
+        old.create_scheduler(&scheduler).unwrap();
+
+        let worker_lease = record_running(
+            &old,
+            ProcessLease {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                profile_id: worker.id,
+                slot: 0,
+                state: WorkerLeaseState::Reserved,
+            },
+        );
+        let pending = ProcessLease {
+            id: Uuid::new_v4(),
+            slot: 1,
+            state: WorkerLeaseState::Reserved,
+            ..worker_lease.clone()
+        };
+        old.reserve_process(&pending).unwrap();
+        let pending = old.claim_process(pending).unwrap();
+        let scheduler_lease = record_running(
+            &old,
+            ProcessLease {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                profile_id: scheduler.id,
+                slot: 0,
+                state: WorkerLeaseState::Reserved,
+            },
+        );
+        drop(old);
+
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        let totals = || store.process_lifecycle_totals(project.id, None).unwrap();
+        assert_eq!(totals().restarts, 0);
+        let pending = retire(&store, pending);
+        record_running(&store, pending);
+        assert_eq!(totals().restarts, 0);
+        let worker_lease = retire(&store, worker_lease);
+        assert_eq!(totals().restarts, 0);
+        let worker_lease = record_running(&store, worker_lease);
+        store
+            .record_process_state(worker_lease.clone(), worker_lease.state)
+            .unwrap();
+        assert_eq!(totals().restarts, 1);
+        let scheduler_lease = retire(&store, scheduler_lease);
+        record_running(&store, scheduler_lease);
+        assert_eq!(totals().restarts, 2);
+        for profile in [worker.id.0, scheduler.id.0] {
+            assert_eq!(
+                store
+                    .process_lifecycle_totals(project.id, Some(&profile.to_string()))
+                    .unwrap()
+                    .restarts,
+                1
+            );
+        }
+        assert_eq!(totals().crashes, 0);
     }
 
     #[test]

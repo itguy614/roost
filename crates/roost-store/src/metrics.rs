@@ -241,7 +241,8 @@ impl Store {
                 if after < high {
                     rows = store.0.query(rows_sql,
                         &[Some(&query.project_id.0.to_string()), query.profile, Some(&after.to_string()),
-                        Some(&high.to_string()), Some(&query.limit.to_string())],
+                        Some(&high.to_string()), Some(&query.limit.to_string()),
+                        Some(&query.from.to_string()), Some(&query.to.to_string())],
                     )?.into_iter().map(|row| serde_json::from_str(&row)).collect::<Result<_,_>>()?;
                 }
             }
@@ -273,6 +274,7 @@ const RAW_HISTORY: &CStr = c"SELECT json_object(
   FROM process_metric_raw r JOIN process_metric_series s ON r.series_id=s.id
   WHERE s.project_id=?1 AND (?2 IS NULL OR s.profile_id=?2)
     AND r.sequence>?3 AND r.sequence<=?4
+    AND r.observed_at>=?6 AND r.observed_at<?7
   ORDER BY r.sequence LIMIT ?5";
 
 const ROLLUP_HISTORY: &CStr = c"SELECT json_object(
@@ -288,4 +290,5 @@ const ROLLUP_HISTORY: &CStr = c"SELECT json_object(
   FROM process_metric_rollups r JOIN process_metric_series s ON r.series_id=s.id
   WHERE s.project_id=?1 AND (?2 IS NULL OR s.profile_id=?2)
     AND r.sequence>?3 AND r.sequence<=?4
+    AND r.bucket>=?6 AND r.bucket<=CAST(?7 AS INTEGER)-300
   ORDER BY r.sequence LIMIT ?5";
