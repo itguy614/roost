@@ -1,6 +1,7 @@
 pub mod discovery;
 pub mod endpoint;
 pub mod groups;
+pub mod metrics;
 pub mod scheduler;
 pub mod watch;
 pub mod workers;
@@ -53,6 +54,9 @@ pub const METHODS: &[&str] = &[
     "watch.status",
     "watch.enable",
     "watch.disable",
+    "metrics.process.current",
+    "metrics.process.history",
+    "metrics.project.summary",
     "group.list",
     "group.get",
     "group.create",

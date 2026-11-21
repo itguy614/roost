@@ -47,6 +47,8 @@ The default macOS state directory is `~/Library/Application Support/Roost`. For 
 
 See [IPC v1](docs/ipc-v1.md), [storage and domain schema](docs/storage.md), and the [product specification](SPEC.md).
 
+See [process metrics](docs/process-metrics.md) for the CLI walkthrough, history and retention semantics, and benchmark reproduction.
+
 ## Run a queue worker on macOS
 
 Start the daemon as above and register a Laravel app with a configured queue connection. Use the project UUID returned by `project add`. Roost uses Herd by default when the PHP path is omitted. You can also pass an explicit executable or select `--provider system`. See [Laravel runtime and queue discovery](docs/laravel-discovery.md) for the discovery commands and a demo.

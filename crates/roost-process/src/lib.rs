@@ -18,7 +18,23 @@ pub use probe::{ProbeError, run_probe};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::run_guarded;
+pub use macos::{read_process_counters, run_guarded};
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessCounters {
+    pub cpu_nanoseconds: u64,
+    pub rss_bytes: u64,
+    pub uptime_seconds: Option<u64>,
+    pub sampled_at_nanoseconds: u64,
+    pub awake_nanoseconds: u64,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_process_counters(
+    _: roost_core::worker_runtime::ProcessIdentity,
+) -> io::Result<ProcessCounters> {
+    Err(io::ErrorKind::Unsupported.into())
+}
 
 pub fn validate_worker(
     project: &Project,

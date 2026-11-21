@@ -74,6 +74,15 @@ fn main() -> ExitCode {
     }
     eprintln!("Authorization: Bearer secret-fixture-output");
     while !STOP.load(Ordering::Relaxed) {
+        if behavior == "soak_crash" && fs::remove_file("exit-once").is_ok() {
+            return ExitCode::from(7);
+        }
+        if behavior == "loaded" {
+            let until = std::time::Instant::now() + Duration::from_millis(2);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
         thread::sleep(Duration::from_millis(10));
     }
     if scheduler {

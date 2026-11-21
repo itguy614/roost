@@ -38,6 +38,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `project.setAutostart` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result containing the project record |
 | `project.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
 | `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit, `reason`, optional `launch_failure`, and recovery block |
+| `metrics.process.current` | Project UUID `id` | Project ID and an array of owned running generations with current gauges |
+| `metrics.process.history` | `project_id`, optional `profile_id`, `resolution` (`raw` or `5m`), `from` and optional `to` (Unix seconds), optional `limit` and `cursor` | History page with resolution, items, next cursor, more flag, and retention floor |
+| `metrics.project.summary` | Project UUID `id` | Desired, running and unresolved counts, gauge coverage, lifecycle totals and profiles |
 | `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
 | `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
 | `group.list` | Omit or use `{}` | Array of group records |
@@ -91,7 +94,10 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32006` | Probe timed out |
 | `-32007` | Probe output exceeded its limit |
 | `-32008` | All discovery slots are busy |
+| `-32020` | History cursor invalid, expired, or bound to another query or database lineage |
 
 The endpoint uses a user-owned state directory with mode `0700`, a socket with mode `0600`, peer UID validation, and an exclusive lock for the daemon. The server accepts up to 32 active connections. Requests are capped at 64 KiB and responses at 4 MiB, excluding delimiters. Reads and writes have five-second deadlines. The server closes idle connections and connections that send an oversized request.
 
 See [Laravel runtime and queue discovery](laravel-discovery.md) for selection precedence, limits, and the bootstrap trust boundary.
+
+See [process metrics](process-metrics.md) for gauge states, cursor recovery, and the raw-to-rollup cutover.
