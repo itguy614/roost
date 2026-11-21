@@ -72,6 +72,25 @@ impl Plan {
 }
 
 impl Supervisor {
+    pub(crate) fn owned_metric_leases(&self) -> std::collections::HashSet<uuid::Uuid> {
+        self.projects
+            .values()
+            .flat_map(|runtime| &runtime.slots)
+            .filter(|slot| slot.has_guardian() && !slot.recovery_blocked())
+            .filter_map(|slot| slot.lease_id)
+            .chain(self.schedulers.owned_metric_leases())
+            .collect()
+    }
+
+    pub(crate) fn metric_subjects(&self) -> Vec<roost_core::metrics::MetricSubject> {
+        self.projects
+            .values()
+            .flat_map(|runtime| &runtime.slots)
+            .filter_map(Slot::metric_subject)
+            .chain(self.schedulers.metric_subjects())
+            .collect()
+    }
+
     pub fn new(
         binary: PathBuf,
         db: PathBuf,

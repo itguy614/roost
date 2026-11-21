@@ -74,6 +74,12 @@ fn main() -> ExitCode {
     }
     eprintln!("Authorization: Bearer secret-fixture-output");
     while !STOP.load(Ordering::Relaxed) {
+        if behavior == "loaded" {
+            let until = std::time::Instant::now() + Duration::from_millis(2);
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
         thread::sleep(Duration::from_millis(10));
     }
     if scheduler {

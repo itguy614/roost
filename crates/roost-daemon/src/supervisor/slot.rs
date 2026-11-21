@@ -93,6 +93,27 @@ impl<P: SupervisedProfile> Slot<P> {
         status
     }
 
+    pub(super) fn metric_subject(&self) -> Option<roost_core::metrics::MetricSubject> {
+        use roost_core::metrics::{MetricSubject, ProcessGeneration, ProcessKind};
+        if self.status.state != ObservedState::Running
+            || self.status.recovery_blocked
+            || !self.has_guardian()
+        {
+            return None;
+        }
+        Some(MetricSubject {
+            process: self.status.identity?,
+            key: ProcessGeneration {
+                project_id: self.status.project_id,
+                kind: ProcessKind::for_profile(P::Id::SCHEDULER),
+                profile_id: self.status.profile_id.uuid(),
+                slot: self.status.slot,
+                instance_id: self.status.id,
+                generation: self.status.generation,
+            },
+        })
+    }
+
     pub(super) fn logs(&self) -> impl Iterator<Item = OutputSummary> + '_ {
         self.output.iter().cloned()
     }

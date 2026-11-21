@@ -1,5 +1,6 @@
 mod discovery;
 mod groups;
+mod metrics;
 mod scheduler;
 mod watch;
 mod workers;
@@ -26,6 +27,9 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] watch enable ID --revision REV [--rules-json JSON]
   roost [--state-dir ABSOLUTE_PATH] watch disable ID --revision REV
   roost [--state-dir ABSOLUTE_PATH] process list ID
+  roost [--state-dir ABSOLUTE_PATH] metrics process current ID
+  roost [--state-dir ABSOLUTE_PATH] metrics process history ID --from UNIX_SECONDS [--to UNIX_SECONDS] [--profile ID] [--resolution raw|5m] [--limit N] [--cursor CURSOR]
+  roost [--state-dir ABSOLUTE_PATH] metrics project summary ID
   roost [--state-dir ABSOLUTE_PATH] log tail ID
   roost [--state-dir ABSOLUTE_PATH] worker crashes ID
   roost [--state-dir ABSOLUTE_PATH] provider list
@@ -59,6 +63,7 @@ enum Command {
     Worker(workers::Command),
     Discovery(discovery::Command),
     Group(groups::Command),
+    Metrics(metrics::Command),
     Scheduler(scheduler::Command),
     Watch(watch::Command),
 }
@@ -105,6 +110,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 Command::Discovery(command)
             } else if let Some(command) = groups::Command::parse(args)? {
                 Command::Group(command)
+            } else if let Some(command) = metrics::Command::parse(args)? {
+                Command::Metrics(command)
             } else if let Some(command) = scheduler::Command::parse(args)? {
                 Command::Scheduler(command)
             } else if let Some(command) = watch::Command::parse(args)? {
@@ -158,6 +165,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             )?,
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
+            Command::Metrics(command) => command.execute(&mut client).await?,
             Command::Group(command) => {
                 let (result, partial_failure) = command.execute(&mut client).await?;
                 failed = partial_failure;

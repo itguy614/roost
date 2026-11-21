@@ -25,6 +25,7 @@ use roost_ipc::{
         GroupOptions, GroupOutcome, GroupParams, GroupProjectLaunch, GroupStopParams,
         UpdateGroupParams,
     },
+    metrics::{HistoryParams, Resolution},
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
     watch::{CodeRestartParams, DisableWatchParams, EnableWatchParams, WatchState, WatchStatus},
     workers::{
@@ -705,6 +706,10 @@ async fn keeps_useful_crash_output_across_reopen_and_explains_clean_exit() {
         .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].exit.code, Some(7));
+    for (id, crashes) in [(crashed, 1), (finished, 0)] {
+        let summary = client.project_metrics(&ProjectParams { id }).await.unwrap();
+        assert_eq!(summary["lifecycle"]["crashes"], crashes);
+    }
     let report = serde_json::to_string(&reports[0]).unwrap();
     assert!(report.contains("RuntimeException: queue connection unavailable"));
     assert!(report.contains("#0 src/Queue.php(20): connect()"));
@@ -2106,4 +2111,111 @@ async fn group_launch_rolls_back_all_intents_when_a_late_write_fails() {
         );
     }
     assert_eq!(client.start_group(&launch).await.unwrap().operation_id, key);
+}
+
+#[tokio::test]
+async fn metrics_follow_owned_worker_and_scheduler_generations_and_page_history() {
+    let h = Harness::new();
+    let app = h.app("metrics", "graceful");
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let params = ProjectParams { id };
+    let from = roost_core::unix_timestamp();
+    client.start_project(&h.launch(id)).await.unwrap();
+    client
+        .configure_scheduler(&scheduler_config(id, CrashRestartPolicy::Never))
+        .await
+        .unwrap();
+    client
+        .start_scheduler(&scheduler_launch(&h, id))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + TOTAL_WAIT;
+    let previous = loop {
+        let current = client.process_metrics(&params).await.unwrap();
+        let processes = current["processes"].as_array().unwrap();
+        if processes.len() == 2
+            && processes.iter().all(|process| {
+                process["cpu_percent"]["state"] == "fresh"
+                    && process["rss_bytes"]["value"]
+                        .as_u64()
+                        .is_some_and(|rss| rss > 0)
+                    && process["uptime_seconds"]["value"].as_u64().is_some()
+            })
+        {
+            break processes
+                .iter()
+                .find(|p| p["identity"]["kind"] == "worker")
+                .unwrap()["identity"]
+                .clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metrics were not collected: {current}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let summary = client.project_metrics(&params).await.unwrap();
+    assert_eq!(summary["workers"]["running"], 1);
+    assert_eq!(summary["scheduler"]["running"], 1);
+    assert_eq!(summary["lifecycle"]["restarts"], 0);
+
+    let mut history = HistoryParams {
+        project_id: id,
+        profile_id: None,
+        resolution: Resolution::Raw,
+        from,
+        to: None,
+        limit: Some(1),
+        cursor: None,
+    };
+    let first_page = client.process_history(&history).await.unwrap();
+    assert_eq!(first_page["has_more"], true);
+    history.cursor = first_page["next_cursor"].as_str().map(str::to_owned);
+    let second_page = client.process_history(&history).await.unwrap();
+    assert_ne!(
+        second_page["items"][0]["sequence"],
+        first_page["items"][0]["sequence"]
+    );
+    history.resolution = Resolution::FiveMinutes;
+    assert!(
+        matches!(client.process_history(&history).await, Err(ClientError::Rpc(error)) if error.data.as_ref().is_some_and(|data| data["kind"] == "cursor_scope_mismatch"))
+    );
+
+    client.restart_project(&h.launch(id)).await.unwrap();
+    let deadline = Instant::now() + TOTAL_WAIT;
+    loop {
+        let current = client.process_metrics(&params).await.unwrap();
+        if let Some(worker) = current["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["identity"]["kind"] == "worker" && p["identity"] != previous)
+        {
+            assert_eq!(worker["cpu_percent"]["state"], "unknown", "{worker}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not obtain a new generation"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let summary = client.project_metrics(&params).await.unwrap();
+    assert_eq!(summary["lifecycle"]["restarts"], 1);
+    assert_eq!(summary["lifecycle"]["crashes"], 0);
+    terminate(&mut daemon).await;
+
+    let (mut daemon, mut client) = h.daemon().await;
+    history.resolution = Resolution::Raw;
+    let resumed = client.process_history(&history).await.unwrap();
+    assert_eq!(resumed["items"], second_page["items"]);
+    assert_eq!(resumed["next_cursor"], second_page["next_cursor"]);
+    assert_eq!(
+        client.project_metrics(&params).await.unwrap()["lifecycle"]["restarts"],
+        1
+    );
+    terminate(&mut daemon).await;
 }

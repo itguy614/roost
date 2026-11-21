@@ -8,6 +8,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod metrics;
+
 macro_rules! id {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

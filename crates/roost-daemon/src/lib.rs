@@ -2,6 +2,8 @@ mod backoff;
 mod discovery_rpc;
 mod group_rpc;
 pub mod guardian;
+mod metrics;
+mod metrics_rpc;
 mod scheduler_rpc;
 mod supervised;
 mod supervisor;
@@ -105,6 +107,7 @@ impl Daemon {
             result = self.accept() => result,
             () = self.service.poll_workers() => unreachable!("worker polling does not terminate"),
             () = self.service.poll_watches() => unreachable!("watch polling does not terminate"),
+            () = self.service.poll_metrics() => unreachable!("metric polling does not terminate"),
         }
     }
 
@@ -222,6 +225,7 @@ pub struct DaemonService {
     started: Instant,
     startup: DaemonStartup,
     workers: Mutex<Supervisor>,
+    process_metrics: Mutex<metrics::Current>,
     watch_status: Mutex<HashMap<ProjectId, watch::RuntimeStatus>>,
     // Distinguishes a watch configuration change from unrelated project edits.
     watch_config_revisions: Mutex<HashMap<ProjectId, Revision>>,
@@ -242,6 +246,7 @@ impl DaemonService {
         let startup = store.begin_daemon_run()?;
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone(), intents, schedulers)),
+            process_metrics: Mutex::default(),
             watch_status: Mutex::default(),
             watch_config_revisions: Mutex::default(),
             snapshots: Mutex::default(),
@@ -421,6 +426,9 @@ async fn dispatch(
             let _permit = permit;
             call.execute(&service)
         })
+    } else if method.starts_with("metrics.") {
+        let call = metrics_rpc::MetricsCall::decode(method, params)?;
+        tokio::task::spawn_blocking(move || call.execute(&service))
     } else if method.starts_with("scheduler.") {
         let call = scheduler_rpc::SchedulerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))

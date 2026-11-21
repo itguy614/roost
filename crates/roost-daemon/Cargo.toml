@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+time = { version = "0.3", features = ["formatting"] }
 libc.workspace = true
 roost-core.workspace = true
 roost-store.workspace = true
