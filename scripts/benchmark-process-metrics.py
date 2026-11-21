@@ -52,7 +52,14 @@ def process_usage(pid):
 
 
 def state_size(state):
-    return sum(path.stat().st_size for path in state.glob("roost.sqlite3*"))
+    total = 0
+    for path in state.glob("roost.sqlite3*"):
+        try:
+            total += path.stat().st_size
+        except FileNotFoundError:
+            # SQLite may remove its rollback journal between enumeration and stat.
+            continue
+    return total
 
 
 def run(daemon_path, duration, loaded, common_reads, root, php):

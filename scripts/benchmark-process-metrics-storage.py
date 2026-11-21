@@ -1,10 +1,12 @@
 """Measure the migration and history SQL with a full 32-process day and week."""
 
+import argparse
 import json
 from pathlib import Path
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 
 STORE = Path(__file__).resolve().parents[1] / "crates/roost-store"
@@ -60,9 +62,9 @@ def seed(db):
     return raw_bytes, size(db) - empty - raw_bytes
 
 
-def maintenance(db):
-    with db:
-        end = START + 300
+def maintenance(db, end=START + 300):
+    db.execute("BEGIN IMMEDIATE")
+    try:
         db.execute(sql("INSERT OR IGNORE INTO process_metric_rollups"), (str(end),))
         db.execute(sql("UPDATE process_metric_state SET rolled_until="), (str(end),))
         for table, watermark, before in (("raw", "raw_pruned", end), ("rollups", "rollup_pruned", START)):
@@ -71,20 +73,93 @@ def maintenance(db):
                 db.execute(sql(f"DELETE FROM process_metric_{table} WHERE"), (str(sequence),))
             db.execute(sql(f"UPDATE process_metric_state SET {watermark}="), (str(rows[-1][0]),))
         db.execute(sql("DELETE FROM process_metric_series WHERE"))
+        db.commit()
+    except sqlite3.Error:
+        db.rollback()
+        raise
     return size(db)
 
 
-def history(db):
+def history(db, start=START + DAY - 1400):
     bounds = sql("SELECT CASE WHEN first IS NOT NULL")
-    start, end = START + DAY - 1400, START + DAY
+    end = START + DAY
     first, last = json.loads(db.execute(bounds, (str(start), str(end))).fetchone()[0])
     query = sql("SELECT json_object(\n  'sequence'")
-    return db.execute(query, ("benchmark", None, str(first - 1), str(last), "257")).fetchall()
+    return db.execute(query, ("benchmark", None, str(first - 1), str(last), "257", str(start), str(end))).fetchall()
+
+
+def concurrent_cleanup(db, path):
+    stop = threading.Event()
+    started = threading.Barrier(5)
+    counts = [0] * 4
+    errors = []
+
+    def read(index):
+        with sqlite3.connect(path, timeout=2) as client:
+            client.execute("PRAGMA query_only=ON")
+            started.wait()
+            try:
+                while not stop.is_set():
+                    with client:
+                        client.execute("BEGIN")
+                        history(client, START if index == 0 else START + DAY - 1400)
+                    counts[index] += 1
+                    stop.wait(.01)
+            except sqlite3.Error as error:
+                errors.append(str(error))
+
+    readers = [threading.Thread(target=read, args=(index,)) for index in range(4)]
+    for reader in readers:
+        reader.start()
+    started.wait()
+    db.execute("PRAGMA busy_timeout=50")
+    commits, busy = [], []
+    before = size(db)
+    try:
+        for bucket in range(1, 11):
+            time.sleep(.15)
+            start = time.perf_counter()
+            try:
+                maintenance(db, START + bucket * 300)
+                commits.append(round((time.perf_counter() - start) * 1000, 3))
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error):
+                    raise
+                busy.append(round((time.perf_counter() - start) * 1000, 3))
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join()
+    assert not errors and all(counts) and commits, (counts, errors, commits)
+    growth = size(db) - before
+    marker = "SELECT rolled_until,raw_pruned,rollup_pruned FROM process_metric_state"
+    watermarks = db.execute(marker).fetchone()
+    with sqlite3.connect(path) as held_reader:
+        held_reader.execute("BEGIN")
+        held_reader.execute(marker).fetchone()
+        start = time.perf_counter()
+        try:
+            maintenance(db, START + 11 * 300)
+        except sqlite3.OperationalError as error:
+            assert "locked" in str(error), error
+            forced_busy = round((time.perf_counter() - start) * 1000, 3)
+        else:
+            raise AssertionError("cleanup committed through a held rollback-journal reader")
+        assert db.execute(marker).fetchone() == watermarks
+    _, retry = timed(lambda: maintenance(db, START + 11 * 300))
+    assert db.execute(marker).fetchone() != watermarks
+    return {"successful_cleanup_ms": commits, "busy_cleanup_ms": busy,
+            "completed_history_reads": counts, "database_growth_bytes": growth,
+            "forced_busy_ms": forced_busy, "retry_cleanup_ms": retry}
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--concurrent", action="store_true")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="roost-metrics-storage-") as path:
-        db = sqlite3.connect(Path(path) / "roost.sqlite3")
+        file = Path(path) / "roost.sqlite3"
+        db = sqlite3.connect(file)
         db.execute("PRAGMA foreign_keys=ON")
         (raw_bytes, rollup_bytes), seed_ms = timed(lambda: seed(db))
         times = []
@@ -97,12 +172,14 @@ def main():
         raw_rows = db.execute("SELECT count(*) FROM process_metric_raw").fetchone()[0]
         rollup_rows = db.execute("SELECT count(*) FROM process_metric_rollups").fetchone()[0]
         assert raw_rows == 1_382_400 - 512 and rollup_rows == 64_512 + 32 - 256
+        contention = concurrent_cleanup(db, file) if args.concurrent else None
         print(json.dumps({
             "sqlite": sqlite3.sqlite_version, "raw_bytes": raw_bytes,
             "week_rollup_bytes": rollup_bytes, "seed_ms": seed_ms,
             "recent_257_row_history_ms": times, "cleanup_commit_ms": cleanup_ms,
             "raw_rows_after": raw_rows, "rollup_rows_after": rollup_rows,
             "database_bytes_after_cleanup": size_after, "journal_mode": journal_mode,
+            "concurrent_cleanup": contention,
         }))
         db.close()
 
