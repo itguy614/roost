@@ -12,7 +12,11 @@ scratch="$(mktemp -d /tmp/roost-notify.XXXXXX)"
 state="$scratch/state"
 cli="$PWD/target/debug/roost"
 daemon="$PWD/target/debug/roost-daemon"
-app="$scratch/Roost Notification Spike.app"
+app_root="$scratch"
+if [[ -n "${ROOST_SPIKE_APP_PARENT:-}" ]]; then
+  app_root="$(mktemp -d "$ROOST_SPIKE_APP_PARENT/RoostSpike.XXXXXX")"
+fi
+app="$app_root/Roost Notification Spike.app"
 bundle="dev.roost.notification-spike.$(uuidgen | tr '[:upper:]' '[:lower:]')"
 daemon_pid=""
 event=-
@@ -30,6 +34,7 @@ cleanup() {
   if [[ -d "$state" ]]; then touch "$state/notification-spike.stop"; fi
   stop_daemon
   printf 'Disposable evidence directory: %s\n' "$scratch"
+  if [[ "$app_root" != "$scratch" ]]; then printf 'Disposable bundle directory: %s\n' "$app_root"; fi
 }
 trap cleanup EXIT
 
