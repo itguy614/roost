@@ -13,7 +13,7 @@ use roost_core::{Project, WorkerProfile, worker_runtime::LaunchFailure};
 mod output;
 mod probe;
 pub use output::{DrainResult, OutputPipe};
-pub use probe::{ProbeError, run_probe};
+pub use probe::{ProbeError, probe_cleanup_pending, run_probe, run_probe_before};
 
 #[cfg(target_os = "macos")]
 mod macos;

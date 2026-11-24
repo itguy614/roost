@@ -1,3 +1,4 @@
+pub mod queue_metrics;
 use std::{
     collections::HashSet,
     fs,

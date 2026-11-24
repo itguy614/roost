@@ -80,7 +80,7 @@ fn current(service: &DaemonService, id: ProjectId) -> Result<(Current, HashSet<U
     Ok((current, supervisor.owned_metric_leases()))
 }
 
-fn timestamp(seconds: u64) -> Option<String> {
+pub(super) fn timestamp(seconds: u64) -> Option<String> {
     time::OffsetDateTime::from_unix_timestamp(i64::try_from(seconds).ok()?)
         .ok()?
         .format(&time::format_description::well_known::Rfc3339)
