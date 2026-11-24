@@ -47,6 +47,8 @@ The default macOS state directory is `~/Library/Application Support/Roost`. For 
 
 See [IPC v1](docs/ipc-v1.md), [storage and domain schema](docs/storage.md), and the [product specification](SPEC.md).
 
+See [queue depth metrics](docs/queue-metrics.md) for opt-in and pending-count semantics.
+
 See [process metrics](docs/process-metrics.md) for the CLI walkthrough, history and retention semantics, and benchmark reproduction.
 
 ## Run a queue worker on macOS

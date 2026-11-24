@@ -41,6 +41,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `metrics.process.current` | Project UUID `id` | Project ID and an array of owned running generations with current gauges |
 | `metrics.process.history` | `project_id`, optional `profile_id`, `resolution` (`raw` or `5m`), `from` and optional `to` (Unix seconds), optional `limit` and `cursor` | History page with resolution, items, next cursor, more flag, and retention floor |
 | `metrics.project.summary` | Project UUID `id` | Desired, running and unresolved counts, gauge coverage, lifecycle totals and profiles |
+| `metrics.queue.configure` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result with project UUID and persisted queue probing opt-in |
+| `metrics.queue.current` | Project UUID `id` | Opt-in and selector readings with freshness or a reason for unavailability |
+| `metrics.queue.history` | `project_id`, optional symbolic `connection` and `queue`, `resolution` (`raw` or `5m`), `from`, optional `to` (Unix seconds), optional `limit` and `cursor` | Queue history page with retention floor and next cursor |
 | `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
 | `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
 | `group.list` | Omit or use `{}` | Array of group records |
@@ -101,3 +104,5 @@ The endpoint uses a user-owned state directory with mode `0700`, a socket with m
 See [Laravel runtime and queue discovery](laravel-discovery.md) for selection precedence, limits, and the bootstrap trust boundary.
 
 See [process metrics](process-metrics.md) for gauge states, cursor recovery, and the raw-to-rollup cutover.
+
+See [queue depth metrics](queue-metrics.md) for adapter semantics and cursor recovery.
