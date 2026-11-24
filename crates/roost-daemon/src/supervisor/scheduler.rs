@@ -36,6 +36,23 @@ pub(super) struct Schedulers {
 }
 
 impl Schedulers {
+    pub(super) fn owned_metric_leases(&self) -> impl Iterator<Item = uuid::Uuid> + '_ {
+        self.projects.values().filter_map(|runtime| {
+            let slot = &runtime.slot;
+            (slot.has_guardian() && !slot.recovery_blocked())
+                .then_some(slot.lease_id)
+                .flatten()
+        })
+    }
+
+    pub(super) fn metric_subjects(
+        &self,
+    ) -> impl Iterator<Item = roost_core::metrics::MetricSubject> + '_ {
+        self.projects
+            .values()
+            .filter_map(|runtime| runtime.slot.metric_subject())
+    }
+
     pub(super) fn new(recovering: Vec<(ProjectId, PathBuf)>) -> Self {
         Self {
             projects: HashMap::new(),

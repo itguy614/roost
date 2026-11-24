@@ -85,6 +85,7 @@ impl Store {
             store.release_completed_process::<P>(id)?;
             if let Some(report) = report {
                 store.insert_crash_report(report)?;
+                store.count_metric_crash(report)?;
             }
             Ok(())
         })

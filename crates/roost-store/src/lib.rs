@@ -1,4 +1,5 @@
 mod leases;
+pub mod metrics;
 mod runtime;
 mod scheduler;
 mod sqlite;
@@ -43,6 +44,13 @@ const SCHEDULER: &CStr = match CStr::from_bytes_with_nul(
     Err(_) => panic!("migration contains NUL"),
 };
 
+const PROCESS_METRICS: &CStr = match CStr::from_bytes_with_nul(
+    concat!(include_str!("../migrations/005_process_metrics.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -81,12 +89,9 @@ impl Store {
     pub fn initialize(path: &Path) -> Result<(), Error> {
         let store = Self(sqlite::Connection::open(path, true)?);
         store.transaction(|store| {
-            match store
-                .0
-                .query(c"PRAGMA user_version", &[])?
-                .first()
-                .map(String::as_str)
-            {
+            let versions = store.0.query(c"PRAGMA user_version", &[])?;
+            let version = versions.first().map(String::as_str);
+            match version {
                 Some("0") => {
                     store.0.exec(INITIAL)?;
                     store.0.exec(WORKER_LEASES)?;
@@ -103,8 +108,11 @@ impl Store {
                     store.0.exec(SCHEDULER)?;
                 }
                 Some("3") => store.0.exec(SCHEDULER)?,
-                Some("4") => (),
+                Some("4" | "5") => (),
                 _ => return Err(Error::Schema),
+            }
+            if version != Some("5") {
+                store.0.exec(PROCESS_METRICS)?;
             }
             Ok(())
         })
@@ -118,7 +126,15 @@ impl Store {
         &self,
         work: impl FnOnce(&Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.0.exec(c"BEGIN IMMEDIATE").map_err(Error::from)?;
+        self.transaction_with(c"BEGIN IMMEDIATE", work)
+    }
+
+    fn transaction_with<T, E: From<Error>>(
+        &self,
+        begin: &CStr,
+        work: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.0.exec(begin).map_err(Error::from)?;
         let result = work(self).and_then(|value| {
             self.0.exec(c"COMMIT").map_err(Error::from)?;
             Ok(value)
@@ -445,7 +461,7 @@ mod tests {
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -453,9 +469,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 5").unwrap();
+        store.0.exec(c"PRAGMA user_version = 6").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["6"]);
     }
 
     #[test]
@@ -477,7 +493,7 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["4"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
         assert_eq!(old.get_group(group.id).unwrap(), Some(group.clone()));
         assert_eq!(
@@ -489,6 +505,402 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn metrics_migrate_v4_and_roll_back_batch_and_retention_faults() {
+        use super::metrics::{HistoryPage, HistoryQuery, Resolution};
+        use roost_core::metrics::{
+            ProcessGeneration, ProcessKind, ProcessSample, RAW_SECONDS, ROLLUP_SECONDS,
+        };
+
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let old = Store(sqlite::Connection::open(&db, true).unwrap());
+        for migration in [INITIAL, WORKER_LEASES, RUNTIME, SCHEDULER] {
+            old.0.exec(migration).unwrap();
+        }
+        let project = fixture.project();
+        old.create_project(&project).unwrap();
+        drop(old);
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        assert_eq!(
+            store.get_project(project.id).unwrap(),
+            Some(project.clone())
+        );
+        let key = ProcessGeneration {
+            project_id: project.id,
+            kind: ProcessKind::Worker,
+            profile_id: Uuid::new_v4(),
+            slot: 0,
+            instance_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let base = 1_800_000_000;
+        let sample = |offset, cpu_percent| ProcessSample {
+            observed_at: base + offset,
+            identity: key,
+            cpu_percent,
+            rss_bytes: Some(4096),
+            uptime_seconds: Some(offset),
+            peak_rss_bytes: Some(4096),
+        };
+        store
+            .0
+            .exec(
+                c"CREATE TRIGGER fail_second BEFORE INSERT ON process_metric_raw
+            WHEN NEW.observed_at=1800000002 BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+            )
+            .unwrap();
+        assert!(
+            store
+                .save_process_samples(&[sample(0, None), sample(2, Some(20.0))])
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .0
+                .query(c"SELECT count(*) FROM process_metric_series", &[])
+                .unwrap(),
+            ["0"]
+        );
+        store.0.exec(c"DROP TRIGGER fail_second").unwrap();
+        store
+            .save_process_samples(&[sample(0, None), sample(2, Some(20.0))])
+            .unwrap();
+        let page = |resolution, after, lineage| {
+            store
+                .process_history(HistoryQuery {
+                    project_id: project.id,
+                    profile: None,
+                    resolution,
+                    from: base,
+                    to: base + 300,
+                    after,
+                    retention_floor: 0,
+                    high: None,
+                    lineage,
+                    limit: 8,
+                })
+                .unwrap()
+        };
+        let HistoryPage::Rows { state, rows } = page(Resolution::Raw, 0, None) else {
+            panic!("missing raw page")
+        };
+        assert_eq!(rows.len(), 2);
+        store
+            .0
+            .exec(
+                c"CREATE TRIGGER fail_rollup BEFORE INSERT ON process_metric_rollups
+            BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+            )
+            .unwrap();
+        assert!(
+            store
+                .maintain_process_metrics(base + RAW_SECONDS + 300)
+                .is_err()
+        );
+        assert!(
+            matches!(page(Resolution::Raw,0,Some(&state.lineage)), HistoryPage::Rows { rows, .. } if rows.len() == 2)
+        );
+        // The read contract expires a cursor on time even if maintenance is stalled.
+        let expired = store
+            .process_history(HistoryQuery {
+                project_id: project.id,
+                profile: None,
+                resolution: Resolution::Raw,
+                from: base,
+                to: base + 300,
+                after: 1,
+                retention_floor: base + 3,
+                high: Some(state.high),
+                lineage: Some(&state.lineage),
+                limit: 8,
+            })
+            .unwrap();
+        assert!(matches!(expired, HistoryPage::Expired(s) if s.pruned == 2));
+        store.0.exec(c"DROP TRIGGER fail_rollup").unwrap();
+
+        // A rollback-journal reader can let the writes proceed but block COMMIT.
+        let reader = Store::open(&db).unwrap();
+        reader.0.exec(c"BEGIN").unwrap();
+        reader
+            .0
+            .query(c"SELECT count(*) FROM process_metric_raw", &[])
+            .unwrap();
+        let writer = Store::open_for_metric_writes(&db).unwrap();
+        assert!(matches!(
+            writer.maintain_process_metrics(base + RAW_SECONDS + 300),
+            Err(Error::Sql(error)) if error.code == 5
+        ));
+        reader.0.exec(c"COMMIT").unwrap();
+        assert_eq!(
+            store
+                .0
+                .query(c"SELECT count(*) FROM process_metric_rollups", &[])
+                .unwrap(),
+            ["0"]
+        );
+        assert!(
+            matches!(page(Resolution::Raw,0,Some(&state.lineage)), HistoryPage::Rows { rows, .. } if rows.len() == 2)
+        );
+        store
+            .maintain_process_metrics(base + RAW_SECONDS + 300)
+            .unwrap();
+        assert!(
+            matches!(page(Resolution::Raw,1,Some(&state.lineage)), HistoryPage::Expired(s) if s.pruned == 2)
+        );
+        assert!(
+            matches!(page(Resolution::Raw,2,Some(&state.lineage)), HistoryPage::Rows { rows, .. } if rows.is_empty())
+        );
+        store
+            .maintain_process_metrics(base + RAW_SECONDS + 300)
+            .unwrap();
+        let HistoryPage::Rows { rows, .. } = page(Resolution::FiveMinutes, 0, Some(&state.lineage))
+        else {
+            panic!("missing rollup")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["cpu_percent"]["samples"], 1);
+        assert_eq!(rows[0]["cpu_percent"]["mean"], 20.0);
+        assert_eq!(rows[0]["rss_bytes"]["samples"], 2);
+        store
+            .maintain_process_metrics(base + ROLLUP_SECONDS + 300)
+            .unwrap();
+        assert!(
+            matches!(page(Resolution::FiveMinutes,0,Some(&state.lineage)), HistoryPage::Expired(s) if s.pruned == 1)
+        );
+    }
+
+    #[test]
+    fn history_enforces_timestamp_and_scope_inside_the_sequence_window() {
+        use metrics::{HistoryPage, HistoryQuery, Resolution};
+
+        let fixture = Fixture::new();
+        let (project, other) = (fixture.project(), Fixture::new());
+        let other_project = other.project();
+        Store::initialize(&fixture.db()).unwrap();
+        let store = Store::open(&fixture.db()).unwrap();
+        store.create_project(&project).unwrap();
+        store.create_project(&other_project).unwrap();
+        for (id, project, profile) in [
+            ("1", project.id, "target"),
+            ("2", project.id, "sibling"),
+            ("3", other_project.id, "target"),
+        ] {
+            store
+                .0
+                .query(
+                    c"INSERT INTO process_metric_series VALUES (?1,?2,'worker',?3,0,?1,1)",
+                    &[Some(id), Some(&project.0.to_string()), Some(profile)],
+                )
+                .unwrap();
+        }
+
+        // Put out-of-range records inside the sequence window explicitly. The
+        // normal writers append in time order, so they cannot create this fixture.
+        for (series, observed_at, bucket) in [
+            ("1", "1800000300", "1800000300"),
+            ("1", "1800000299", "1800000000"),
+            ("3", "1800000301", "1800000300"),
+            ("2", "1800000302", "1800000300"),
+            ("1", "1800000900", "1800000900"),
+            ("1", "1800000899", "1800000600"),
+        ] {
+            store
+                .0
+                .query(
+                    c"INSERT INTO process_metric_raw (series_id,observed_at) VALUES (?1,?2)",
+                    &[Some(series), Some(observed_at)],
+                )
+                .unwrap();
+            store.0.query(
+                c"INSERT INTO process_metric_rollups VALUES (NULL,?1,?2,0,NULL,NULL,NULL,0,NULL,NULL,NULL,NULL,NULL)",
+                &[Some(series), Some(bucket)],
+            ).unwrap();
+        }
+
+        for resolution in [Resolution::Raw, Resolution::FiveMinutes] {
+            let read = |profile, after, limit, to| {
+                let HistoryPage::Rows { rows, .. } = store
+                    .process_history(HistoryQuery {
+                        project_id: project.id,
+                        profile,
+                        resolution,
+                        from: 1_800_000_300,
+                        to,
+                        after,
+                        retention_floor: 0,
+                        high: Some(6),
+                        lineage: None,
+                        limit,
+                    })
+                    .unwrap()
+                else {
+                    panic!("expected a history page");
+                };
+                rows.into_iter()
+                    .map(|row| row["sequence"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(read(Some("target"), 0, 1, 1_800_000_900), ["1"]);
+            assert_eq!(read(Some("target"), 1, 2, 1_800_000_900), ["6"]);
+            assert_eq!(read(None, 0, 8, 1_800_000_900), ["1", "4", "6"]);
+            assert_eq!(read(Some("target"), 0, 8, 1_800_000_899), ["1"]);
+        }
+    }
+
+    #[test]
+    fn migration_counts_replacements_for_preexisting_running_leases_only() {
+        use roost_core::{
+            scheduler::{SchedulerMode, SchedulerProfile, SchedulerProfileId},
+            worker_runtime::{
+                ProcessExit, ProcessIdentity, ProcessLease, ProcessProfileId, WorkerLeaseState,
+            },
+        };
+
+        fn record_running<P: ProcessProfileId>(
+            store: &Store,
+            lease: ProcessLease<P>,
+        ) -> ProcessLease<P> {
+            store.reserve_process(&lease).unwrap();
+            let claimed = store.claim_process(lease).unwrap();
+            let running = WorkerLeaseState::Running {
+                identity: ProcessIdentity {
+                    pid: 123,
+                    group: 123,
+                    uid: 501,
+                    started_seconds: 1,
+                    started_microseconds: 0,
+                },
+            };
+            store
+                .record_process_state(claimed.clone(), running)
+                .unwrap();
+            store.process_lease(claimed.id).unwrap().unwrap()
+        }
+
+        fn retire<P: ProcessProfileId>(store: &Store, lease: ProcessLease<P>) -> ProcessLease<P> {
+            let replacement = ProcessLease {
+                id: Uuid::new_v4(),
+                state: WorkerLeaseState::Reserved,
+                ..lease.clone()
+            };
+            let id = lease.id;
+            store
+                .record_process_state(
+                    lease,
+                    WorkerLeaseState::Exited {
+                        exit: ProcessExit {
+                            code: Some(0),
+                            signal: None,
+                            at: 2,
+                            requested_stop: true,
+                            stop_cause: None,
+                            forced: false,
+                        },
+                    },
+                )
+                .unwrap();
+            store.finish_process::<P>(id, None).unwrap();
+            replacement
+        }
+
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let old = Store(sqlite::Connection::open(&db, true).unwrap());
+        for migration in [INITIAL, WORKER_LEASES, RUNTIME, SCHEDULER] {
+            old.0.exec(migration).unwrap();
+        }
+        let project = fixture.project();
+        old.create_project(&project).unwrap();
+        let worker = WorkerProfile {
+            id: WorkerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            name: "Worker".into(),
+            connection: "database".into(),
+            queues: Vec::new(),
+            desired_instances: 2,
+            sleep_seconds: 3,
+            tries: 1,
+            timeout_seconds: 60,
+            graceful_stop_seconds: 1,
+            crash_restart: CrashRestartPolicy::Never,
+            code_restart: CodeRestartPolicy::Never,
+            notifications: false,
+            enabled: true,
+            revision: Revision(1),
+        };
+        let scheduler = SchedulerProfile {
+            id: SchedulerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            enabled: true,
+            mode: SchedulerMode::ScheduleWork,
+            crash_restart: CrashRestartPolicy::Never,
+            graceful_stop_seconds: 1,
+            revision: Revision(1),
+        };
+        old.create_worker_profile(&worker).unwrap();
+        old.create_scheduler(&scheduler).unwrap();
+
+        let worker_lease = record_running(
+            &old,
+            ProcessLease {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                profile_id: worker.id,
+                slot: 0,
+                state: WorkerLeaseState::Reserved,
+            },
+        );
+        let pending = ProcessLease {
+            id: Uuid::new_v4(),
+            slot: 1,
+            state: WorkerLeaseState::Reserved,
+            ..worker_lease.clone()
+        };
+        old.reserve_process(&pending).unwrap();
+        let pending = old.claim_process(pending).unwrap();
+        let scheduler_lease = record_running(
+            &old,
+            ProcessLease {
+                id: Uuid::new_v4(),
+                project_id: project.id,
+                profile_id: scheduler.id,
+                slot: 0,
+                state: WorkerLeaseState::Reserved,
+            },
+        );
+        drop(old);
+
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        let totals = || store.process_lifecycle_totals(project.id, None).unwrap();
+        assert_eq!(totals().restarts, 0);
+        let pending = retire(&store, pending);
+        record_running(&store, pending);
+        assert_eq!(totals().restarts, 0);
+        let worker_lease = retire(&store, worker_lease);
+        assert_eq!(totals().restarts, 0);
+        let worker_lease = record_running(&store, worker_lease);
+        store
+            .record_process_state(worker_lease.clone(), worker_lease.state)
+            .unwrap();
+        assert_eq!(totals().restarts, 1);
+        let scheduler_lease = retire(&store, scheduler_lease);
+        record_running(&store, scheduler_lease);
+        assert_eq!(totals().restarts, 2);
+        for profile in [worker.id.0, scheduler.id.0] {
+            assert_eq!(
+                store
+                    .process_lifecycle_totals(project.id, Some(&profile.to_string()))
+                    .unwrap()
+                    .restarts,
+                1
+            );
+        }
+        assert_eq!(totals().crashes, 0);
     }
 
     #[test]
