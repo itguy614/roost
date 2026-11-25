@@ -10,12 +10,55 @@ import resource
 import runpy
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = runpy.run_path(str(ROOT / "scripts/test-queue-metrics.py"))
 HELPERS = FIXTURE["HELPERS"]
+
+
+ACCOUNTING = r"""
+#include <inttypes.h>
+#include <libproc.h>
+#include <mach/mach_time.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/resource.h>
+int main(int argc, char **argv) {
+    struct rusage_info_v3 usage = {0};
+    if (argc != 2 || proc_pid_rusage(atoi(argv[1]), RUSAGE_INFO_V3, (rusage_info_t *)&usage)) {
+        perror("proc_pid_rusage");
+        return 1;
+    }
+    mach_timebase_info_data_t scale;
+    if (mach_timebase_info(&scale) != 0 || !scale.denom)
+        return 1;
+    printf("%" PRIu64 " %" PRIu64 "\n",
+        (uint64_t)((__uint128_t)(usage.ri_user_time + usage.ri_system_time) * scale.numer / scale.denom),
+        (uint64_t)((__uint128_t)(usage.ri_child_user_time + usage.ri_child_system_time) * scale.numer / scale.denom));
+    return 0;
+}
+"""
+
+
+def cpu_seconds(accounting, pid):
+    own, reaped_children = subprocess.check_output([accounting, str(pid)], text=True).split()
+    return int(own) / 1_000_000_000, int(reaped_children) / 1_000_000_000
+
+
+def calibrate(accounting):
+    child_before = sum(resource.getrusage(resource.RUSAGE_CHILDREN)[:2])
+    own_before, kernel_before = cpu_seconds(accounting, os.getpid())
+    subprocess.run([sys.executable, "-c", "sum(i*i for i in range(8000000))"], check=True)
+    child_after = sum(resource.getrusage(resource.RUSAGE_CHILDREN)[:2])
+    own_after, kernel_after = cpu_seconds(accounting, os.getpid())
+    elapsed = child_after - child_before
+    reported = kernel_after - kernel_before
+    assert own_after >= own_before and abs(elapsed - reported) < .015, (elapsed, reported)
+    print(json.dumps({"case": "darwin_child_cpu_calibration", "getrusage_seconds": elapsed,
+                      "proc_pid_rusage_seconds": reported}), flush=True)
 
 
 def database_stats(state):
@@ -31,7 +74,8 @@ def database_stats(state):
         return raw, gap, queues
 
 
-def benchmark(root, binary, vendor, seconds, interval, redis_socket, enabled, loaded):
+def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket, variant, loaded):
+    enabled = variant != "baseline"
     root.mkdir()
     state = root / "state"
     with (root / "daemon.log").open("w") as log:
@@ -59,12 +103,15 @@ def benchmark(root, binary, vendor, seconds, interval, redis_socket, enabled, lo
                     return all((app / "usage.jsonl").exists() for app, _ in projects)
 
                 FIXTURE["ready"](first_samples, 20)
-            cpu_start, rss_peak = HELPERS["process_usage"](daemon.pid)
+            _, rss_peak = HELPERS["process_usage"](daemon.pid)
+            cpu_start, child_start = cpu_seconds(accounting, daemon.pid)
             size_start = size_peak = HELPERS["state_size"](state)
             elapsed_start = time.monotonic()
             wall_start = time.time()
             methods = [("daemon.status", {}), ("process.list", supervised),
-                       ("metrics.process.current", supervised), ("metrics.project.summary", supervised)]
+                       ("metrics.process.current", supervised), ("metrics.project.summary", supervised),
+                       ("metrics.process.history", {"project_id": supervised["id"],
+                         "from": int(wall_start) - 600, "limit": 256})]
             if enabled:
                 methods.append(("metrics.queue.current", projects[0][1]))
             latencies = {name: [] for name, _ in methods}
@@ -78,7 +125,7 @@ def benchmark(root, binary, vendor, seconds, interval, redis_socket, enabled, lo
                 time.sleep(interval)
             wall_end = time.time()
             elapsed = time.monotonic() - elapsed_start
-            cpu_end, _ = HELPERS["process_usage"](daemon.pid)
+            cpu_end, child_end = cpu_seconds(accounting, daemon.pid)
             assert running()
             usages = []
             for app, _ in projects:
@@ -90,12 +137,19 @@ def benchmark(root, binary, vendor, seconds, interval, redis_socket, enabled, lo
                 assert usages and all(FIXTURE["inspect"](client, project)[("redis", "primary")]["state"] == "fresh"
                                       for _, project in projects)
             daemon_cpu = cpu_end - cpu_start
+            children_cpu = child_end - child_start
+            # The measurement window has no guardian replacements. All
+            # activity charged to reaped children comes from the probes and
+            # their descendants, including Herd resolution subprocesses.
+            if enabled:
+                assert children_cpu > 0, "Darwin did not report reaped probe CPU"
             php_cpu = sum(row["cpu_seconds"] for row in usages)
             raw, gap, queue = database_stats(state)
-            print(json.dumps({"workload": "loaded" if loaded else "idle", "queue_enabled": enabled,
+            print(json.dumps({"workload": "loaded" if loaded else "idle", "variant": variant, "queue_enabled": enabled,
                 "seconds": round(elapsed, 3), "daemon_cpu_seconds": round(daemon_cpu, 3),
-                "php_probe_cpu_seconds": round(php_cpu, 3),
-                "daemon_plus_count_php_core_percent": round(100 * (daemon_cpu + php_cpu) / elapsed, 3),
+                "php_count_probe_cpu_seconds_at_shutdown": round(php_cpu, 3),
+                "reaped_children_cpu_seconds_including_herd": round(children_cpu, 3),
+                "daemon_plus_all_reaped_children_core_percent": round(100 * (daemon_cpu + children_cpu) / elapsed, 3),
                 "completed_php_probes": len(usages), "daemon_peak_rss_kib": rss_peak,
                 "peak_single_php_rss_bytes": max((row["peak_rss_bytes"] for row in usages), default=0),
                 "sqlite_main_and_journal_growth_bytes": size_peak - size_start,
@@ -112,9 +166,9 @@ def benchmark(root, binary, vendor, seconds, interval, redis_socket, enabled, lo
                 daemon.wait(timeout=40)
 
 
-def seeded_storage(root):
+def seeded_storage(root, cadence=10, flapping=False):
     storage = runpy.run_path(str(ROOT / "scripts/benchmark-process-metrics-storage.py"))
-    path = root / "seeded.sqlite3"
+    path = root / f"seeded-{cadence}-{flapping}.sqlite3"
     with sqlite3.connect(path) as db:
         raw_process, rollup_process = storage["seed"](db)
         initial = storage["size"](db)
@@ -122,15 +176,35 @@ def seeded_storage(root):
             WITH RECURSIVE selectors(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM selectors WHERE n<255)
             INSERT INTO queue_metric_series (project_id,connection,queue)
               SELECT 'benchmark','database','queue-'||n FROM selectors;
-            WITH RECURSIVE ticks(s) AS (VALUES(0) UNION ALL SELECT s+10 FROM ticks WHERE s<86390)
-            INSERT INTO queue_metric_raw (series_id,observed_at,pending)
-              SELECT series.id,1800000000+s,1 FROM ticks CROSS JOIN queue_metric_series series;
         """)
+        with db:
+            # Thirty- and sixty-second candidates retain the poll tick on
+            # every outage and recovery, in addition to periodic samples.
+            db.execute("""
+                WITH RECURSIVE ticks(s) AS (VALUES(0) UNION ALL SELECT s+10 FROM ticks WHERE s<86390)
+                INSERT INTO queue_metric_raw (series_id,observed_at,pending,reason)
+                SELECT series.id,1800000000+s,
+                    CASE WHEN (?2 AND (s/10)%2=1) OR (NOT ?2 AND series.id<=16
+                        AND s IN (9010,9020,18020,45050)) THEN NULL ELSE (s/10+series.id)%9 END,
+                    CASE WHEN (?2 AND (s/10)%2=1) OR (NOT ?2 AND series.id<=16
+                        AND s IN (9010,9020,18020,45050)) THEN 'timeout' ELSE NULL END
+                FROM ticks CROSS JOIN queue_metric_series series
+                WHERE ?2 OR s%?1=0 OR (series.id <= 16 AND s IN (9010,9030,18020,18030,45050,45060))
+            """, (cadence, flapping))
+        raw_rows = db.execute("SELECT count(*) FROM queue_metric_raw").fetchone()[0]
+        if flapping:
+            transition_rows = raw_rows - 256
+            assert transition_rows == 256 * 8639
+        else:
+            transition_rows = db.execute("""SELECT count(*) FROM queue_metric_raw
+                WHERE series_id<=16 AND observed_at-1800000000 IN (9010,9030,18020,18030,45050,45060)
+            """).fetchone()[0]
+            assert transition_rows == 96
         raw_bytes = storage["size"](db) - initial
-        db.executescript("""
+        db.executescript(f"""
             WITH RECURSIVE buckets(s) AS (VALUES(0) UNION ALL SELECT s+300 FROM buckets WHERE s<604500)
             INSERT INTO queue_metric_rollups (series_id,bucket,samples,observations,mean,minimum,maximum)
-              SELECT series.id,1800000000-604800+s,30,30,1,1,1
+              SELECT series.id,1800000000-604800+s,300/{cadence},300/{cadence},1,1,1
               FROM buckets CROSS JOIN queue_metric_series series;
         """)
         rollup_bytes = storage["size"](db) - initial - raw_bytes
@@ -159,12 +233,14 @@ def seeded_storage(root):
         history_ms = {}
         for description, start in (("raw_recent", 1800085000), ("raw_full_day", 1800000000)):
             first = db.execute("SELECT min(sequence) FROM queue_metric_raw WHERE observed_at>=?", (start,)).fetchone()[0]
-            args = ("benchmark", None, None, str(start), "1800086400", str(first-1), "2211840", "257")
+            args = ("benchmark", None, None, str(start), "1800086400", str(first-1), str(raw_rows), "257")
             records, elapsed = storage["timed"](lambda: db.execute(raw_history, args).fetchall())
             assert len(records) == 257
             history_ms[description] = elapsed
         _, cleanup_ms = storage["timed"](cleanup)
-        print(json.dumps({"case": "seeded_at_capacity", "queue_raw_rows": 2211840,
+        print(json.dumps({"case": "seeded_at_capacity", "persistence_seconds": cadence, "flapping_all_selectors": flapping,
+                          "queue_raw_rows": raw_rows, "expected_periodic_samples_per_bucket": 300 // cadence,
+                          "availability_transition_rows": transition_rows,
                           "queue_rollup_rows": 516096, "queue_raw_bytes": raw_bytes,
                           "queue_rollup_bytes": rollup_bytes,
                           "process_metric_bytes": raw_process + rollup_process,
@@ -197,7 +273,10 @@ def main():
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--candidate", type=Path)
     parser.add_argument("--laravel13", type=Path)
-    parser.add_argument("--seconds", default=40, type=int)
+    parser.add_argument("--seconds", default=150, type=int)
+    parser.add_argument("--uncached", type=Path, help="also measure the prior queue build for 60 seconds")
+    parser.add_argument("--candidate-only", action="store_true", help="repeat only the cached candidate")
+    parser.add_argument("--workload", choices=["idle", "loaded", "both"], default="both")
     parser.add_argument("--interval", default=2.0, type=float)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--storage-only", action="store_true")
@@ -205,16 +284,23 @@ def main():
     args = parser.parse_args()
     if args.herd_only and not args.laravel13:
         parser.error("--laravel13 is required for a Herd measurement")
-    if not (args.storage_only or args.herd_only) and not all((args.baseline, args.candidate, args.laravel13)):
-        parser.error("--baseline, --candidate, and --laravel13 are required for live runs")
+    if not (args.storage_only or args.herd_only) and not all((args.baseline or args.candidate_only, args.candidate, args.laravel13)):
+        parser.error("live runs require --candidate, --laravel13, and either --baseline or --candidate-only")
     with tempfile.TemporaryDirectory(prefix="roost-qb-", dir="/private/tmp") as location:
         root = Path(location)
         if args.herd_only:
             herd_resolution(root, args.laravel13.resolve() / "vendor")
             return
         if args.storage_only:
-            seeded_storage(root)
+            for cadence in (10, 30, 60):
+                seeded_storage(root, cadence)
+            seeded_storage(root, 30, flapping=True)
             return
+        source = root / "accounting.c"
+        source.write_text(ACCOUNTING)
+        accounting = root / "accounting"
+        subprocess.run(["cc", "-O2", source, "-o", accounting], check=True)
+        calibrate(accounting)
         sock = root / "redis.sock"
         redis = subprocess.Popen(["redis-server", "--port", "0", "--unixsocket", str(sock),
             "--unixsocketperm", "700", "--save", "", "--appendonly", "no"], cwd=root, stdout=subprocess.DEVNULL)
@@ -223,9 +309,15 @@ def main():
             subprocess.run(["redis-cli", "-s", str(sock), "acl", "setuser", "roost_probe", "on",
                 ">fixture-password", "~queues:*", "-@all", "+llen", "+select"], check=True, stdout=subprocess.DEVNULL)
             for label, loaded in (("idle", False), ("loaded", True)):
-                for name, binary, enabled in (("baseline", args.baseline, False), ("candidate", args.candidate, True)):
-                    benchmark(root / f"{label}-{name}", binary, args.laravel13.resolve() / "vendor",
-                              args.seconds, args.interval, sock, enabled, loaded)
+                if args.workload not in ("both", label):
+                    continue
+                variants = [] if args.candidate_only else [("baseline", args.baseline, args.seconds)]
+                variants.append(("cached", args.candidate, args.seconds))
+                if args.uncached and not loaded:
+                    variants.append(("uncached", args.uncached, 60))
+                for variant, binary, seconds in variants:
+                    benchmark(root / f"{label}-{variant}", binary, accounting, args.laravel13.resolve() / "vendor",
+                              seconds, args.interval, sock, variant, loaded)
             seeded_storage(root)
         finally:
             redis.terminate()

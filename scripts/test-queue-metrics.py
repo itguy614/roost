@@ -10,7 +10,9 @@ import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPERS = runpy.run_path(str(ROOT / "scripts/benchmark-process-metrics.py"))
@@ -95,7 +97,7 @@ def db_rows(root):
         return db.execute("SELECT * FROM jobs ORDER BY id").fetchall()
 
 
-def matrix(args, root, client, redis, redis_socket, running):
+def matrix(args, root, client, redis, redis_socket, launch, running):
     tracked = [
         (("database", None), "fresh", 1), (("database", "empty"), "fresh", 0),
         (("database", "other"), "fresh", 1), (("redis", None), "fresh", 1),
@@ -123,7 +125,14 @@ def matrix(args, root, client, redis, redis_socket, running):
                   ("redis-default", "redis", []), ("redis-other", "redis", ["primary", "other", "empty"]),
                   ("sync", "sync", ["other"]), ("missing", "missing", ["other"]), ("custom", "custom", [])]
         params = register(client, fixture, groups)
-        assert client.request("metrics.queue.current", params) == {**{"project_id": params["id"]}, "enabled": False, "queues": []}
+        assert client.request("metrics.queue.current", params) == {
+            "project_id": params["id"], "enabled": False, "queues": [], "polling": {"state": "disabled"},
+        }
+        if not projects:
+            revision = client.request("project.get", params)["revision"]
+            client.request("watch.enable", {**params, "expected_revision": revision,
+                "rules": {"include": ["queue-default.php"], "exclude": []}})
+            ready(lambda: client.request("watch.status", params)["state"] == "watching")
         projects.append((version, fixture, params, db_rows(fixture)))
         client.request("metrics.queue.configure", {**params, "enabled": True})
 
@@ -174,6 +183,14 @@ def matrix(args, root, client, redis, redis_socket, running):
             time.sleep(.15)
         else:
             raise AssertionError("hung Laravel Redis connection did not time out")
+        default_history = {"project_id": params["id"], "connection": "redis", "queue": "primary",
+                           "from": int(time.time()) - 120}
+        latest = client.request("metrics.queue.history", default_history)["items"][-1]
+        assert latest["pending"]["reason"] == "timeout" and latest["pending"]["value"] is None
+        (hung / "redis-socket").write_text(str(redis_socket))
+        ready(lambda: result_when_ready(client, params), 16)
+        assert client.request("metrics.queue.history", default_history)["items"][-1]["pending"]["value"] == 1
+        contention(root, client, hung, params, projects[1][1], launch, running)
         client.request("metrics.queue.configure", {**params, "enabled": False})
         assert not client.request("metrics.queue.current", params)["enabled"]
         client.request("metrics.queue.configure", {**projects[1][2], "enabled": False})
@@ -181,6 +198,103 @@ def matrix(args, root, client, redis, redis_socket, running):
             assert db.execute("SELECT count(*) FROM queue_metric_raw").fetchone()[0] > 0
         if args.saturation:
             saturation(args, root, client, silent_path, running)
+
+
+def contention(root, client, fixture, params, other_fixture, launch, running):
+    # Block telemetry COMMIT with a genuine rollback-journal reader. Reads and
+    # watcher invalidation still run, and opt-out must report failure honestly.
+    state = root / "state"
+    writer_result = []
+    started_mutation = threading.Event()
+    optout_key = str(uuid.uuid4())
+    admission_log = fixture / "admissions.log"
+    before = admission_log.read_text().splitlines()
+    log = root / "daemon.log"
+    warning = "queue metric batch could not commit"
+    warning_count = log.read_text().count(warning)
+    for app_dir in (fixture, other_fixture):
+        (app_dir / "hold-probe").touch()
+
+    def probe_entered():
+        client.request("daemon.status")
+        return len(admission_log.read_text().splitlines()) > len(before)
+
+    ready(probe_entered, 14)
+    watch_start = time.monotonic()
+
+    def scheduler_mutation():
+        wire = Client(state)
+        try:
+            started_mutation.set()
+            start = time.monotonic()
+            ack = wire.request("scheduler.restart", launch)
+            writer_result.append((time.monotonic() - start, ack))
+        finally:
+            wire.close()
+
+    with sqlite3.connect(state / "roost.sqlite3") as blocker:
+        blocker.execute("BEGIN")
+        blocker.execute("SELECT count(*) FROM queue_metric_raw").fetchone()
+        (fixture / "queue-default.php").write_text("<?php return 'reconfigured';\n")
+
+        def cleared():
+            pending = inspect(client, params)[("redis", None)]
+            return pending.get("reason") == "awaiting_probe" and "last_known" not in pending
+
+        ready(cleared, 4)
+        invalidation_ms = (time.monotonic() - watch_start) * 1000
+        # The other project still has a valid publication ticket and must hit
+        # the actual no-wait SQLite COMMIT path while this reader is held.
+        def write_blocked():
+            client.request("daemon.status")
+            return log.read_text().count(warning) > warning_count
+
+        ready(write_blocked, 4)
+        start = time.monotonic()
+        assert cleared()
+        current_ms = (time.monotonic() - start) * 1000
+        history = {"project_id": params["id"], "connection": "redis", "queue": "reconfigured",
+                   "from": int(time.time()) - 120}
+        assert client.request("metrics.queue.history", history)["items"] == []
+        start = time.monotonic()
+        try:
+            client.request("metrics.queue.configure", {**params, "enabled": False,
+                           "idempotency_key": optout_key})
+        except RuntimeError as error:
+            assert "database" in str(error) or "-32603" in str(error), error
+        else:
+            raise AssertionError("opt-out cannot report a commit while SQLite blocks it")
+        optout_busy_ms = (time.monotonic() - start) * 1000
+        assert client.request("metrics.queue.current", params)["enabled"]
+        start = time.monotonic()
+        assert running()
+        lifecycle_read_ms = (time.monotonic() - start) * 1000
+
+        worker = threading.Thread(target=scheduler_mutation)
+        worker.start()
+        try:
+            assert started_mutation.wait(2)
+            time.sleep(.06)
+            assert not writer_result, "lifecycle write committed before the reader released"
+        finally:
+            blocker.rollback()
+            worker.join(timeout=5)
+        assert writer_result and writer_result[0][1]["result"]["desired_state"] == "running"
+
+    for app_dir in (fixture, other_fixture):
+        (app_dir / "hold-probe").unlink()
+    ready(lambda: result_when_ready(client, params), 16)
+    default = next(row for row in client.request("metrics.queue.current", params)["queues"]
+                   if row["connection"] == "redis" and row["requested_queue"] is None)
+    assert default["queue"] == "reconfigured" and default["pending"]["value"] == 0
+    assert client.request("metrics.queue.history", history)["items"][-1]["pending"]["value"] == 0
+    ack = client.request("metrics.queue.configure", {**params, "enabled": False,
+                         "idempotency_key": optout_key})
+    assert not ack["result"]["enabled"] and not client.request("metrics.queue.current", params)["enabled"]
+    print(json.dumps({"watch_invalidation_ms": invalidation_ms, "queue_current_under_lock_ms": current_ms,
+        "optout_busy_ms": optout_busy_ms, "supervision_reads_under_lock_ms": lifecycle_read_ms,
+        "scheduler_restart_across_reader_release_ms": writer_result[0][0]*1000,
+        "old_batch_discarded": True, "optout_retry_committed": True, "new_default_attributed": True}), flush=True)
 
 
 def saturation(args, root, client, silent_path, running):
@@ -266,8 +380,8 @@ def main():
                     state = root / "state"
                     daemon = subprocess.Popen([str(args.daemon.resolve()), "--state-dir", str(state)], stdout=daemon_log, stderr=daemon_log)
                     client = ready(lambda: connect(state))
-                    _, running = start_supervision(root, client)
-                    matrix(args, root, client, redis, sock, running)
+                    launch, running = start_supervision(root, client)
+                    matrix(args, root, client, redis, sock, launch, running)
                     observed.seek(0)
                     commands = observed.read()
                     assert commands.lower().count('"llen"') >= 6, commands
