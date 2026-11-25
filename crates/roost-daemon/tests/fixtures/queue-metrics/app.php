@@ -6,6 +6,9 @@ $base = dirname(__DIR__);
 if (is_file($base . '/record-admissions')) {
     file_put_contents($base . '/admissions.log', microtime(true) . PHP_EOL, FILE_APPEND | LOCK_EX);
 }
+if (is_file($base . '/hold-probe')) {
+    usleep(900000);
+}
 if (is_file($base . '/record-usage')) {
     register_shutdown_function(function () use ($base) {
         $usage = getrusage();
@@ -20,9 +23,10 @@ $app = Application::configure($base)->create();
 $app->afterBootstrapping(LoadConfiguration::class, function ($app) use ($base) {
     $config = $app['config'];
     $config->set('queue.default', 'database');
+    $default = is_file($base . '/queue-default.php') ? require $base . '/queue-default.php' : 'primary';
     $config->set('queue.connections', [
         'database' => ['driver' => 'database', 'queue' => 'primary', 'connection' => 'fixture', 'table' => 'jobs'],
-        'redis' => ['driver' => 'redis', 'queue' => 'primary', 'connection' => 'fixture'],
+        'redis' => ['driver' => 'redis', 'queue' => $default, 'connection' => 'fixture'],
         'sync' => ['driver' => 'sync'],
         'custom' => ['driver' => 'redis', 'queue' => 'primary', 'connection' => 'fixture'],
     ]);

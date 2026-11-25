@@ -34,6 +34,32 @@ pub struct QueueProbeStamp<'a> {
     pub selectors: &'a [Selector],
 }
 
+/// An uncommitted queue batch. A dropped batch rolls back without publication.
+pub struct QueueMetricWrite<'a> {
+    store: &'a Store,
+    committed: bool,
+}
+
+impl QueueMetricWrite<'_> {
+    /// Never wait on SQLite readers while the caller holds a publication lock.
+    pub fn commit(mut self) -> Result<(), Error> {
+        self.store.0.exec(c"PRAGMA busy_timeout = 0")?;
+        self.store.0.exec(c"COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for QueueMetricWrite<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.store.0.exec(c"ROLLBACK");
+        }
+        // Use the bounded metric writer timeout for subsequent operations.
+        let _ = self.store.0.exec(c"PRAGMA busy_timeout = 50");
+    }
+}
+
 impl Store {
     pub fn has_queue_metrics(&self) -> Result<bool, Error> {
         Ok(self
@@ -112,30 +138,48 @@ impl Store {
         Ok(result.into_iter().collect())
     }
 
-    pub fn save_queue_metrics(
+    pub fn stage_queue_metrics(
         &self,
         stamp: QueueProbeStamp<'_>,
         at: u64,
         batch: &[(Selector, Reading)],
-    ) -> Result<bool, Error> {
-        self.transaction(|store| {
-            if store.get_project(stamp.project)?.is_none_or(|p| p.revision != stamp.revision)
+    ) -> Result<Option<QueueMetricWrite<'_>>, Error> {
+        self.0.exec(c"BEGIN IMMEDIATE")?;
+        let staged = QueueMetricWrite {
+            store: self,
+            committed: false,
+        };
+        let store = self;
+        {
+            if store
+                .get_project(stamp.project)?
+                .is_none_or(|p| p.revision != stamp.revision)
                 || store.queue_probe_token(stamp.project)?.as_deref() != Some(stamp.token)
                 || store.queue_probe_selectors(stamp.project)? != stamp.selectors
             {
-                return Ok(false);
+                return Ok(None);
             }
             let mut recorded = BTreeSet::new();
             for (selector, reading) in batch {
                 let project = stamp.project.0.to_string();
                 let connection = &selector.connection;
-                let queue = reading.queue.as_deref().or(selector.queue.as_deref()).unwrap_or_default();
+                let queue = reading
+                    .queue
+                    .as_deref()
+                    .or(selector.queue.as_deref())
+                    .unwrap_or_default();
                 if !recorded.insert((connection, queue)) {
                     continue;
                 }
-                store.0.query(c"INSERT OR IGNORE INTO queue_metric_series (project_id,connection,queue)
-                    VALUES (?1,?2,?3)", &[Some(&project), Some(connection), Some(queue)])?;
-                let reason = reading.reason.map(|value| serde_json::to_string(&value)).transpose()?;
+                store.0.query(
+                    c"INSERT OR IGNORE INTO queue_metric_series (project_id,connection,queue)
+                    VALUES (?1,?2,?3)",
+                    &[Some(&project), Some(connection), Some(queue)],
+                )?;
+                let reason = reading
+                    .reason
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()?;
                 store.0.query(c"INSERT INTO queue_metric_raw (series_id,observed_at,pending,reason)
                     SELECT s.id,?4,?5,json_extract(?6,'$') FROM queue_metric_series s,queue_metric_state m
                     WHERE s.project_id=?1 AND s.connection=?2 AND s.queue=?3
@@ -144,8 +188,8 @@ impl Store {
                     &[Some(&project), Some(connection), Some(queue), Some(&at.to_string()),
                       reading.pending.map(|n|n.to_string()).as_deref(), reason.as_deref()])?;
             }
-            Ok(true)
-        })
+            Ok(Some(staged))
+        }
     }
 
     pub fn maintain_queue_metrics(&self, now: u64) -> Result<(), Error> {
@@ -318,6 +362,19 @@ mod tests {
         queue_metrics::Problem,
     };
 
+    fn save(
+        store: &Store,
+        stamp: QueueProbeStamp<'_>,
+        at: u64,
+        batch: &[(Selector, Reading)],
+    ) -> Result<bool, Error> {
+        let Some(write) = store.stage_queue_metrics(stamp, at, batch)? else {
+            return Ok(false);
+        };
+        write.commit()?;
+        Ok(true)
+    }
+
     #[test]
     fn queue_batches_fence_previous_opt_in_and_keep_retention_atomic() {
         let scratch = std::env::temp_dir().join(format!("roost-queue-store-{}", Uuid::new_v4()));
@@ -386,19 +443,11 @@ mod tests {
         store.configure_queue_probe(project.id, true).unwrap();
         let before = store.queue_probe_token(project.id).unwrap().unwrap();
         assert_eq!(store.queue_probe_projects().unwrap(), [project.id]);
-        assert!(
-            store
-                .save_queue_metrics(stamp(&before), at, &sample)
-                .unwrap()
-        );
+        assert!(save(&store, stamp(&before), at, &sample).unwrap());
         store.configure_queue_probe(project.id, false).unwrap();
         store.configure_queue_probe(project.id, true).unwrap();
         let after = store.queue_probe_token(project.id).unwrap().unwrap();
-        assert!(
-            !store
-                .save_queue_metrics(stamp(&before), at + 1, &sample)
-                .unwrap()
-        );
+        assert!(!save(&store, stamp(&before), at + 1, &sample).unwrap());
         let missing = [(
             selectors[0].clone(),
             Reading {
@@ -406,11 +455,7 @@ mod tests {
                 ..Reading::failed(Problem::Timeout)
             },
         )];
-        assert!(
-            store
-                .save_queue_metrics(stamp(&after), at + 10, &missing)
-                .unwrap()
-        );
+        assert!(save(&store, stamp(&after), at + 10, &missing).unwrap());
         let page = |resolution, after, lineage| {
             store
                 .queue_metric_history(QueueHistory {

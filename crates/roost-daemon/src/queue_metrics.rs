@@ -1,3 +1,5 @@
+mod php;
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -9,7 +11,8 @@ use roost_core::{
     queue_metrics::{Problem, Reading, SELECTORS_PER_PROBE, Selector},
     unix_timestamp,
 };
-use roost_providers::{Resolver, probe_queue_depths};
+use roost_process::ProbeCleanup;
+use roost_providers::{Resolver, probe_queue_depths, resolve_queue_php};
 use roost_store::{Store, queue_metrics::QueueProbeStamp};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
@@ -25,6 +28,7 @@ const STALE: u64 = 20;
 #[derive(Default)]
 pub(super) struct Current {
     projects: HashMap<ProjectId, Entry>,
+    php: php::Cache,
 }
 
 struct Entry {
@@ -32,6 +36,7 @@ struct Entry {
     token: String,
     ticket: Arc<()>,
     readings: HashMap<Selector, Metric>,
+    files: Option<php::ProjectFiles>,
 }
 
 #[derive(Default)]
@@ -44,6 +49,17 @@ struct Metric {
 impl Current {
     pub(super) fn invalidate(&mut self, id: ProjectId) {
         self.projects.remove(&id);
+        self.php.take(id);
+    }
+
+    pub(super) fn invalidate_token(&mut self, id: ProjectId, token: &str) {
+        if self
+            .projects
+            .get(&id)
+            .is_some_and(|entry| entry.token == token)
+        {
+            self.invalidate(id);
+        }
     }
 
     fn prepare(&mut self, project: &Project, token: &str, selectors: &[Selector]) -> Arc<()> {
@@ -52,6 +68,7 @@ impl Current {
             .entry(project.id)
             .or_insert_with(|| Entry::new(project, token));
         if !entry.matches(project, token) {
+            self.php.take(project.id);
             *entry = Entry::new(project, token);
         }
         entry
@@ -89,6 +106,7 @@ impl Entry {
             token: token.into(),
             ticket: Arc::new(()),
             readings: HashMap::new(),
+            files: None,
         }
     }
 
@@ -98,7 +116,14 @@ impl Entry {
 }
 
 impl Metric {
+    fn attribute(&self, reading: &mut Reading) {
+        if reading.queue.is_none() && reading.reason.is_some_and(temporary) {
+            reading.queue = self.effective_queue.clone();
+        }
+    }
+
     fn update(&mut self, reading: Reading, now: u64) {
+        let resolved = reading.queue.is_some();
         if let Some(queue) = reading.queue {
             if self
                 .effective_queue
@@ -114,13 +139,15 @@ impl Metric {
         }
         if reading.reason.is_some_and(|reason| {
             reason.unsupported()
-                || matches!(reason, Problem::InvalidDefault | Problem::ConnectionMissing)
+                || matches!(
+                    reason,
+                    Problem::InvalidDefault
+                        | Problem::ConnectionMissing
+                        | Problem::ProjectUnavailable
+                )
         }) {
             self.success = None;
-            if matches!(
-                reading.reason,
-                Some(Problem::InvalidDefault | Problem::ConnectionMissing)
-            ) {
+            if !resolved {
                 self.effective_queue = None;
             }
         }
@@ -144,6 +171,18 @@ impl Metric {
             }
         }
     }
+}
+
+fn temporary(reason: Problem) -> bool {
+    matches!(
+        reason,
+        Problem::BackendUnavailable
+            | Problem::PhpUnavailable
+            | Problem::Timeout
+            | Problem::OutputLimit
+            | Problem::InvalidOutput
+            | Problem::CleanupUnconfirmed
+    )
 }
 
 #[derive(Default)]
@@ -187,7 +226,7 @@ impl DaemonService {
             while running.len() < SLOTS
                 && admitted < ADMISSIONS
                 && end.saturating_duration_since(tokio::time::Instant::now()) >= SLOT
-                && !roost_process::probe_cleanup_pending()
+                && roost_process::probe_cleanup_status() == ProbeCleanup::Ready
             {
                 let Some(id) = fair.next(&occupied) else {
                     break;
@@ -214,6 +253,10 @@ impl DaemonService {
                     };
                     offsets.retain(|id, _| projects.contains(id));
                     fair.round(projects);
+                }
+                () = tokio::time::sleep(Duration::from_millis(250)),
+                    if roost_process::probe_cleanup_status() == ProbeCleanup::Retrying => {
+                    let _ = tokio::task::spawn_blocking(roost_process::retry_probe_cleanup).await;
                 }
                 Some(joined) = running.join_next_with_id(), if !running.is_empty() => {
                     match joined {
@@ -245,12 +288,12 @@ fn queue_round(service: &DaemonService) -> Result<Vec<ProjectId>, roost_store::E
             tracing::warn!("queue metric retention could not commit");
         }
     }
-    service
+    let mut cache = service
         .queue_metrics
         .lock()
-        .map_err(|_| roost_store::Error::Schema)?
-        .projects
-        .retain(|id, _| projects.contains(id));
+        .map_err(|_| roost_store::Error::Schema)?;
+    cache.projects.retain(|id, _| projects.contains(id));
+    cache.php.retain(|id| projects.contains(&id));
     Ok(projects)
 }
 
@@ -287,51 +330,149 @@ fn run_batch(
         return Ok(0);
     }
     let (batch, next) = rotated(&selectors, offset);
-    let ticket = {
+    let files = php::ProjectFiles::read(&project);
+    let (ticket, cached) = {
         let mut cache = service
             .queue_metrics
             .lock()
             .map_err(|_| roost_store::Error::Schema)?;
-        if store.queue_probe_token(id)?.as_deref() != Some(&token) {
-            return Ok(0);
+        let ticket = cache.prepare(&project, &token, &selectors);
+        let entry = cache.projects.get_mut(&id).expect("prepared queue project");
+        if entry
+            .files
+            .replace(files.clone())
+            .is_some_and(|previous| previous != files)
+        {
+            // The readings live longer than an evicted executable cache
+            // entry. Keep the same configuration fence for both.
+            entry.readings.clear();
         }
-        cache.prepare(&project, &token, &selectors)
+        (ticket, cache.php.take(id))
     };
-    let result = probe_queue_depths(&Resolver::default(), &project, &batch, deadline);
-    let readings = result.unwrap_or_else(|error| vec![Reading::failed(error); batch.len()]);
-    let batch: Vec<_> = batch.into_iter().zip(readings).collect();
-    let at = unix_timestamp();
-    let mut cache = service
-        .queue_metrics
-        .lock()
-        .map_err(|_| roost_store::Error::Schema)?;
-    let Some(entry) = cache
-        .projects
-        .get_mut(&id)
-        .filter(|entry| Arc::ptr_eq(&ticket, &entry.ticket))
-    else {
+    let changed = cached.as_ref().is_some_and(|cached| cached.changed(&files));
+    let resolver = Resolver::default();
+    let mut old = cached;
+    let mut resolved_cache = None;
+    let resolved = if !changed && old.as_ref().is_some_and(|c| c.fresh(Instant::now())) {
+        resolved_cache = old.take();
+        Ok(resolved_cache
+            .as_ref()
+            .expect("fresh resolution")
+            .php
+            .clone())
+    } else {
+        resolve_queue_php(&resolver, &project, deadline).inspect(|resolved| {
+            resolved_cache = php::Resolved::new(resolved.clone(), files.clone(), Instant::now());
+        })
+    };
+    let changed = changed
+        || old
+            .as_ref()
+            .zip(resolved_cache.as_ref())
+            .is_some_and(|(old, new)| !old.same_runtime(new));
+    if changed {
+        let mut cache = service
+            .queue_metrics
+            .lock()
+            .map_err(|_| roost_store::Error::Schema)?;
+        if let Some(entry) = cache
+            .projects
+            .get_mut(&id)
+            .filter(|entry| Arc::ptr_eq(&ticket, &entry.ticket))
+        {
+            entry.readings.clear();
+        }
+    }
+    if store.queue_probe_token(id)?.as_deref() != Some(&token) {
         return Ok(next);
-    };
+    }
+    let result =
+        resolved.and_then(|php| probe_queue_depths(&resolver, &project, &php, &batch, deadline));
+    if matches!(
+        result,
+        Err(Problem::PhpUnavailable | Problem::ProjectUnavailable)
+    ) {
+        resolved_cache = None;
+    }
+    let readings = result.unwrap_or_else(|error| vec![Reading::failed(error); batch.len()]);
+    let mut batch: Vec<_> = batch.into_iter().zip(readings).collect();
+    let at = unix_timestamp();
+    let files_changed = php::ProjectFiles::read(&project) != files;
+    {
+        let mut cache = service
+            .queue_metrics
+            .lock()
+            .map_err(|_| roost_store::Error::Schema)?;
+        let Some(entry) = cache
+            .projects
+            .get_mut(&id)
+            .filter(|entry| Arc::ptr_eq(&ticket, &entry.ticket))
+        else {
+            return Ok(next);
+        };
+        if files_changed {
+            cache.invalidate(id);
+            return Ok(next);
+        }
+        for (selector, reading) in &mut batch {
+            if let Some(metric) = entry.readings.get(selector) {
+                metric.attribute(reading);
+            }
+        }
+        if let Some(resolved) = resolved_cache {
+            cache.php.put(id, resolved);
+        }
+    }
     let stamp = QueueProbeStamp {
         project: id,
         revision: project.revision,
         token: &token,
         selectors: &selectors,
     };
-    match store.save_queue_metrics(stamp, at, &batch) {
-        Ok(true) => {
-            for (selector, reading) in batch {
-                entry
-                    .readings
-                    .entry(selector)
-                    .or_default()
-                    .update(reading, at);
-            }
-        }
-        Ok(false) => {}
-        Err(_) => tracing::warn!("queue metric batch could not commit"),
-    }
+    publish(service, &store, stamp, &ticket, at, batch);
     Ok(next)
+}
+
+fn publish(
+    service: &DaemonService,
+    store: &Store,
+    stamp: QueueProbeStamp<'_>,
+    ticket: &Arc<()>,
+    at: u64,
+    batch: Vec<(Selector, Reading)>,
+) {
+    let id = stamp.project;
+    let write = match store.stage_queue_metrics(stamp, at, &batch) {
+        Ok(Some(write)) => write,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::warn!("queue metric batch could not stage");
+            return;
+        }
+    };
+    let Ok(mut cache) = service.queue_metrics.lock() else {
+        return;
+    };
+    let Some(entry) = cache
+        .projects
+        .get_mut(&id)
+        .filter(|entry| Arc::ptr_eq(ticket, &entry.ticket))
+    else {
+        return;
+    };
+    // Staging may wait for SQLite without holding this lock. COMMIT uses a
+    // zero busy timeout to keep the watcher and current-read lock bounded.
+    if write.commit().is_ok() {
+        for (selector, reading) in batch {
+            entry
+                .readings
+                .entry(selector)
+                .or_default()
+                .update(reading, at);
+        }
+    } else {
+        tracing::warn!("queue metric batch could not commit");
+    }
 }
 
 #[cfg(test)]

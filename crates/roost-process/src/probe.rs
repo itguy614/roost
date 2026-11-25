@@ -4,27 +4,40 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeCleanup {
+    Ready,
+    Retrying,
+    Blocked,
+}
 
 #[cfg(target_os = "macos")]
-static CLEANUP_PENDING: AtomicUsize = AtomicUsize::new(0);
+mod cleanup;
+#[cfg(target_os = "macos")]
+use cleanup::{defer, status};
 
-pub fn probe_cleanup_pending() -> bool {
+pub fn probe_cleanup_status() -> ProbeCleanup {
     #[cfg(target_os = "macos")]
     {
-        CLEANUP_PENDING.load(Ordering::Acquire) != 0
+        status()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        ProbeCleanup::Ready
     }
+}
+
+pub fn retry_probe_cleanup() {
+    #[cfg(target_os = "macos")]
+    cleanup::retry();
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     #[error("could not launch or read the probe process")]
     Io(#[from] std::io::Error),
+    #[error("could not launch the probe executable")]
+    Launch(std::io::Error),
     #[error("probe exceeded its time limit")]
     Timeout,
     #[error("probe exceeded its output limit")]
@@ -65,7 +78,7 @@ pub fn run_probe_before(
 ) -> Result<Vec<u8>, ProbeError> {
     use std::{process::Stdio, thread};
 
-    if CLEANUP_PENDING.load(Ordering::Acquire) != 0 {
+    if probe_cleanup_status() != ProbeCleanup::Ready {
         return Err(ProbeError::Cleanup);
     }
     if Instant::now() >= execution_deadline {
@@ -75,7 +88,7 @@ pub fn run_probe_before(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = crate::spawn_session(command, Some(environment))?;
+    let mut child = crate::spawn_session(command, Some(environment)).map_err(ProbeError::Launch)?;
     let pid = child.id() as libc::pid_t;
     // Keep the leader PID pinned until the group is empty. An exited leader
     // can still have live descendants holding inherited pipes.
@@ -111,7 +124,7 @@ pub fn run_probe_before(
             .map_err(|_| ProbeError::Cleanup)
             .and_then(|exited| terminate_group(pid, exited));
         if cleanup.is_err() {
-            return defer_reap(child);
+            return Err(defer(child));
         }
         loop {
             if crate::macos::exited(pid).is_ok_and(|exited| exited)
@@ -120,12 +133,15 @@ pub fn run_probe_before(
                 break;
             }
             if Instant::now() >= cleanup_deadline {
-                return defer_reap(child);
+                return Err(defer(child));
             }
             thread::sleep(Duration::from_millis(10));
         }
     }
-    let status = child.wait()?;
+    let status = match child.try_wait() {
+        Ok(Some(status)) => status,
+        _ => return Err(defer(child)),
+    };
     result.and_then(|output| {
         if status.success() {
             Ok(output)
@@ -133,28 +149,6 @@ pub fn run_probe_before(
             Err(ProbeError::Exit)
         }
     })
-}
-
-#[cfg(target_os = "macos")]
-fn defer_reap(mut child: std::process::Child) -> Result<Vec<u8>, ProbeError> {
-    CLEANUP_PENDING.fetch_add(1, Ordering::AcqRel);
-    let _ = std::thread::Builder::new()
-        .name("roost-probe-reaper".into())
-        .spawn(move || {
-            let pid = child.id() as libc::pid_t;
-            loop {
-                if crate::macos::exited(pid).is_ok_and(|exited| exited)
-                    && group_empty(pid).is_ok_and(|empty| empty)
-                {
-                    if child.wait().is_ok() {
-                        CLEANUP_PENDING.fetch_sub(1, Ordering::AcqRel);
-                    }
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        });
-    Err(ProbeError::Cleanup)
 }
 
 #[cfg(target_os = "macos")]

@@ -40,31 +40,36 @@ impl QueueCall {
             Self::Current(p) => p.id,
             Self::History(p) => p.project_id,
         };
-        let store = Store::open(&service.db).map_err(store_error)?;
+        let store = Store::open_for_metric_writes(&service.db).map_err(store_error)?;
         let project = store
             .get_project(id)
             .map_err(store_error)?
             .ok_or_else(|| store_error(roost_store::Error::NotFound))?;
         match self {
             Self::Configure(params) => {
-                // Serialize opt-out with final batch publication. Historical
-                // receipt replay must not invalidate a newly enabled window.
-                let mut cache = service.queue_metrics.lock().map_err(|_| internal_error())?;
+                // The persisted token fences publication even when the opt-out
+                // raced an admitted task. A receipt replay performs no invalidation.
                 let key = request_key("metrics.queue.configure", &params)?;
-                let mut changed = false;
+                let mut disabled_token = None;
                 let (operation_id, result) = store
                     .try_mutate::<_, crate::supervisor::Error>(
                         params.idempotency_key,
                         &key,
                         |store| {
-                            changed = store.queue_probe_token(id)?.is_some() != params.enabled;
+                            if !params.enabled {
+                                disabled_token = store.queue_probe_token(id)?;
+                            }
                             store.configure_queue_probe(id, params.enabled)?;
                             Ok(json!({"project_id":id,"enabled":params.enabled}))
                         },
                     )
                     .map_err(worker_error)?;
-                if changed {
-                    cache.invalidate(id);
+                if let Some(token) = disabled_token {
+                    service
+                        .queue_metrics
+                        .lock()
+                        .map_err(|_| internal_error())?
+                        .invalidate_token(id, &token);
                 }
                 Ok(json!({"operation_id":operation_id,"result":result}))
             }
@@ -80,7 +85,20 @@ impl QueueCall {
                 } else {
                     Vec::new()
                 };
-                Ok(json!({"project_id":id,"enabled":token.is_some(),"queues":queues}))
+                use roost_process::ProbeCleanup;
+                let polling = match (token.is_some(), roost_process::probe_cleanup_status()) {
+                    (false, _) => json!({"state":"disabled"}),
+                    (true, ProbeCleanup::Ready) => json!({"state":"ready"}),
+                    (true, ProbeCleanup::Retrying) => {
+                        json!({"state":"degraded","reason":"cleanup_unconfirmed","cleanup":"retrying"})
+                    }
+                    (true, ProbeCleanup::Blocked) => {
+                        json!({"state":"degraded","reason":"cleanup_unconfirmed","cleanup":"blocked"})
+                    }
+                };
+                Ok(
+                    json!({"project_id":id,"enabled":token.is_some(),"queues":queues,"polling":polling}),
+                )
             }
             Self::History(p) => history(&store, p),
         }

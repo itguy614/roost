@@ -2,18 +2,43 @@ use std::time::{Duration, Instant};
 
 use roost_core::{
     Project,
+    discovery::ResolvedPhp,
     queue_metrics::{Problem, Reading, SELECTORS_PER_PROBE, Selector, safe_identifier},
 };
 use roost_process::ProbeError;
 
 use crate::{Error, Resolver};
 
+pub fn resolve_queue_php(
+    resolver: &Resolver,
+    project: &Project,
+    slot_deadline: Instant,
+) -> Result<ResolvedPhp, Problem> {
+    resolver
+        .resolve_before(
+            project,
+            None,
+            None,
+            slot_deadline - Duration::from_millis(300),
+        )
+        .map_err(|error| match error {
+            Error::HerdProbe(ProbeError::Timeout) => Problem::Timeout,
+            Error::HerdProbe(ProbeError::Cleanup) => Problem::CleanupUnconfirmed,
+            Error::Project => Problem::ProjectUnavailable,
+            _ => Problem::PhpUnavailable,
+        })
+}
+
 pub fn probe_queue_depths(
     resolver: &Resolver,
     project: &Project,
+    php: &ResolvedPhp,
     selectors: &[Selector],
     slot_deadline: Instant,
 ) -> Result<Vec<Reading>, Problem> {
+    project
+        .validate_location()
+        .map_err(|_| Problem::ProjectUnavailable)?;
     if selectors.is_empty()
         || selectors.len() > SELECTORS_PER_PROBE
         || selectors.iter().any(|s| {
@@ -26,17 +51,10 @@ pub fn probe_queue_depths(
     // Reserve the tail of the slot for termination and group cleanup. Herd's
     // lookup and PHP execution share the same absolute slot deadline.
     let execution_deadline = slot_deadline - Duration::from_millis(300);
-    let php = resolver
-        .resolve_before(project, None, None, execution_deadline)
-        .map_err(|error| match error {
-            Error::HerdProbe(ProbeError::Timeout) => Problem::Timeout,
-            Error::HerdProbe(ProbeError::Cleanup) => Problem::CleanupUnconfirmed,
-            _ => Problem::PhpUnavailable,
-        })?;
     if !project.path.join("vendor/autoload.php").is_file()
         || !project.path.join("bootstrap/app.php").is_file()
     {
-        return Err(Problem::PhpUnavailable);
+        return Err(Problem::BackendUnavailable);
     }
     let input = serde_json::to_string(selectors).map_err(|_| Problem::InvalidOutput)?;
     let mut command = resolver.command(&php.path, &project.path);
@@ -66,6 +84,7 @@ fn probe_problem(error: ProbeError) -> Problem {
         ProbeError::Timeout => Problem::Timeout,
         ProbeError::Cleanup => Problem::CleanupUnconfirmed,
         ProbeError::OutputLimit => Problem::OutputLimit,
+        ProbeError::Launch(_) => Problem::PhpUnavailable,
         _ => Problem::BackendUnavailable,
     }
 }

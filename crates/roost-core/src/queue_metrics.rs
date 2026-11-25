@@ -19,6 +19,7 @@ pub enum Problem {
     ConnectionMissing,
     BackendUnavailable,
     PhpUnavailable,
+    ProjectUnavailable,
     Timeout,
     OutputLimit,
     InvalidOutput,

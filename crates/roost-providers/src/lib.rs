@@ -18,7 +18,7 @@ use roost_core::{
 use roost_process::ProbeError;
 
 pub use connections::discover_connections;
-pub use queue_metrics::probe_queue_depths;
+pub use queue_metrics::{probe_queue_depths, resolve_queue_php};
 use roost_core::queue_metrics::safe_identifier;
 pub use suggestions::suggest_queues;
 
