@@ -179,9 +179,9 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             assert running()
             usages = []
             for app, _ in projects:
-                log = app / "usage.jsonl"
-                if log.exists():
-                    usages.extend(row for row in map(json.loads, log.read_text().splitlines())
+                usage_log = app / "usage.jsonl"
+                if usage_log.exists():
+                    usages.extend(row for row in map(json.loads, usage_log.read_text().splitlines())
                                   if wall_start <= row["at"] <= wall_end)
             if enabled:
                 assert usages and all(FIXTURE["inspect"](client, project)[("redis", "primary")]["state"] == "fresh"
