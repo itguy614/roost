@@ -59,4 +59,15 @@ python3 scripts/benchmark-queue-metrics.py --candidate-only --thresholds --workl
   --candidate target/debug/roost-daemon --laravel13 "$LARAVEL13_FIXTURE" --seconds 140
 ```
 
+### Measured resource cost
+
+The Apple M4 Pro fixture ran on macOS 26.6.2 with Herd PHP 8.4.28, Redis 7.4.7, and SQLite 3.51.0. CPU includes the daemon, its reaped probe subprocesses including Herd and PHP, live guardians, and fixture Redis. Each trial used eight enabled queue projects, 31 workers and one scheduler, 31 active alert episodes, and local IPC reads every two seconds.
+
+| Build | Elapsed | Combined CPU, one core | Peak daemon RSS | Worst local IPC p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Preliminary debug | 142.06 s | 13.62% | 18.48 MiB | 27.50 ms |
+| Optimized, `f15c431` | 140.92 s | 11.30% | 15.36 MiB | 13.28 ms |
+
+The optimized run used 4.036 daemon CPU seconds, 7.741 reaped child CPU seconds, 3.963 guardian CPU seconds, and 0.189 Redis CPU seconds. Alert listing p95 was 4.61 ms and event history p95 was 2.20 ms. SQLite and journals peaked at 638,976 bytes in the fresh fixture. The longest persisted process-sampling gap was two seconds and the daemon emitted zero warning or error lines. The debug trial exceeded the 12% combined CPU envelope. The optimized trial met the combined CPU, daemon RSS, and IPC p95 envelopes for this workload. The short trials leave steady-state storage and broader workload costs to the release gates.
+
 Physical macOS sleep/wake, Intel, minimum macOS compatibility, and launchd operation remain release gates. Milestone 6 includes multi-day retention and storage recycling, journal peaks, and repeated resolved queue identity churn. Native authorization, OS acceptance, and Notification Center delivery remain acceptance gates for Milestone 4.4.
