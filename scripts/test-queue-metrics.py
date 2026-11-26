@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import runpy
@@ -236,6 +237,9 @@ def contention(root, client, fixture, params, other_fixture, launch, running):
         blocker.execute("BEGIN")
         blocker.execute("SELECT count(*) FROM queue_metric_raw").fetchone()
         (fixture / "queue-default.php").write_text("<?php return 'reconfigured';\n")
+        # A transition gives the unchanged-ticket project a durable write
+        # even when this test falls between 30-second periodic points.
+        (other_fixture / "queue-default.php").write_text("<?php return 'blocked-current';\n")
 
         def cleared():
             pending = inspect(client, params)[("redis", None)]
@@ -344,6 +348,88 @@ def saturation(args, root, client, silent_path, running):
         "selectors_rotated": len(seen), "max_supervision_status_ms": maximum}), flush=True)
 
 
+def restart_and_provider_change(args, root, redis_socket):
+    case = root / "restart"
+    case.mkdir()
+    fixture = case / "app"
+    app(fixture, args.laravel13.resolve() / "vendor", redis_socket)
+    (fixture / "record-usage").touch()
+    state = case / "state"
+    daemon = client = None
+    log = (case / "daemon.log").open("w")
+
+    environment = os.environ.copy()
+    system_php = None
+    if args.alternate_php:
+        # The system resolver deliberately excludes Herd's home directory.
+        # Use the real PHP executable on a test-only absolute PATH entry.
+        bin_path = case / "system-bin"
+        bin_path.mkdir()
+        system_php = bin_path / "php"
+        shutil.copy2(args.alternate_php.resolve(), system_php)
+        environment["PATH"] = str(bin_path) + os.pathsep + environment.get("PATH", "")
+
+    def start():
+        child = subprocess.Popen([args.daemon.resolve(), "--state-dir", state], env=environment,
+                                 stdout=log, stderr=log)
+        return child, ready(lambda: connect(state))
+
+    def usage():
+        client.request("daemon.status")
+        path = fixture / "usage.jsonl"
+        return [json.loads(line)["php_version"] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def configure_provider(provider, override=None):
+        # This fixture changes the same revisioned field used by the store.
+        # Project provider editing is currently outside the public CLI surface.
+        with sqlite3.connect(state / "roost.sqlite3") as db:
+            db.execute("""UPDATE projects SET revision=revision+1,
+                data=json_set(data,'$.revision',revision+1,'$.provider',?,'$.php_override',?) WHERE id=?""",
+                       (provider, str(override) if override is not None else None, params["id"]))
+
+    try:
+        daemon, client = start()
+        params = register(client, fixture, [("redis-default", "redis", [])])
+        client.request("metrics.queue.configure", {**params, "enabled": True})
+        ready(lambda: result_when_ready(client, params), 16)
+        original = usage()[-1]
+        query = {"project_id": params["id"], "connection": "redis", "from": int(time.time())-30}
+        before = client.request("metrics.queue.history", query)
+        assert before["items"][0]["coverage"]["initial"]
+        client.close()
+        client = None
+        daemon.terminate()
+        daemon.wait(timeout=30)
+        daemon, client = start()
+        ready(lambda: result_when_ready(client, params), 16)
+        resumed = client.request("metrics.queue.history", {**query, "cursor": before["next_cursor"]})
+        assert all(not row["coverage"]["initial"] for row in resumed["items"])
+        with sqlite3.connect(state / "roost.sqlite3") as db:
+            assert not db.execute("""SELECT 1 FROM queue_metric_raw WHERE flags&1!=0
+                GROUP BY series_id,observed_at/30 HAVING count(*)>1""").fetchall()
+        evidence = {"daemon_restart_preserved_checkpoint_and_cursor": True, "initial_php": original}
+
+        if system_php:
+            version = subprocess.check_output([system_php, "-r", "echo PHP_VERSION;"], text=True)
+            assert version != original, "use a distinct installed PHP version"
+            configure_provider("system")
+            ready(lambda: usage() and usage()[-1] == version and result_when_ready(client, params), 16)
+            configure_provider("system", fixture / "missing-php")
+            ready(lambda: inspect(client, params)[("redis", None)].get("reason") == "php_unavailable", 16)
+            configure_provider("herd")
+            ready(lambda: usage() and usage()[-1] == original and result_when_ready(client, params), 16)
+            evidence.update({"real_system_php": version, "returned_to_herd_php": original,
+                             "failed_lookup_then_recovered": True})
+        print(json.dumps(evidence), flush=True)
+    finally:
+        if client:
+            client.close()
+        if daemon and daemon.poll() is None:
+            daemon.terminate()
+            daemon.wait(timeout=30)
+        log.close()
+
+
 def result_when_ready(client, params):
     result = inspect(client, params)
     return result if result.get(("redis", None), {}).get("state") == "fresh" else None
@@ -355,6 +441,7 @@ def main():
     parser.add_argument("--laravel13", required=True, type=Path)
     parser.add_argument("--daemon", default=ROOT / "target/debug/roost-daemon", type=Path)
     parser.add_argument("--saturation", action="store_true")
+    parser.add_argument("--alternate-php", type=Path, help="a distinct installed PHP for the provider-change fixture")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="roost-q-", dir="/private/tmp") as path:
         root = Path(path)
@@ -382,6 +469,7 @@ def main():
                     client = ready(lambda: connect(state))
                     launch, running = start_supervision(root, client)
                     matrix(args, root, client, redis, sock, launch, running)
+                    restart_and_provider_change(args, root, sock)
                     observed.seek(0)
                     commands = observed.read()
                     assert commands.lower().count('"llen"') >= 6, commands

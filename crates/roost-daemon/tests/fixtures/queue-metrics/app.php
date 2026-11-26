@@ -16,6 +16,7 @@ if (is_file($base . '/record-usage')) {
              + ($usage['ru_utime.tv_usec'] + $usage['ru_stime.tv_usec']) / 1000000;
         file_put_contents($base . '/usage.jsonl', json_encode([
             'at' => microtime(true), 'cpu_seconds' => $cpu, 'peak_rss_bytes' => $usage['ru_maxrss'],
+            'php_version' => PHP_VERSION,
         ]) . PHP_EOL, FILE_APPEND | LOCK_EX);
     });
 }
