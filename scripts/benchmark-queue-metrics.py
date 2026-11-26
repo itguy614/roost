@@ -81,17 +81,19 @@ def calibrate(accounting):
                       "proc_pid_rusage_seconds": reported}), flush=True)
 
 
-def database_stats(state):
+def database_stats(state, measured_from):
     with sqlite3.connect(state / "roost.sqlite3") as db:
-        raw, gap = db.execute("""
-            SELECT sum(rows),max(gap) FROM (
-                SELECT count(*) AS rows, observed_at - lag(observed_at) OVER (ORDER BY observed_at) AS gap
-                FROM process_metric_raw GROUP BY observed_at
-            )
-        """).fetchone()
+        ticks = db.execute("""
+            SELECT observed_at,count(*) AS rows,observed_at - lag(observed_at) OVER (ORDER BY observed_at) AS gap
+            FROM process_metric_raw GROUP BY observed_at
+        """).fetchall()
+        outages = [{"at": at, "gap_seconds": gap, "rows": rows} for at, rows, gap in ticks
+                   if at >= measured_from and gap is not None and (gap > 2 or rows < 32)]
+        raw = sum(rows for _, rows, _ in ticks)
+        gap = max((gap for at, _, gap in ticks if at >= measured_from and gap is not None), default=0)
         has_queue = db.execute("SELECT count(*) FROM sqlite_master WHERE name='queue_metric_raw'").fetchone()[0]
         queues = db.execute("SELECT count(*) FROM queue_metric_raw").fetchone()[0] if has_queue else 0
-        return raw, gap, queues
+        return raw, gap, queues, outages
 
 
 def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket, redis_pid, variant, loaded,
@@ -139,6 +141,7 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             if enabled or variant == "scale":
                 methods.append(("metrics.queue.current", projects[0][1]))
             latencies = {name: [] for name, _ in methods}
+            checkpoint_reads = 0
             with contextlib.ExitStack() as cleanup:
                 faults = cleanup.enter_context(queue_faults(root, daemon.pid, redis_socket, projects[0])) if soak else None
                 next_checkpoint = 0
@@ -157,9 +160,11 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                             "daemon_cpu_seconds": round(own-cpu_start, 3), "child_cpu_seconds": round(children-child_start, 3),
                             "redis_cpu_seconds": round(backend-redis_start, 3),
                             "guardian_cpu_seconds": round(custody-guardian_start, 3),
-                            "worst_rpc_p95_ms_so_far": max(HELPERS["percentiles"](times)["p95"] for times in latencies.values()),
+                            "worst_rpc_p95_ms_in_interval": max(HELPERS["percentiles"](times[checkpoint_reads:])["p95"]
+                                                                 for times in latencies.values()),
                             "peak_daemon_rss_kib": rss_peak, "peak_db_and_journal_bytes": size_peak,
                             **faults.result()}), flush=True)
+                        checkpoint_reads = len(latencies["daemon.status"])
                         next_checkpoint += 300
                     time.sleep(interval)
                 fault_result = faults.result() if faults else {}
@@ -191,7 +196,8 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             if enabled:
                 assert children_cpu > 0, "Darwin did not report reaped probe CPU"
             php_cpu = sum(row["cpu_seconds"] for row in usages)
-            raw, gap, queue = database_stats(state)
+            raw, gap, queue, outages = database_stats(state, int(wall_start))
+            warnings = [line for line in Path(log.name).read_text().splitlines() if " WARN " in line or " ERROR " in line]
             print(json.dumps({"case": "soak_complete" if soak else "live",
                 "workload": "loaded" if loaded else "idle", "variant": variant, "queue_enabled": enabled,
                 "enabled_projects": enabled_projects,
@@ -207,8 +213,13 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                 "peak_db_and_journal_bytes": size_peak,
                 "process_sample_rows_since_startup": raw, "process_sample_max_gap_seconds": gap,
                 "queue_samples_since_startup": queue,
+                "process_sampling_anomalies": outages, "daemon_warning_count": len(warnings),
+                "daemon_warnings": warnings[:20],
+                "worst_last_interval_rpc_p95_ms": max((HELPERS["percentiles"](times[checkpoint_reads:])["p95"]
+                    for times in latencies.values() if times[checkpoint_reads:]), default=None),
                 **fault_result,
-                "rpc_ms": {name: HELPERS["percentiles"](times) for name, times in latencies.items()}}), flush=True)
+                "rpc_ms": {name: {**HELPERS["percentiles"](times), "max": round(max(times), 3)}
+                           for name, times in latencies.items()}}), flush=True)
         finally:
             try:
                 if client:
