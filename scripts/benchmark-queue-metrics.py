@@ -149,7 +149,7 @@ class AlertWorkload:
         charged = [alert for alert in alerts if alert["restart_charged"]]
         expect = int(self.enabled)
         assert len(alerts) == len(events) == 2 * expect, (alerts, events)
-        assert len(recovered) == len(charged) == len(restarted) == expect
+        assert len(recovered) == len(charged) == len(restarted) == expect, (alerts, restarted)
         if restarted:
             assert restarted[0]["last_exit"]["stop_cause"] == "resource_threshold"
             assert restarted[0]["generation"] == 2
