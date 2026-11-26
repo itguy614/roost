@@ -68,6 +68,28 @@ The harness measures daemon user and system CPU, CPU charged to reaped descendan
 
 The one-hour run exercises the same full-capacity workload. It injects a silent Redis socket every five minutes and verifies timeout, recovery, and actual Herd lookup after cache expiration. Five-minute checkpoints record CPU, sampled daemon RSS, SQLite footprint, and IPC latency. The measurement runs on Apple Silicon. The separate process CPU gauge correction is tracked in [PR #14](https://github.com/itguy614/roost/pull/14).
 
+#### Final measurements
+
+Apple M4 Pro with macOS 26.6.2, Herd PHP 8.4.28, Redis 7.4.7, and SQLite 3.51.0. Both real Laravel versions and nine-project saturation passed. The provider fixture switched to system PHP 8.5.13, checked a missing override, and returned to Herd PHP 8.4.28. All 74 Rust tests and strict Clippy passed.
+
+| Enabled projects | Seconds | Daemon CPU | Herd and PHP children CPU | Live guardians CPU | Redis CPU | Total CPU | Peak daemon RSS | Worst RPC p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 90.5 | 3.76% | 0.00% | 3.12% | 0.13% | 7.00% | 17.34 MiB | 27.07 ms |
+| 1 | 90.6 | 3.98% | 0.85% | 3.10% | 0.12% | 8.06% | 17.58 MiB | 26.59 ms |
+| 2 | 90.6 | 4.08% | 1.65% | 3.08% | 0.13% | 8.94% | 17.52 MiB | 26.19 ms |
+| 4 | 90.6 | 4.01% | 2.66% | 3.07% | 0.13% | 9.87% | 17.80 MiB | 24.44 ms |
+| 8 | 90.6 | 4.09% | 4.73% | 2.98% | 0.13% | 11.94% | 18.19 MiB | 27.88 ms |
+
+Typical use with one and two enabled projects used 8.06% and 8.94% of one core, including the daemon, probes, guardians, and Redis. At eight projects, the same total was 11.94%, an increase of 4.94 percentage points from zero projects. The daemon by itself used 3.76% at zero projects.
+
+The full-capacity run lasted 3601.5 seconds at 11.54% combined CPU. Its peak sampled daemon RSS was 18.77 MiB, SQLite and journal footprint was 5.39 MiB, worst overall IPC p95 was 24.17 ms, and the longest persisted process sampling gap was 2 seconds. The daemon published 12 injected timeouts and 12 recoveries. The monitor spotted 216 actual Herd resolution processes after 120 seconds. There were 2,844 completed PHP probes, 0 irregular process sampling ticks, and 7 daemon warning or error lines.
+
+- The highest five-minute CPU interval was 11.87% over elapsed seconds 1801–2101.
+- The worst interval RPC p95 was 24.69 ms over elapsed seconds 1801–2101.
+- The daemon emitted 7 warning or error lines. Observed messages include queue metric batch could not commit.
+
+All CPU, daemon RSS, and overall IPC p95 working envelopes were met for this workload.
+
 ### Durable storage budget
 
 The production cadence is 30 seconds plus transitions for 24 hours of raw data and seven days of five-minute rollups. The cumulative working envelopes, including SQLite journals, are 180 MiB for steady operation and 250 MiB for pathological churn. The seeded test fills 256 queue series and adds a full day of raw records and week of rollups for 32 managed processes. In the regular fixture, 16 queue selectors incur 96 total outage and recovery transitions. The flapping fixture switches every selector between success and timeout at each poll. Both fixtures exercise the retention SQL with a sampled rollback journal.
