@@ -56,22 +56,25 @@ roost process list "$project"
 roost metrics alerts list "$project"
 ```
 
-On a disposable workload, the cumulative benchmark enables two rules on all 31 workers, opens 31 RSS episodes, polls eight Laravel projects, and reads both alert and event IPC. The scheduler is included in supervision and process sampling. The benchmark keeps actual restart coverage in the independent IPC scenario above.
+## Matched resource comparison
+
+The Apple M4 Pro fixture ran on macOS 26.6.2 with Herd PHP 8.4.28, Redis 7.4.7, and SQLite 3.51.0. Both arms use the same optimized daemon, eight enabled queue projects, 31 worker stand-ins, one scheduler, and the same IPC reads every two seconds, including alert and event reads. The harness applies two 64 MiB RSS excursions on different workers. The alert-enabled arm must commit two episodes, observe one recovery, and confirm one guardian-backed replacement. The alert-disabled arm must observe both excursions with zero episodes and replacements. CPU accounting includes the daemon, Herd, PHP, live guardians, and fixture Redis. In the enabled arm the reaped CPU also includes the retired guardian and any CPU carried from its stand-in worker.
 
 ```sh
-python3 scripts/benchmark-queue-metrics.py --candidate-only --thresholds --workload idle \
-  --candidate target/debug/roost-daemon --laravel13 "$LARAVEL13_FIXTURE" --seconds 140
+cargo build --release --workspace --locked
+python3 scripts/benchmark-queue-metrics.py --alert-comparison --alerts-first \
+  --candidate target/release/roost-daemon --laravel13 "$LARAVEL13_FIXTURE" --seconds 120
 ```
 
-### Measured resource cost
+| Optimized build `3bec357` | Elapsed | Combined CPU, one core | Peak daemon RSS | Worst local IPC p95 | Episodes / recovered / restarted |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Alerts enabled | 120.58 s | 10.89% | 14.92 MiB | 15.56 ms | 2 / 1 / 1 |
+| Alerts disabled | 120.58 s | 10.74% | 15.02 MiB | 18.18 ms | 0 / 0 / 0 |
 
-The Apple M4 Pro fixture ran on macOS 26.6.2 with Herd PHP 8.4.28, Redis 7.4.7, and SQLite 3.51.0. CPU includes the daemon, its reaped probe subprocesses including Herd and PHP, live guardians, and fixture Redis. Each trial used eight enabled queue projects, 31 workers and one scheduler, 31 active alert episodes, and local IPC reads every two seconds.
+The enabled arm used 3.538 daemon CPU seconds, 5.851 reaped child seconds, a net 3.574 live guardian seconds, and 0.168 Redis seconds. The disabled arm used 3.522, 5.676, 3.588, and 0.163 seconds in the same categories. Both arms completed 96 PHP count probes. Combined CPU was 0.15 percentage points higher with alerts enabled in this pair. An earlier optimized pass with the opposite order and preliminary fixture measured 11.71% with alerts off and 11.30% with alerts on. The direction varied between short trials, so the difference is an observed cost for this workload. Both final arms met the combined CPU, RSS, and IPC targets.
 
-| Build | Elapsed | Combined CPU, one core | Peak daemon RSS | Worst local IPC p95 |
-| --- | ---: | ---: | ---: | ---: |
-| Preliminary debug | 142.06 s | 13.62% | 18.48 MiB | 27.50 ms |
-| Optimized, `f15c431` | 140.92 s | 11.30% | 15.36 MiB | 13.28 ms |
+SQLite and journals peaked at 577,536 bytes with alerts enabled and 565,248 bytes with alerts disabled in these fresh fixtures. Both runs had zero warning or error lines. One three-second process sample interval occurred with alerts disabled and still contained 32 rows. The enabled arm had no irregular process sampling ticks. A discarded trial used an allocator-backed RSS fixture that could retain memory after release. The final fixture unmaps its memory explicitly.
 
-The optimized run used 4.036 daemon CPU seconds, 7.741 reaped child CPU seconds, 3.963 guardian CPU seconds, and 0.189 Redis CPU seconds. Alert listing p95 was 4.61 ms and event history p95 was 2.20 ms. SQLite and journals peaked at 638,976 bytes in the fresh fixture. The longest persisted process-sampling gap was two seconds and the daemon emitted zero warning or error lines. The debug trial exceeded the 12% combined CPU envelope. The optimized trial met the combined CPU, daemon RSS, and IPC p95 envelopes for this workload. The short trials leave steady-state storage and broader workload costs to the release gates.
+The isolated SQLite contention test held a shared reader across episode and attempt commit. Combined worker and scheduler status took at most 76.32 ms. Manual stop and rule update returned busy in 82.38 ms and 83.37 ms. Both succeeded using their original request keys after the reader released. The worker stopped in its original generation, its guardian confirmed cleanup, and the scheduler kept its process identity. No attempted charge or episode survived rollback.
 
 Physical macOS sleep/wake, Intel, minimum macOS compatibility, and launchd operation remain release gates. Milestone 6 includes multi-day retention and storage recycling, journal peaks, and repeated resolved queue identity churn. Native authorization, OS acceptance, and Notification Center delivery remain acceptance gates for Milestone 4.4.
