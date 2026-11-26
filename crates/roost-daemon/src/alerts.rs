@@ -105,6 +105,15 @@ impl Evaluator {
             }
             self.states.remove(&key);
         }
+        let mut selected: Vec<_> = selected.into_iter().collect();
+        selected.sort_unstable_by_key(|((generation, metric), _)| {
+            (
+                generation.project_id.0,
+                generation.profile_id,
+                generation.slot,
+                metric.name(),
+            )
+        });
         for (key, (subject, rule)) in selected {
             let state = self
                 .states
