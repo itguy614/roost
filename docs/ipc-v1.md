@@ -106,6 +106,8 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32008` | All discovery slots are busy |
 | `-32020` | History cursor invalid, expired, or bound to another query or database lineage |
 
+For expired `event.history` cursors, `error.data` includes `pruned_through`, `recovery_cursor`, and `earliest_retained`. The latter is the first global retained sequence as a string and its original Unix timestamp `at`. Use the same filter with `recovery_cursor`.
+
 The endpoint uses a user-owned state directory with mode `0700`, a socket with mode `0600`, peer UID validation, and an exclusive lock for the daemon. The server accepts up to 32 active connections. Requests are capped at 64 KiB and responses at 4 MiB, excluding delimiters. Reads and writes have five-second deadlines. The server closes idle connections and connections that send an oversized request.
 
 See [Laravel runtime and queue discovery](laravel-discovery.md) for selection precedence, limits, and the bootstrap trust boundary.

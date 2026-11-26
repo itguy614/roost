@@ -47,7 +47,12 @@ impl WorkerCall {
 
     pub fn execute(self, service: &DaemonService) -> Result<Value, RpcError> {
         let mut supervisor = service.workers.lock().map_err(|_| internal_error())?;
-        let store = Store::open(&service.db).map_err(store_error)?;
+        let store = if matches!(self, Self::Stop(_) | Self::ListProcesses(_)) {
+            Store::open_for_metric_writes(&service.db)
+        } else {
+            Store::open(&service.db)
+        }
+        .map_err(store_error)?;
         match self {
             Self::Create(params) => {
                 let key = request_key("worker.profile.create", &params)?;

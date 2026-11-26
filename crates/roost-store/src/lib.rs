@@ -79,6 +79,13 @@ const EVENTS: &CStr = match CStr::from_bytes_with_nul(
     Err(_) => panic!("migration contains NUL"),
 };
 
+const ALERT_CLOCK: &CStr = match CStr::from_bytes_with_nul(
+    concat!(include_str!("../migrations/009_alert_clock.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -136,20 +143,23 @@ impl Store {
                     store.0.exec(SCHEDULER)?;
                 }
                 Some("3") => store.0.exec(SCHEDULER)?,
-                Some("4" | "5" | "6" | "7" | "8") => (),
+                Some("4" | "5" | "6" | "7" | "8" | "9") => (),
                 _ => return Err(Error::Schema),
             }
-            if !matches!(version, Some("5" | "6" | "7" | "8")) {
+            if !matches!(version, Some("5" | "6" | "7" | "8" | "9")) {
                 store.0.exec(PROCESS_METRICS)?;
             }
-            if !matches!(version, Some("6" | "7" | "8")) {
+            if !matches!(version, Some("6" | "7" | "8" | "9")) {
                 store.0.exec(QUEUE_METRICS)?;
             }
-            if !matches!(version, Some("7" | "8")) {
+            if !matches!(version, Some("7" | "8" | "9")) {
                 store.0.exec(QUEUE_HISTORY_COVERAGE)?;
             }
-            if version != Some("8") {
+            if !matches!(version, Some("8" | "9")) {
                 store.0.exec(EVENTS)?;
+            }
+            if version != Some("9") {
+                store.0.exec(ALERT_CLOCK)?;
             }
             Ok(())
         })
@@ -157,6 +167,12 @@ impl Store {
 
     pub fn open(path: &Path) -> Result<Self, Error> {
         Ok(Self(sqlite::Connection::open(path, false)?))
+    }
+
+    pub fn open_without_busy_wait(path: &Path) -> Result<Self, Error> {
+        let store = Self::open(path)?;
+        store.0.exec(c"PRAGMA busy_timeout = 0")?;
+        Ok(store)
     }
 
     fn transaction<T, E: From<Error>>(
@@ -493,7 +509,7 @@ mod tests {
 
     #[test]
     fn crash_event_failure_rolls_back_report_and_retention_expires_pinned_cursor() {
-        use crate::{events::EventQuery, metrics::HistoryPage};
+        use crate::events::{EventPage, EventQuery};
         use roost_core::{
             scheduler::{SchedulerMode, SchedulerProfile, SchedulerProfileId},
             worker_runtime::{ProcessExit, ProcessLease, WorkerLeaseState},
@@ -587,7 +603,7 @@ mod tests {
                 .output
                 .is_empty()
         );
-        let HistoryPage::Rows { state, rows } = store
+        let EventPage::Rows { state, rows } = store
             .event_history(EventQuery {
                 project: Some(project.id),
                 lineage: None,
@@ -602,7 +618,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], serde_json::json!(id));
         store.0.exec(c"WITH RECURSIVE samples(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM samples WHERE n<2048)
-            INSERT INTO daemon_events(id,project_id,kind,data) SELECT 'seed-'||n,'other','process_crash','{}' FROM samples").unwrap();
+            INSERT INTO daemon_events(id,project_id,kind,data) SELECT 'seed-'||n,'other','process_crash',json_object('at',1800000000+n) FROM samples").unwrap();
         let event = roost_core::event::Event {
             id: Uuid::new_v4(),
             project_id: project.id,
@@ -615,7 +631,10 @@ mod tests {
             actions_suppressed: false,
         };
         store.record_recovery_failure(&event).unwrap();
-        let HistoryPage::Expired(retained) = store
+        let EventPage::Expired {
+            state: retained,
+            earliest: Some(earliest),
+        } = store
             .event_history(EventQuery {
                 project: Some(project.id),
                 lineage: Some(&state.lineage),
@@ -628,7 +647,9 @@ mod tests {
             panic!("expected expired cursor")
         };
         assert_eq!(retained.pruned, 2);
-        let HistoryPage::Rows { rows, .. } = store
+        assert_eq!(earliest.sequence, "3");
+        assert_eq!(earliest.at, 1_800_000_002);
+        let EventPage::Rows { rows, .. } = store
             .event_history(EventQuery {
                 project: Some(project.id),
                 lineage: Some(&state.lineage),
@@ -687,22 +708,24 @@ mod tests {
             breach_at: 1,
             restart: true,
         };
-        let open = |store: &Store, rule: &Rule, revision, at| {
+        let episode = |rule: &Rule, revision, at| Episode {
+            id: Uuid::new_v4(),
+            identity,
+            rule: rule.clone(),
+            rule_revision: revision,
+            opened_at: at,
+            breach_observed_at: at,
+            breach_evidence: Evidence::RssBytes(3),
+            actions_suppressed: false,
+            restart_charged: false,
+            restart_deferred: None,
+        };
+        let open = |store: &Store, rule: &Rule, revision, wall, elapsed| {
             store
-                .open_alert(
-                    Episode {
-                        id: Uuid::new_v4(),
-                        identity,
-                        rule: rule.clone(),
-                        rule_revision: revision,
-                        opened_at: at,
-                        breach_observed_at: at,
-                        breach_evidence: Evidence::RssBytes(3),
-                        actions_suppressed: false,
-                        restart_charged: false,
-                    },
-                    true,
-                )
+                .stage_alert(episode(rule, revision, wall), elapsed)
+                .unwrap()
+                .unwrap()
+                .commit()
                 .unwrap()
         };
         store
@@ -710,7 +733,28 @@ mod tests {
                 store.replace_alert_rules(&profile, &[], std::slice::from_ref(&rule), 10000)
             })
             .unwrap();
-        let first = open(&store, &rule, profile.revision, 10001);
+        let blocker = Store::open(&db).unwrap();
+        blocker.0.exec(c"BEGIN").unwrap();
+        blocker
+            .0
+            .query(c"SELECT count(*) FROM alert_episodes", &[])
+            .unwrap();
+        let writer = Store::open_without_busy_wait(&db).unwrap();
+        let staged = writer
+            .stage_alert(episode(&rule, profile.revision, 10001), 0)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(staged.commit(), Err(Error::Sql(error)) if error.code & 0xff == 5));
+        assert_eq!(
+            store
+                .0
+                .query(c"SELECT count(*) FROM alert_restart_attempts", &[])
+                .unwrap(),
+            ["0"]
+        );
+        assert!(store.list_alerts(project.id, None, 1).unwrap().is_empty());
+        blocker.0.exec(c"ROLLBACK").unwrap();
+        let first = open(&store, &rule, profile.revision, 10001, 0);
         assert!(first.restart_charged);
         let prior = store.alert_rules(&[profile.id]).unwrap();
         rule = Rule::RssBytes {
@@ -731,18 +775,55 @@ mod tests {
         );
         drop(store);
         let store = Store::open(&db).unwrap();
-        let suppressed = open(&store, &rule, profile.revision, 10010);
+        let suppressed = open(&store, &rule, profile.revision, 9_000_000, 10);
         assert!(suppressed.actions_suppressed && !suppressed.restart_charged);
         store.close_previous_alerts(10011).unwrap();
-        let second = open(&store, &rule, profile.revision, 10302);
+        let second = open(&store, &rule, profile.revision, 1, 302);
         assert!(second.restart_charged);
         store.close_alert(second.id, 10303, "recovered").unwrap();
-        let capped = open(&store, &rule, profile.revision, 10603);
+        let capped = open(&store, &rule, profile.revision, 2, 603);
         assert!(!capped.actions_suppressed && !capped.restart_charged);
         store
             .close_alert(capped.id, 10604, "generation_ended")
             .unwrap();
-        assert!(open(&store, &rule, profile.revision, 13602).restart_charged);
+        assert!(open(&store, &rule, profile.revision, 3, 3601).restart_charged);
+
+        // An unreleased v8 installation may already have wall-clock charges.
+        // Rebase that schema and keep every charge through a full fresh window.
+        store.close_previous_alerts(20).unwrap();
+        store
+            .0
+            .exec(
+                c"DROP TABLE alert_clock; PRAGMA user_version = 8;
+            UPDATE alert_restart_attempts SET charged_at=999999;
+            UPDATE alert_cooldowns SET until_at=1000299",
+            )
+            .unwrap();
+        drop(store);
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.alert_elapsed().unwrap(), 0);
+        assert_eq!(
+            store
+                .0
+                .query(
+                    c"SELECT charged_at FROM alert_restart_attempts ORDER BY episode_id",
+                    &[]
+                )
+                .unwrap(),
+            ["0", "0"]
+        );
+        let cooldown = open(&store, &rule, profile.revision, 9_000_000, 299);
+        assert!(cooldown.actions_suppressed && !cooldown.restart_charged);
+        store
+            .close_alert(cooldown.id, 9_000_001, "recovered")
+            .unwrap();
+        let capped = open(&store, &rule, profile.revision, 9_000_002, 3599);
+        assert!(!capped.actions_suppressed && !capped.restart_charged);
+        store
+            .close_alert(capped.id, 9_000_003, "recovered")
+            .unwrap();
+        assert!(open(&store, &rule, profile.revision, 9_000_004, 3900).restart_charged);
     }
 
     #[test]
@@ -752,7 +833,7 @@ mod tests {
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["9"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -760,9 +841,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 9").unwrap();
+        store.0.exec(c"PRAGMA user_version = 10").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["9"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["10"]);
     }
 
     #[test]
@@ -784,7 +865,7 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["9"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
         assert_eq!(old.get_group(group.id).unwrap(), Some(group.clone()));
         assert_eq!(

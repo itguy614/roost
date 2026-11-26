@@ -73,11 +73,26 @@ fn main() -> ExitCode {
         println!("worker ready");
     }
     eprintln!("Authorization: Bearer secret-fixture-output");
+    let pid = std::process::id().to_string();
+    let mut memory = Vec::new();
+    let mut cpu_load = false;
+    let mut next_check = std::time::Instant::now();
     while !STOP.load(Ordering::Relaxed) {
+        if matches!(behavior.as_str(), "controlled-rss" | "controlled-cpu") && std::time::Instant::now() >= next_check {
+            next_check = std::time::Instant::now() + Duration::from_millis(200);
+            cpu_load = behavior == "controlled-cpu" && fs::read_to_string("cpu-load-pid").is_ok_and(|target| target == pid);
+            let selected = behavior == "controlled-rss" && fs::read_to_string("rss-load-pid").is_ok_and(|target| target == pid);
+            if selected && memory.is_empty() {
+                memory = vec![1u8; 64 * 1024 * 1024];
+                std::hint::black_box(&memory);
+            } else if !selected && !memory.is_empty() {
+                memory = Vec::new();
+            }
+        }
         if behavior == "soak_crash" && fs::remove_file("exit-once").is_ok() {
             return ExitCode::from(7);
         }
-        if behavior == "loaded" {
+        if behavior == "loaded" || cpu_load {
             let until = std::time::Instant::now() + Duration::from_millis(2);
             while std::time::Instant::now() < until {
                 std::hint::spin_loop();

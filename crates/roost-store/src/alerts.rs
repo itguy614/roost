@@ -85,49 +85,90 @@ impl Store {
         Ok(())
     }
 
-    pub fn open_alert(&self, mut episode: Episode, allow_restart: bool) -> Result<Episode, Error> {
-        self.transaction(|store| {
-            let profile = episode.identity.profile_id.to_string();
-            let project = episode.identity.project_id.0.to_string();
-            let slot = episode.identity.slot.to_string();
-            let metric = episode.rule.metric().name();
-            let at = episode.opened_at;
-            let now = at.to_string();
-            let id = episode.id.to_string();
-            episode.actions_suppressed = store.0.query(c"SELECT 1 FROM alert_cooldowns
+    pub fn alert_elapsed(&self) -> Result<u64, Error> {
+        self.0
+            .query(c"SELECT elapsed FROM alert_clock", &[])?
+            .first()
+            .and_then(|value| value.parse().ok())
+            .ok_or(Error::Schema)
+    }
+
+    pub fn stage_alert(
+        &self,
+        episode: Episode,
+        elapsed: u64,
+    ) -> Result<Option<AlertWrite<'_>>, Error> {
+        self.0.exec(c"BEGIN IMMEDIATE")?;
+        let mut write = AlertWrite {
+            store: self,
+            committed: false,
+            episode,
+        };
+        let current = self.alert_rules(&[WorkerProfileId(write.episode.identity.profile_id)])?;
+        if !current.iter().any(|rule| {
+            rule.revision == write.episode.rule_revision && rule.rule == write.episode.rule
+        }) {
+            return Ok(None);
+        }
+        self.insert_alert(&mut write.episode, elapsed)?;
+        Ok(Some(write))
+    }
+
+    fn insert_alert(&self, episode: &mut Episode, elapsed: u64) -> Result<(), Error> {
+        let store = self;
+        let profile = episode.identity.profile_id.to_string();
+        let project = episode.identity.project_id.0.to_string();
+        let slot = episode.identity.slot.to_string();
+        let metric = episode.rule.metric().name();
+        let at = episode.opened_at;
+        let elapsed = store.alert_elapsed()?.max(elapsed);
+        let now = elapsed.to_string();
+        let id = episode.id.to_string();
+        store.0.query(
+            c"UPDATE alert_clock SET elapsed=?1 WHERE singleton=1",
+            &[Some(&now)],
+        )?;
+        episode.actions_suppressed = store.0.query(
+            c"SELECT 1 FROM alert_cooldowns
                 WHERE profile_id=?1 AND slot=?2 AND metric=?3 AND until_at>?4",
-                &[Some(&profile),Some(&slot),Some(metric),Some(&now)])? == ["1"];
-            if !episode.actions_suppressed {
-                let until = at.saturating_add(300).to_string();
-                store.0.query(c"INSERT INTO alert_cooldowns VALUES (?1,?2,?3,?4)
+            &[Some(&profile), Some(&slot), Some(metric), Some(&now)],
+        )? == ["1"];
+        if !episode.actions_suppressed {
+            let until = elapsed.saturating_add(300).to_string();
+            store.0.query(
+                c"INSERT INTO alert_cooldowns VALUES (?1,?2,?3,?4)
                     ON CONFLICT(profile_id,slot,metric) DO UPDATE SET until_at=excluded.until_at",
-                    &[Some(&profile),Some(&slot),Some(metric),Some(&until)])?;
-                if allow_restart && episode.rule.restart() {
-                    let floor = at.saturating_sub(3600).to_string();
-                    store.0.query(c"DELETE FROM alert_restart_attempts WHERE charged_at<=?1", &[Some(&floor)])?;
-                    store.0.query(c"INSERT INTO alert_restart_attempts(episode_id,profile_id,slot,charged_at)
+                &[Some(&profile), Some(&slot), Some(metric), Some(&until)],
+            )?;
+            if episode.rule.restart() && episode.restart_deferred.is_none() {
+                if let Some(floor) = elapsed.checked_sub(3600) {
+                    store.0.query(
+                        c"DELETE FROM alert_restart_attempts WHERE charged_at<=?1",
+                        &[Some(&floor.to_string())],
+                    )?;
+                }
+                store.0.query(c"INSERT INTO alert_restart_attempts(episode_id,profile_id,slot,charged_at)
                         SELECT ?1,?2,?3,?4 WHERE (SELECT count(*) FROM alert_restart_attempts WHERE profile_id=?2 AND slot=?3)<2",
                         &[Some(&id),Some(&profile),Some(&slot),Some(&now)])?;
-                    episode.restart_charged = store.0.changes() == 1;
-                }
+                episode.restart_charged = store.0.changes() == 1;
             }
-            store.0.query(c"INSERT INTO alert_episodes(id,project_id,profile_id,slot,metric,data) VALUES (?1,?2,?3,?4,?5,?6)",
+        }
+        store.0.query(c"INSERT INTO alert_episodes(id,project_id,profile_id,slot,metric,data) VALUES (?1,?2,?3,?4,?5,?6)",
                 &[Some(&id),Some(&project),Some(&profile),Some(&slot),Some(metric),Some(&serde_json::to_string(&episode)?)])?;
-            store.append_event(&Event {
-                id: episode.id,
-                project_id: episode.identity.project_id,
-                profile_id: episode.identity.profile_id,
-                slot: episode.identity.slot,
-                process_kind: episode.identity.kind,
-                kind: EventKind::ResourceThreshold,
-                at,
-                crash_id: None,
-                actions_suppressed: episode.actions_suppressed,
-            })?;
-            store.0.exec(c"DELETE FROM alert_episodes WHERE sequence IN (
+        store.append_event(&Event {
+            id: episode.id,
+            project_id: episode.identity.project_id,
+            profile_id: episode.identity.profile_id,
+            slot: episode.identity.slot,
+            process_kind: episode.identity.kind,
+            kind: EventKind::ResourceThreshold,
+            at,
+            crash_id: None,
+            actions_suppressed: episode.actions_suppressed,
+        })?;
+        store.0.exec(c"DELETE FROM alert_episodes WHERE sequence IN (
                 SELECT sequence FROM alert_episodes WHERE closed_at IS NOT NULL ORDER BY sequence DESC LIMIT -1 OFFSET 2048)")?;
-            Ok(episode)
-        })
+        Ok(())
     }
 
     pub fn close_alert(&self, id: Uuid, at: u64, reason: &str) -> Result<(), Error> {
@@ -151,5 +192,28 @@ impl Store {
         self.0.query(c"SELECT json_set(data,'$.sequence',CAST(sequence AS TEXT),'$.closed_at',closed_at,'$.closed_reason',closed_reason)
             FROM alert_episodes WHERE project_id=?1 AND (?2 IS NULL OR sequence < ?2) ORDER BY sequence DESC LIMIT ?3",
             &[Some(&project.0.to_string()),before.map(|value| value.to_string()).as_deref(),Some(&limit.to_string())])?.iter().map(|row| serde_json::from_str(row).map_err(Error::from)).collect()
+    }
+}
+
+/// A dropped or rejected episode rolls back its event and attempt charge.
+pub struct AlertWrite<'a> {
+    store: &'a Store,
+    committed: bool,
+    episode: Episode,
+}
+
+impl AlertWrite<'_> {
+    pub fn commit(mut self) -> Result<Episode, Error> {
+        self.store.0.exec(c"COMMIT")?;
+        self.committed = true;
+        Ok(self.episode.clone())
+    }
+}
+
+impl Drop for AlertWrite<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.store.0.exec(c"ROLLBACK");
+        }
     }
 }

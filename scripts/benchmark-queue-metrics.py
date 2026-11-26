@@ -96,8 +96,69 @@ def database_stats(state, measured_from):
         return raw, gap, queues, outages
 
 
+class AlertWorkload:
+    """One recoverable spike, then one spike eligible for a guardian restart."""
+
+    def __init__(self, root, client, project, enabled):
+        self.marker = root / "supervised" / "rss-load-pid"
+        self.project = project
+        self.enabled = enabled
+        profiles = sorted(client.request("worker.profile.list", project), key=lambda profile: profile["name"])
+        self.slots = [next(slot for slot in client.request("process.list", project)
+                           if slot["profile_id"] == profile["id"] and slot["slot"] == 0) for profile in profiles]
+        if enabled:
+            for index, profile in enumerate(profiles):
+                client.request("metrics.thresholds.update", {"profile_id": profile["id"],
+                    "expected_revision": profile["revision"], "rules": [
+                        {"metric": "cpu_percent", "clear_at": 8000, "breach_at": 10000},
+                        {"metric": "rss_bytes", "clear_at": 16 * 1024 ** 2, "breach_at": 32 * 1024 ** 2,
+                         "restart": index == 1},
+                    ]})
+        self.schedule = iter([(12, 0), (32, None), (52, 1), (76, None)])
+        self.next_change = next(self.schedule, None)
+        self.spikes_observed = set()
+        self.spike = None
+
+    def tick(self, now):
+        if self.next_change and now >= self.next_change[0]:
+            _, self.spike = self.next_change
+            self.next_change = next(self.schedule, None)
+            if self.spike is None:
+                self.marker.unlink(missing_ok=True)
+            else:
+                self.marker.write_text(str(self.slots[self.spike]["identity"]["pid"]))
+
+    def observe(self, method, response):
+        if method != "metrics.process.current" or self.spike is None:
+            return
+        original = self.slots[self.spike]
+        if any(item["identity"]["instance_id"] == original["id"]
+               and item["identity"]["generation"] == original["generation"]
+               and (item["rss_bytes"].get("value") or 0) >= 32 * 1024 ** 2
+               for item in response["processes"]):
+            self.spikes_observed.add(self.spike)
+
+    def finish(self, client):
+        assert self.spikes_observed == {0, 1}, self.spikes_observed
+        query = {"project_id": self.project["id"]}
+        alerts = client.request("metrics.alerts.list", query)["alerts"]
+        events = client.request("event.history", query)["items"]
+        slots = client.request("process.list", self.project)
+        restarted = [slot for slot in slots if slot["restarts"] > 0]
+        recovered = [alert for alert in alerts if alert["closed_reason"] == "recovered"]
+        charged = [alert for alert in alerts if alert["restart_charged"]]
+        expect = int(self.enabled)
+        assert len(alerts) == len(events) == 2 * expect, (alerts, events)
+        assert len(recovered) == len(charged) == len(restarted) == expect
+        if restarted:
+            assert restarted[0]["last_exit"]["stop_cause"] == "resource_threshold"
+            assert restarted[0]["generation"] == 2
+        return {"alert_episodes": len(alerts), "alert_recoveries": len(recovered),
+                "alert_restarts": len(restarted), "controlled_spikes": len(self.spikes_observed)}
+
+
 def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket, redis_pid, variant, loaded,
-              enabled_projects=None, soak=False, thresholds=False):
+              enabled_projects=None, soak=False, thresholds=False, alert_workload=None):
     enabled_projects = (0 if variant == "baseline" else 8) if enabled_projects is None else enabled_projects
     enabled = enabled_projects > 0
     root.mkdir()
@@ -107,7 +168,7 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
         client = None
         try:
             client = FIXTURE["ready"](lambda: FIXTURE["connect"](state))
-            launch, running = FIXTURE["start_supervision"](root, client, 31, loaded)
+            launch, running = FIXTURE["start_supervision"](root, client, 31, loaded, controlled_rss=alert_workload is not None)
             supervised = {"id": launch["id"]}
             if thresholds:
                 for profile in client.request("worker.profile.list", supervised):
@@ -116,6 +177,7 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                             {"metric": "cpu_percent", "clear_at": 8000, "breach_at": 10000},
                             {"metric": "rss_bytes", "clear_at": 0, "breach_at": 1},
                         ]})
+            trial = None if alert_workload is None else AlertWorkload(root, client, supervised, alert_workload)
             projects = []
             for i in range(8):
                 app = root / f"queue-{i}"
@@ -147,7 +209,7 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                          "from": int(wall_start) - 600, "limit": 256})]
             if enabled or variant == "scale":
                 methods.append(("metrics.queue.current", projects[0][1]))
-            if thresholds:
+            if thresholds or trial:
                 methods.extend([("metrics.alerts.list", {"project_id": launch["id"]}),
                                 ("event.history", {"project_id": launch["id"]})])
             latencies = {name: [] for name, _ in methods}
@@ -158,10 +220,14 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                 while (running_for := time.monotonic() - elapsed_start) < seconds:
                     if faults:
                         faults.tick(client, running_for)
+                    if trial:
+                        trial.tick(running_for)
                     for name, params in methods:
                         before = time.monotonic()
-                        client.request(name, params)
+                        response = client.request(name, params)
                         latencies[name].append((time.monotonic() - before) * 1000)
+                        if trial:
+                            trial.observe(name, response)
                     rss_peak = max(rss_peak, HELPERS["process_usage"](daemon.pid)[1])
                     size_peak = max(size_peak, HELPERS["state_size"](state))
                     if faults and running_for >= next_checkpoint:
@@ -184,8 +250,11 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                     assert any(offset > 120 for offset in faults.herd_lookups.values()), fault_result
             wall_end = time.time()
             elapsed = time.monotonic() - elapsed_start
-            cpu_end, child_end, redis_end, guardian_end = cpu_snapshot(accounting, daemon.pid, redis_pid, guardians)
-            assert guardians == guardian_pids(daemon.pid)
+            ending_guardians = guardian_pids(daemon.pid)
+            cpu_end, child_end, redis_end, guardian_end = cpu_snapshot(accounting, daemon.pid, redis_pid, ending_guardians)
+            retired = len(set(guardians) - set(ending_guardians))
+            assert len(ending_guardians) == len(guardians) == 32
+            assert retired == int(alert_workload is True)
             assert running()
             usages = []
             for app, _ in projects:
@@ -201,13 +270,14 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                 alerts = client.request("metrics.alerts.list", {"project_id": launch["id"]})["alerts"]
                 active_alerts = sum(alert["state"] == "active" for alert in alerts)
                 assert active_alerts == 31
+            alert_result = trial.finish(client) if trial else {}
             daemon_cpu = cpu_end - cpu_start
             children_cpu = child_end - child_start
             guardian_cpu = guardian_end - guardian_start
             redis_cpu = redis_end - redis_start
-            # The measurement window has no guardian replacements. All
-            # activity charged to reaped children comes from the probes and
-            # their descendants, including Herd resolution subprocesses.
+            # Reaped descendant CPU plus the net change across live guardians
+            # counts each retired guardian once. It also counts any retired
+            # stand-in worker, conservatively, in the alert-on arm.
             if enabled:
                 assert children_cpu > 0, "Darwin did not report reaped probe CPU"
             php_cpu = sum(row["cpu_seconds"] for row in usages)
@@ -232,6 +302,8 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                 "daemon_warnings": warnings[:20],
                 "worst_last_interval_rpc_p95_ms": max((HELPERS["percentiles"](times[checkpoint_reads:])["p95"]
                     for times in latencies.values() if times[checkpoint_reads:]), default=None),
+                "retired_guardians": retired,
+                **alert_result,
                 **fault_result,
                 "rpc_ms": {name: {**HELPERS["percentiles"](times), "max": round(max(times), 3)}
                            for name, times in latencies.items()}}), flush=True)
@@ -462,14 +534,18 @@ def main():
     modes.add_argument("--herd-only", action="store_true")
     modes.add_argument("--scale", action="store_true")
     modes.add_argument("--soak", action="store_true")
+    modes.add_argument("--alert-comparison", action="store_true")
+    parser.add_argument("--alerts-first", action="store_true", help="reverse the alert comparison order")
     args = parser.parse_args()
     if args.herd_only and not args.laravel13:
         parser.error("--laravel13 is required for a Herd measurement")
     if args.thresholds and not args.candidate_only:
         parser.error("--thresholds requires --candidate-only")
+    if args.alert_comparison and (args.seconds < 100 or args.interval > 2):
+        parser.error("--alert-comparison needs at least 100 seconds and an interval at most two seconds")
     if args.soak and args.seconds < 3600:
         parser.error("--soak requires at least 3600 seconds")
-    if not (args.storage_only or args.herd_only) and not all((args.baseline or args.candidate_only or args.scale or args.soak, args.candidate, args.laravel13)):
+    if not (args.storage_only or args.herd_only) and not all((args.baseline or args.candidate_only or args.scale or args.soak or args.alert_comparison, args.candidate, args.laravel13)):
         parser.error("live runs require --candidate, --laravel13, and either --baseline or --candidate-only")
     with tempfile.TemporaryDirectory(prefix="roost-qb-", dir="/private/tmp") as location:
         root = Path(location)
@@ -493,6 +569,12 @@ def main():
             FIXTURE["ready"](sock.exists)
             subprocess.run(["redis-cli", "-s", str(sock), "acl", "setuser", "roost_probe", "on",
                 ">fixture-password", "~queues:*", "-@all", "+llen", "+select"], check=True, stdout=subprocess.DEVNULL)
+            if args.alert_comparison:
+                for enabled in (args.alerts_first, not args.alerts_first):
+                    label = "alerts-on" if enabled else "alerts-off"
+                    benchmark(root / label, args.candidate, accounting, args.laravel13.resolve() / "vendor",
+                              args.seconds, args.interval, sock, redis.pid, label, False, 8, alert_workload=enabled)
+                return
             if args.soak:
                 benchmark(root / "soak", args.candidate, accounting, args.laravel13.resolve() / "vendor",
                           args.seconds, args.interval, sock, redis.pid, "soak", False, 8, True)

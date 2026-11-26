@@ -33,7 +33,7 @@ impl Call {
     }
 
     pub(super) fn execute(self, service: &DaemonService) -> Result<Value, RpcError> {
-        let store = Store::open(&service.db).map_err(store_error)?;
+        let store = Store::open_for_metric_writes(&service.db).map_err(store_error)?;
         match self {
             Self::Get(params) => {
                 let (profile, rules) = store
@@ -174,10 +174,12 @@ fn list(
         let episode: Episode = serde_json::from_value(row.clone()).map_err(|_|internal_error())?;
         let active = row["closed_at"].is_null();
         row["state"] = json!(if active {"active"} else {"closed"});
-        row["restart"] = json!(if episode.restart_charged { "attempt_charged" }
+        row["restart"] = if let Some(deferred) = episode.restart_deferred {
+            json!(deferred)
+        } else { json!(if episode.restart_charged { "attempt_charged" }
             else if !episode.rule.restart() { "off" }
             else if episode.actions_suppressed { "cooldown" }
-            else { "attempt_limit" });
+            else { "attempt_limit" }) };
         let evidence = if active && owned.iter().any(|subject| subject.key == episode.identity) { current.get(&episode.identity).copied() } else { None };
         row["evidence"] = match evidence {
             Some(sample) if fresh(sample) => {

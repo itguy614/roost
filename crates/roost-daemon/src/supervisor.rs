@@ -78,23 +78,10 @@ impl Supervisor {
         store: &Store,
         subject: roost_core::metrics::MetricSubject,
     ) -> Result<Option<&mut Slot>, Error> {
-        if self.closing
-            || store.project_intent(subject.key.project_id)?.desired() != DesiredState::Running
-        {
+        if store.project_intent(subject.key.project_id)?.desired() != DesiredState::Running {
             return Ok(None);
         }
-        let Some(runtime) = self
-            .projects
-            .get_mut(&subject.key.project_id)
-            .filter(|runtime| {
-                runtime.desired == DesiredState::Running && runtime.replacement.is_none()
-            })
-        else {
-            return Ok(None);
-        };
-        let Some(slot) = runtime.slots.iter_mut().find(|slot| {
-            slot.desired() == DesiredState::Running && slot.metric_subject() == Some(subject)
-        }) else {
+        let Some(slot) = self.threshold_slot(subject) else {
             return Ok(None);
         };
         let Some(id) = slot.lease_id else {
@@ -103,6 +90,25 @@ impl Supervisor {
         let valid = store.process_lease::<roost_core::WorkerProfileId>(id)?.is_some_and(|lease|
             matches!(lease.state, WorkerLeaseState::Running { identity } if identity == subject.process));
         Ok(valid.then_some(slot))
+    }
+
+    pub(super) fn threshold_slot(
+        &mut self,
+        subject: roost_core::metrics::MetricSubject,
+    ) -> Option<&mut Slot> {
+        if self.closing {
+            return None;
+        }
+        self.projects
+            .get_mut(&subject.key.project_id)
+            .filter(|runtime| {
+                runtime.desired == DesiredState::Running && runtime.replacement.is_none()
+            })?
+            .slots
+            .iter_mut()
+            .find(|slot| {
+                slot.desired() == DesiredState::Running && slot.metric_subject() == Some(subject)
+            })
     }
 
     pub(super) fn threshold_restart(slot: &mut Slot) {

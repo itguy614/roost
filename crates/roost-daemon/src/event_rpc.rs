@@ -1,6 +1,9 @@
 use roost_core::ProjectId;
 use roost_ipc::{RpcError, events::EventHistoryParams};
-use roost_store::{Store, events::EventQuery, metrics::HistoryPage};
+use roost_store::{
+    Store,
+    events::{EventPage, EventQuery},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -59,9 +62,9 @@ pub(super) fn history(
         })
         .map_err(store_error)?;
     let (state, mut rows) = match page {
-        HistoryPage::Rows { state, rows } => (state, rows),
-        HistoryPage::DifferentLineage => return Err(cursor_error("cursor_lineage_changed")),
-        HistoryPage::Expired(state) => {
+        EventPage::Rows { state, rows } => (state, rows),
+        EventPage::DifferentLineage => return Err(cursor_error("cursor_lineage_changed")),
+        EventPage::Expired { state, earliest } => {
             let recovery_cursor = serde_json::to_string(&Cursor {
                 project,
                 lineage: state.lineage,
@@ -71,7 +74,7 @@ pub(super) fn history(
             .map_err(|_| internal_error())?;
             let mut error = cursor_error("cursor_expired");
             error.data = Some(
-                json!({"kind":"cursor_expired", "pruned_through":state.pruned.to_string(), "recovery_cursor":recovery_cursor}),
+                json!({"kind":"cursor_expired", "pruned_through":state.pruned.to_string(), "earliest_retained":earliest, "recovery_cursor":recovery_cursor}),
             );
             return Err(error);
         }

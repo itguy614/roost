@@ -133,4 +133,12 @@ pub struct Episode {
     pub breach_evidence: Evidence,
     pub actions_suppressed: bool,
     pub restart_charged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_deferred: Option<RestartDeferred>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartDeferred {
+    OtherMetric,
 }

@@ -129,20 +129,17 @@ impl Sampler {
             .next_maintenance
             .is_none_or(|next| Instant::now() >= next);
         if !current.is_empty() || maintain || self.alerts.has_open() {
-            let store = Store::open_for_metric_writes(&service.db).map_err(|_| ())?;
             let subjects = self
                 .baselines
                 .values()
                 .map(|(subject, _)| *subject)
                 .collect::<Vec<_>>();
-            let failed = self
-                .alerts
-                .tick(service, &store, &subjects, &current)
-                .is_err();
+            let failed = self.alerts.tick(service, &subjects, &current).is_err();
             if failed && !self.alerts_failed {
-                tracing::warn!("resource alert evaluation could not commit");
+                tracing::warn!("resource alert evaluation did not finish");
             }
             self.alerts_failed = failed;
+            let store = Store::open_for_metric_writes(&service.db).map_err(|_| ())?;
             let rows: Vec<_> = current
                 .values()
                 .map(|observation| observation.sample)

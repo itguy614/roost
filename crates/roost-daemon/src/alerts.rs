@@ -5,7 +5,7 @@ use std::{
 
 use roost_core::{
     Revision, WorkerProfileId,
-    alerts::{ConfiguredRule, Episode, Metric, Reading},
+    alerts::{ConfiguredRule, Episode, Metric, Reading, RestartDeferred},
     metrics::{MetricSubject, ProcessGeneration, ProcessKind},
     unix_timestamp,
 };
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     DaemonService,
+    alerts_clock::Clock,
     metrics::{Current, Observation},
     supervisor::Supervisor,
 };
@@ -24,6 +25,7 @@ const STREAK_INTERVAL: Duration = Duration::from_millis(3500);
 #[derive(Default)]
 pub(super) struct Evaluator {
     states: HashMap<(ProcessGeneration, Metric), State>,
+    clock: Option<Clock>,
 }
 
 struct State {
@@ -60,10 +62,35 @@ impl Evaluator {
     pub(super) fn tick(
         &mut self,
         service: &DaemonService,
-        store: &Store,
         subjects: &[MetricSubject],
         samples: &Current,
     ) -> Result<(), ()> {
+        let result = self.evaluate(service, subjects, samples);
+        if result.is_err() {
+            self.reset_streaks();
+        }
+        result
+    }
+
+    fn reset_streaks(&mut self) {
+        for state in self.states.values_mut() {
+            state.streak = Streak::default();
+            state.previous = None;
+        }
+    }
+
+    fn evaluate(
+        &mut self,
+        service: &DaemonService,
+        subjects: &[MetricSubject],
+        samples: &Current,
+    ) -> Result<(), ()> {
+        let store = Store::open_without_busy_wait(&service.db).map_err(|_| ())?;
+        if self.clock.is_none() {
+            self.clock = Some(Clock::new(store.alert_elapsed().map_err(|_| ())?));
+        }
+        let clock = self.clock.as_mut().ok_or(())?;
+        let eligibility = clock.sample(unix_timestamp(), Instant::now());
         let profiles: Vec<_> = subjects
             .iter()
             .filter(|subject| subject.key.kind == ProcessKind::Worker)
@@ -114,6 +141,7 @@ impl Evaluator {
                 metric.name(),
             )
         });
+        let mut restarts: Vec<Restart<'_>> = Vec::new();
         for (key, (subject, rule)) in selected {
             let state = self
                 .states
@@ -121,6 +149,11 @@ impl Evaluator {
                 .or_insert_with(|| State::new(rule.revision));
             if state.revision != rule.revision {
                 *state = State::new(rule.revision);
+            }
+            if !eligibility.verified {
+                state.streak = Streak::default();
+                state.previous = None;
+                continue;
             }
             let sample = samples
                 .get(&key.0)
@@ -140,12 +173,30 @@ impl Evaluator {
                     store.close_alert(id, now, "recovered").map_err(|_| ())?;
                     state.current = None;
                 } else if let Some(sample) = sample {
-                    state.current = open(service, store, subject, rule, sample)?;
+                    let sibling_charged = restarts.iter().any(|action| action.subject == subject);
+                    if let Some(episode) = open(
+                        service,
+                        &store,
+                        subject,
+                        rule,
+                        sample,
+                        eligibility.elapsed,
+                        sibling_charged,
+                    )? {
+                        state.current = Some(episode.id);
+                        if episode.restart_charged {
+                            restarts.push(Restart {
+                                subject,
+                                rule,
+                                sample,
+                            });
+                        }
+                    }
                 }
                 state.streak = Streak::default();
             }
         }
-        Ok(())
+        dispatch(service, &store, clock, restarts)
     }
 }
 
@@ -172,46 +223,87 @@ fn open(
     subject: MetricSubject,
     rule: &ConfiguredRule,
     sample: Observation,
-) -> Result<Option<Uuid>, ()> {
-    let mut supervisor = service.workers.lock().map_err(|_| ())?;
-    let Some(slot) = supervisor
-        .threshold_target(store, subject)
-        .map_err(|_| ())?
-    else {
-        return Ok(None);
-    };
-    if !fresh(sample)
-        || !store
-            .alert_rules(&[rule.profile_id])
-            .map_err(|_| ())?
-            .iter()
-            .any(|current| current.revision == rule.revision && current.rule == rule.rule)
-    {
-        return Ok(None);
-    }
+    elapsed: u64,
+    sibling_charged: bool,
+) -> Result<Option<Episode>, ()> {
     let Some(breach_evidence) = rule.rule.evidence(sample.sample) else {
         return Ok(None);
     };
-    let episode = store
-        .open_alert(
-            Episode {
-                id: Uuid::new_v4(),
-                identity: subject.key,
-                rule: rule.rule.clone(),
-                rule_revision: rule.revision,
-                opened_at: unix_timestamp(),
-                breach_observed_at: sample.sample.observed_at,
-                breach_evidence,
-                actions_suppressed: false,
-                restart_charged: false,
-            },
-            true,
-        )
-        .map_err(|_| ())?;
-    if episode.restart_charged && fresh(sample) {
-        Supervisor::threshold_restart(slot);
+    let episode = Episode {
+        id: Uuid::new_v4(),
+        identity: subject.key,
+        rule: rule.rule.clone(),
+        rule_revision: rule.revision,
+        opened_at: unix_timestamp(),
+        breach_observed_at: sample.sample.observed_at,
+        breach_evidence,
+        actions_suppressed: false,
+        restart_charged: false,
+        restart_deferred: (sibling_charged && rule.rule.restart())
+            .then_some(RestartDeferred::OtherMetric),
+    };
+    let Some(write) = store.stage_alert(episode, elapsed).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    // SQLite owns a write reservation. A supervisor operation could already
+    // be attempting a write, so never wait for its lock from this transaction.
+    let mut supervisor = service.workers.try_lock().map_err(|_| ())?;
+    if !fresh(sample)
+        || supervisor
+            .threshold_target(store, subject)
+            .map_err(|_| ())?
+            .is_none()
+    {
+        return Ok(None);
     }
-    Ok(Some(episode.id))
+    write.commit().map(Some).map_err(|_| ())
+}
+
+struct Restart<'a> {
+    subject: MetricSubject,
+    rule: &'a ConfiguredRule,
+    sample: Observation,
+}
+
+fn dispatch(
+    service: &DaemonService,
+    store: &Store,
+    clock: &Clock,
+    restarts: Vec<Restart<'_>>,
+) -> Result<(), ()> {
+    if restarts.is_empty() {
+        return Ok(());
+    }
+    let mut supervisor = service.workers.lock().map_err(|_| ())?;
+    let mut confirmed = Vec::new();
+    // Finish all fallible reads before signalling the first guardian. A failed
+    // cycle keeps committed charges and dispatches none of its planned actions.
+    for action in restarts {
+        if fresh(action.sample)
+            && supervisor
+                .threshold_target(store, action.subject)
+                .map_err(|_| ())?
+                .is_some()
+            && store
+                .alert_rules(&[action.rule.profile_id])
+                .map_err(|_| ())?
+                .iter()
+                .any(|rule| rule.revision == action.rule.revision && rule.rule == action.rule.rule)
+        {
+            confirmed.push(action);
+        }
+    }
+    if !clock.can_dispatch(unix_timestamp(), Instant::now()) {
+        return Err(());
+    }
+    for action in confirmed {
+        if fresh(action.sample)
+            && let Some(slot) = supervisor.threshold_slot(action.subject)
+        {
+            Supervisor::threshold_restart(slot);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,5 +334,49 @@ mod tests {
             assert!(!streak.reached(true, input));
         }
         assert!(streak.reached(true, Reading::Clear));
+    }
+    #[test]
+    fn failed_cycle_discards_breach_and_recovery_without_erasing_committed_state() {
+        use roost_core::ProjectId;
+        let identity = ProcessGeneration {
+            project_id: ProjectId(Uuid::new_v4()),
+            kind: ProcessKind::Worker,
+            profile_id: Uuid::new_v4(),
+            slot: 0,
+            instance_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let active_id = Uuid::new_v4();
+        let mut evaluator = Evaluator::default();
+        for (metric, current) in [
+            (Metric::CpuPercent, None),
+            (Metric::RssBytes, Some(active_id)),
+        ] {
+            evaluator.states.insert(
+                (identity, metric),
+                State {
+                    revision: Revision(1),
+                    streak: Streak(2),
+                    current,
+                    previous: Some(Instant::now()),
+                },
+            );
+        }
+        evaluator.reset_streaks();
+        for ((_, metric), state) in &mut evaluator.states {
+            assert!(state.previous.is_none());
+            assert_eq!(
+                state.current,
+                (*metric == Metric::RssBytes).then_some(active_id)
+            );
+            let reading = if state.current.is_some() {
+                Reading::Clear
+            } else {
+                Reading::Breach
+            };
+            assert!(!state.streak.reached(state.current.is_some(), reading));
+            assert!(!state.streak.reached(state.current.is_some(), reading));
+            assert!(state.streak.reached(state.current.is_some(), reading));
+        }
     }
 }

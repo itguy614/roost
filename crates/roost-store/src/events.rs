@@ -1,10 +1,8 @@
 use roost_core::{ProjectId, event::Event};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::{
-    Error, Store,
-    metrics::{HistoryPage, HistoryState},
-};
+use crate::{Error, Store, metrics::HistoryState};
 
 const CAPACITY: &str = "2048";
 
@@ -14,6 +12,24 @@ pub struct EventQuery<'a> {
     pub after: u64,
     pub high: Option<u64>,
     pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EventBoundary {
+    pub sequence: String,
+    pub at: u64,
+}
+
+pub enum EventPage {
+    Rows {
+        state: HistoryState,
+        rows: Vec<Value>,
+    },
+    Expired {
+        state: HistoryState,
+        earliest: Option<EventBoundary>,
+    },
+    DifferentLineage,
 }
 
 impl Store {
@@ -44,7 +60,7 @@ impl Store {
         self.transaction(|store| store.append_event(event))
     }
 
-    pub fn event_history(&self, query: EventQuery<'_>) -> Result<HistoryPage, Error> {
+    pub fn event_history(&self, query: EventQuery<'_>) -> Result<EventPage, Error> {
         #[derive(Deserialize)]
         struct State {
             lineage: String,
@@ -56,11 +72,14 @@ impl Store {
                 'high',max(pruned,coalesce((SELECT max(sequence) FROM daemon_events),0))) FROM daemon_event_state", &[])?;
             let State { lineage, pruned, high } = serde_json::from_str(state.first().ok_or(Error::Schema)?)?;
             if query.lineage.is_some_and(|value| value != lineage) {
-                return Ok(HistoryPage::DifferentLineage);
+                return Ok(EventPage::DifferentLineage);
             }
             let state = HistoryState { lineage, pruned, high };
             if query.lineage.is_some() && query.after < pruned {
-                return Ok(HistoryPage::Expired(state));
+                let first = store.0.query(c"SELECT json_object('sequence', CAST(sequence AS TEXT), 'at', json_extract(data,'$.at'))
+                    FROM daemon_events ORDER BY sequence LIMIT 1", &[])?;
+                let earliest = first.first().map(|row| serde_json::from_str(row)).transpose()?;
+                return Ok(EventPage::Expired { state, earliest });
             }
             let rows = store.0.query(c"SELECT json_set(data,'$.sequence',CAST(sequence AS TEXT))
                 FROM daemon_events WHERE (?1 IS NULL OR project_id=?1)
@@ -68,7 +87,7 @@ impl Store {
                 &[query.project.map(|id| id.0.to_string()).as_deref(), Some(&query.after.max(pruned).to_string()),
                 Some(&query.high.unwrap_or(high).to_string()),Some(&query.limit.to_string())])?
                 .iter().map(|row| serde_json::from_str(row).map_err(Error::from)).collect::<Result<_,_>>()?;
-            Ok(HistoryPage::Rows {state,rows})
+            Ok(EventPage::Rows {state,rows})
         })
     }
 }

@@ -23,3 +23,5 @@ Migration 006 stores per-project queue polling opt-in, queue series, raw samples
 Migration 007 adds queue history observation flags, a per-series 30-second slot, transition checkpoints per opted-in selector, and rollup coverage counters. Opt-out deletes the checkpoints. Retention removes unused checkpoints when the corresponding history series ages out. The migration preserves the existing queue history cursor lineage and flags older observations as legacy. Raw retention stays at 24 hours and five-minute rollups stay at seven days.
 
 Migration 008 adds an independent event sequence and retention watermark, revisioned profile rules, alert episodes, and durable cooldown and restart-attempt accounting. It preserves earlier crash reports and telemetry and does not synthesize events for crashes from earlier schema versions. See [alerts and events](alerts-and-events.md).
+
+Migration 009 adds the verified elapsed clock checkpoint for alert cooldown and restart eligibility. It conservatively re-anchors legacy window rows and preserves charged attempts, episodes, events, and process ownership.
