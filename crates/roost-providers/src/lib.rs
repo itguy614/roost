@@ -1,13 +1,14 @@
 mod connections;
+mod queue_metrics;
 mod suggestions;
 
 use std::{
-    ffi::OsString,
+    ffi::{CStr, OsString},
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use roost_core::{
@@ -17,6 +18,8 @@ use roost_core::{
 use roost_process::ProbeError;
 
 pub use connections::discover_connections;
+pub use queue_metrics::{probe_queue_depths, resolve_queue_php};
+use roost_core::queue_metrics::safe_identifier;
 pub use suggestions::suggest_queues;
 
 pub const PROVIDERS: [PhpProvider; 2] = [PhpProvider::Herd, PhpProvider::System];
@@ -75,6 +78,21 @@ impl Resolver {
         selected: Option<PhpProvider>,
         explicit: Option<&Path>,
     ) -> Result<ResolvedPhp, Error> {
+        self.resolve_before(
+            project,
+            selected,
+            explicit,
+            Instant::now() + Duration::from_millis(1450),
+        )
+    }
+
+    fn resolve_before(
+        &self,
+        project: &Project,
+        selected: Option<PhpProvider>,
+        explicit: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<ResolvedPhp, Error> {
         project.validate_location().map_err(|_| Error::Project)?;
         if selected.is_some() && explicit.is_some() {
             return Err(Error::ConflictingSelection);
@@ -91,10 +109,13 @@ impl Resolver {
             });
         }
         match selected.unwrap_or(project.provider) {
-            PhpProvider::Herd => self.herd(&project.path).map(|path| ResolvedPhp {
-                path,
-                source: PhpSource::Herd,
-            }),
+            PhpProvider::Herd => {
+                self.herd_before(&project.path, deadline)
+                    .map(|path| ResolvedPhp {
+                        path,
+                        source: PhpSource::Herd,
+                    })
+            }
             PhpProvider::System => self.system(&project.path).map(|path| ResolvedPhp {
                 path,
                 source: PhpSource::System,
@@ -119,6 +140,10 @@ impl Resolver {
     }
 
     fn herd(&self, project: &Path) -> Result<PathBuf, Error> {
+        self.herd_before(project, Instant::now() + Duration::from_millis(1450))
+    }
+
+    fn herd_before(&self, project: &Path, deadline: Instant) -> Result<PathBuf, Error> {
         let dir = self.herd_dir().ok_or(Error::HerdUnavailable)?;
         let bootstrap = executable(&dir.join("php")).ok_or(Error::HerdUnavailable)?;
         let phar = dir.join("herd.phar");
@@ -127,10 +152,17 @@ impl Resolver {
         }
         let mut command = self.command(&bootstrap, project);
         command.arg(phar).arg("which-php");
-        let stdout = roost_process::run_probe(
+        let mut environment = self.environment();
+        if let Some(user) = login_name() {
+            // Herd's site lookup expects USER. The Laravel probe does not
+            // inherit this lookup-specific environment variable.
+            environment.push(("USER", user));
+        }
+        let stdout = roost_process::run_probe_before(
             command,
-            &self.environment(),
-            Duration::from_millis(1200),
+            &environment,
+            deadline - Duration::from_millis(250),
+            deadline,
             32 * 1024,
         )
         .map_err(Error::HerdProbe)?;
@@ -184,6 +216,31 @@ impl Resolver {
     }
 }
 
+fn login_name() -> Option<OsString> {
+    let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = [0; 4096];
+    let mut result = std::ptr::null_mut();
+    // SAFETY: getpwuid_r fills caller-owned storage and result points into
+    // that storage on success. Copy the login name before it goes away.
+    unsafe {
+        if libc::getpwuid_r(
+            libc::geteuid(),
+            passwd.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        ) != 0
+            || result.is_null()
+            || (*result).pw_name.is_null()
+        {
+            return None;
+        }
+        Some(OsString::from_vec(
+            CStr::from_ptr((*result).pw_name).to_bytes().to_vec(),
+        ))
+    }
+}
+
 fn executable(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -191,19 +248,6 @@ fn executable(path: &Path) -> Option<PathBuf> {
     let path = fs::canonicalize(path).ok()?;
     let metadata = path.metadata().ok()?;
     (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(path)
-}
-
-fn safe_identifier(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    !name.is_empty()
-        && name.len() <= 96
-        && (name.as_bytes()[0].is_ascii_alphanumeric() || name.starts_with('{'))
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:{}".contains(&byte))
-        && !["ghp_", "github_pat_", "sk-", "xox", "akia", "asia", "eyj"]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
 }
 
 #[cfg(all(test, target_os = "macos"))]

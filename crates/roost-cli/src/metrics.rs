@@ -54,13 +54,7 @@ impl Command {
                                     .map_err(|_| io::Error::other("profile ID must be a UUID"))?,
                             )
                         }
-                        "--resolution" => {
-                            params.resolution = match value {
-                                "raw" => Resolution::Raw,
-                                "5m" => Resolution::FiveMinutes,
-                                _ => return Err(io::Error::other("resolution must be raw or 5m")),
-                            }
-                        }
+                        "--resolution" => params.resolution = resolution(value)?,
                         _ => return Err(io::Error::other("unknown metrics history option")),
                     }
                 }
@@ -84,8 +78,16 @@ impl Command {
     }
 }
 
-fn number<T: std::str::FromStr>(value: &str) -> io::Result<T> {
+pub(super) fn number<T: std::str::FromStr>(value: &str) -> io::Result<T> {
     value
         .parse()
         .map_err(|_| io::Error::other("expected an unsigned integer"))
+}
+
+pub(super) fn resolution(value: &str) -> io::Result<Resolution> {
+    match value {
+        "raw" => Ok(Resolution::Raw),
+        "5m" => Ok(Resolution::FiveMinutes),
+        _ => Err(io::Error::other("resolution must be raw or 5m")),
+    }
 }

@@ -1,15 +1,43 @@
-use std::{ffi::OsString, process::Command, time::Duration};
+use std::{
+    ffi::OsString,
+    process::Command,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeCleanup {
+    Ready,
+    Retrying,
+    Blocked,
+}
 
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
+mod cleanup;
 #[cfg(target_os = "macos")]
-static CLEANUP_PENDING: AtomicUsize = AtomicUsize::new(0);
+use cleanup::{defer, status};
+
+pub fn probe_cleanup_status() -> ProbeCleanup {
+    #[cfg(target_os = "macos")]
+    {
+        status()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ProbeCleanup::Ready
+    }
+}
+
+pub fn retry_probe_cleanup() {
+    #[cfg(target_os = "macos")]
+    cleanup::retry();
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     #[error("could not launch or read the probe process")]
     Io(#[from] std::io::Error),
+    #[error("could not launch the probe executable")]
+    Launch(std::io::Error),
     #[error("probe exceeded its time limit")]
     Timeout,
     #[error("probe exceeded its output limit")]
@@ -23,122 +51,134 @@ pub enum ProbeError {
 }
 
 /// Run a short read-only-by-contract probe in an owned process group.
-/// Only stdout is retained. Stderr counts toward the same output limit.
-#[cfg(target_os = "macos")]
 pub fn run_probe(
-    mut command: Command,
+    command: Command,
     environment: &[(&str, OsString)],
     duration: Duration,
     limit: usize,
 ) -> Result<Vec<u8>, ProbeError> {
-    use std::{process::Stdio, thread, time::Instant};
+    let execution_deadline = Instant::now() + duration;
+    run_probe_before(
+        command,
+        environment,
+        execution_deadline,
+        execution_deadline + Duration::from_millis(250),
+        limit,
+    )
+}
 
-    // Refuse new probes while a previously killed child is still unreaped.
-    // The daemon separately limits in-flight probes, bounding cleanup threads.
-    if CLEANUP_PENDING.load(Ordering::Acquire) != 0 {
+/// Only stdout is retained. Stderr counts toward the same output limit.
+#[cfg(target_os = "macos")]
+pub fn run_probe_before(
+    mut command: Command,
+    environment: &[(&str, OsString)],
+    execution_deadline: Instant,
+    cleanup_deadline: Instant,
+    limit: usize,
+) -> Result<Vec<u8>, ProbeError> {
+    use std::{process::Stdio, thread};
+
+    if probe_cleanup_status() != ProbeCleanup::Ready {
         return Err(ProbeError::Cleanup);
+    }
+    if Instant::now() >= execution_deadline {
+        return Err(ProbeError::Timeout);
     }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = crate::spawn_session(command, Some(environment))?;
+    let mut child = crate::spawn_session(command, Some(environment)).map_err(ProbeError::Launch)?;
     let pid = child.id() as libc::pid_t;
-    // spawn_in_session only returns after setsid and exec succeed. The child
-    // PID stays pinned until we reap it, including if its leader exits first.
+    // Keep the leader PID pinned until the group is empty. An exited leader
+    // can still have live descendants holding inherited pipes.
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut waited = false;
+    let mut signaled = false;
     let result = (|| {
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
-        let until = Instant::now() + duration;
         let mut output = Vec::new();
         let mut bytes = 0;
-        let mut exited = false;
         loop {
-            if !exited && crate::macos::exited(pid)? {
-                // Stop background helpers still in the group before final pipe reads.
+            let exited = crate::macos::exited(pid)?;
+            if exited && !signaled {
                 terminate_group(pid, true)?;
-                exited = true;
+                signaled = true;
             }
-            let stdout_empty = read_pass(&mut stdout, &mut bytes, limit, Some(&mut output))?;
-            let stderr_empty = read_pass(&mut stderr, &mut bytes, limit, None)?;
-            if exited && stdout_empty && stderr_empty {
-                waited = true;
-                let status = child.wait()?;
-                return if status.success() {
-                    Ok(output)
-                } else {
-                    Err(ProbeError::Exit)
-                };
-            }
-            if Instant::now() >= until {
+            let out_idle = read_pass(&mut stdout, &mut bytes, limit, Some(&mut output))?;
+            let err_idle = read_pass(&mut stderr, &mut bytes, limit, None)?;
+            if Instant::now() >= execution_deadline {
                 return Err(ProbeError::Timeout);
             }
-            if stdout_empty && stderr_empty {
+            if exited && out_idle && err_idle && group_empty(pid)? {
+                return Ok(output);
+            }
+            if out_idle && err_idle {
                 thread::sleep(Duration::from_millis(10));
             }
         }
     })();
-
-    if result.is_err() && !waited {
-        // No normal wait occurred on this path. Check custody before signaling.
+    if result.is_err() {
         let cleanup = crate::macos::exited(pid)
             .map_err(|_| ProbeError::Cleanup)
             .and_then(|exited| terminate_group(pid, exited));
         if cleanup.is_err() {
-            return defer_reap(child);
+            return Err(defer(child));
         }
-        let until = Instant::now() + Duration::from_millis(250);
         loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if Instant::now() < until => thread::sleep(Duration::from_millis(10)),
-                _ => return defer_reap(child),
+            if crate::macos::exited(pid).is_ok_and(|exited| exited)
+                && group_empty(pid).is_ok_and(|empty| empty)
+            {
+                break;
             }
+            if Instant::now() >= cleanup_deadline {
+                return Err(defer(child));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
-    result
+    let status = match child.try_wait() {
+        Ok(Some(status)) => status,
+        _ => return Err(defer(child)),
+    };
+    result.and_then(|output| {
+        if status.success() {
+            Ok(output)
+        } else {
+            Err(ProbeError::Exit)
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn defer_reap(mut child: std::process::Child) -> Result<Vec<u8>, ProbeError> {
-    // No further signals. If cleanup cannot be proved, keep discovery disabled.
-    CLEANUP_PENDING.fetch_add(1, Ordering::AcqRel);
-    let _ = std::thread::Builder::new()
-        .name("roost-probe-reaper".into())
-        .spawn(move || {
-            if child.wait().is_ok() {
-                CLEANUP_PENDING.fetch_sub(1, Ordering::AcqRel);
-            }
-        });
-    Err(ProbeError::Cleanup)
+fn group_empty(pid: libc::pid_t) -> Result<bool, ProbeError> {
+    crate::macos::group_has_live_members(pid)
+        .map(|live| !live)
+        .map_err(|_| ProbeError::Cleanup)
 }
 
 #[cfg(target_os = "macos")]
 fn terminate_group(pid: libc::pid_t, exited: bool) -> Result<(), ProbeError> {
-    let group_empty = || {
-        crate::macos::group_has_live_members(pid)
-            .map(|live| !live)
-            .map_err(|_| ProbeError::Cleanup)
-    };
-    if exited && group_empty()? {
+    if exited && group_empty(pid)? {
         return Ok(());
     }
     match crate::macos::send_group(pid, libc::SIGKILL) {
         Ok(()) => Ok(()),
         // The child can exit between waitid and kill, with no live group left.
-        Err(_) if crate::macos::exited(pid).is_ok_and(|exited| exited) && group_empty()? => Ok(()),
+        Err(_) if crate::macos::exited(pid).is_ok_and(|exited| exited) && group_empty(pid)? => {
+            Ok(())
+        }
         Err(_) => Err(ProbeError::Cleanup),
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn run_probe(
+pub fn run_probe_before(
     _: Command,
     _: &[(&str, OsString)],
-    _: Duration,
+    _: Instant,
+    _: Instant,
     _: usize,
 ) -> Result<Vec<u8>, ProbeError> {
     Err(ProbeError::Unsupported)
@@ -225,5 +265,44 @@ mod tests {
             ),
             Err(ProbeError::Exit)
         ));
+    }
+
+    #[test]
+    fn timeout_confirms_cleanup_of_a_live_descendant() {
+        const CHILD: &str = "ROOST_TEST_PROBE_DESCENDANT";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let mut descendant = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            std::fs::write(path, descendant.id().to_string()).unwrap();
+            let _ = descendant.wait();
+            return;
+        }
+
+        let path = std::env::temp_dir().join(format!("roost-probe-group-{}", std::process::id()));
+        let mut fixture = Command::new(std::env::current_exe().unwrap());
+        fixture.args([
+            "--exact",
+            "probe::tests::timeout_confirms_cleanup_of_a_live_descendant",
+        ]);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(350);
+        let outcome = run_probe_before(
+            fixture,
+            &[(CHILD, path.clone().into_os_string())],
+            deadline,
+            deadline + Duration::from_millis(300),
+            16 * 1024,
+        );
+        let pid = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(matches!(outcome, Err(ProbeError::Timeout)));
+        let status = Command::new("/bin/ps")
+            .args(["-p", pid.trim(), "-o", "state="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(status.stdout).unwrap();
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "{state}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 mod leases;
 pub mod metrics;
+pub mod queue_metrics;
 mod runtime;
 mod scheduler;
 mod sqlite;
@@ -46,6 +47,24 @@ const SCHEDULER: &CStr = match CStr::from_bytes_with_nul(
 
 const PROCESS_METRICS: &CStr = match CStr::from_bytes_with_nul(
     concat!(include_str!("../migrations/005_process_metrics.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
+const QUEUE_METRICS: &CStr = match CStr::from_bytes_with_nul(
+    concat!(include_str!("../migrations/006_queue_metrics.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
+const QUEUE_HISTORY_COVERAGE: &CStr = match CStr::from_bytes_with_nul(
+    concat!(
+        include_str!("../migrations/007_queue_history_coverage.sql"),
+        "\0"
+    )
+    .as_bytes(),
 ) {
     Ok(sql) => sql,
     Err(_) => panic!("migration contains NUL"),
@@ -108,11 +127,17 @@ impl Store {
                     store.0.exec(SCHEDULER)?;
                 }
                 Some("3") => store.0.exec(SCHEDULER)?,
-                Some("4" | "5") => (),
+                Some("4" | "5" | "6" | "7") => (),
                 _ => return Err(Error::Schema),
             }
-            if version != Some("5") {
+            if !matches!(version, Some("5" | "6" | "7")) {
                 store.0.exec(PROCESS_METRICS)?;
+            }
+            if !matches!(version, Some("6" | "7")) {
+                store.0.exec(QUEUE_METRICS)?;
+            }
+            if version != Some("7") {
+                store.0.exec(QUEUE_HISTORY_COVERAGE)?;
             }
             Ok(())
         })
@@ -461,7 +486,7 @@ mod tests {
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["7"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -469,9 +494,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 6").unwrap();
+        store.0.exec(c"PRAGMA user_version = 8").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["6"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
     }
 
     #[test]
@@ -493,7 +518,7 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["5"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["7"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
         assert_eq!(old.get_group(group.id).unwrap(), Some(group.clone()));
         assert_eq!(

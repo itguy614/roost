@@ -257,9 +257,22 @@ impl Watches {
             }
         }
         drop(cache);
+        let invalidated = changes
+            .iter()
+            .filter_map(|(&id, change)| change.invalidate_snapshot.then_some(id))
+            .collect::<Vec<_>>();
         for (id, change) in changes {
             if let Some(changed_at) = change.delivery {
                 supervisor.restart_changed_workers(id, changed_at);
+            }
+        }
+        drop(supervisor);
+        if !invalidated.is_empty() {
+            let mut queue = service.queue_metrics.lock().map_err(|_| {
+                crate::supervisor::Error::Conflict("queue metric cache unavailable")
+            })?;
+            for id in invalidated {
+                queue.invalidate(id);
             }
         }
         Ok(())

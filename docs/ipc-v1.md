@@ -41,6 +41,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `metrics.process.current` | Project UUID `id` | Project ID and an array of owned running generations with current gauges |
 | `metrics.process.history` | `project_id`, optional `profile_id`, `resolution` (`raw` or `5m`), `from` and optional `to` (Unix seconds), optional `limit` and `cursor` | History page with resolution, items, next cursor, more flag, and retention floor |
 | `metrics.project.summary` | Project UUID `id` | Desired, running and unresolved counts, gauge coverage, lifecycle totals and profiles |
+| `metrics.queue.configure` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result with project UUID and persisted queue probing opt-in |
+| `metrics.queue.current` | Project UUID `id` | Opt-in, polling state with cleanup degradation when applicable, and selector readings with freshness or an unavailable reason |
+| `metrics.queue.history` | `project_id`, optional symbolic `connection` and `queue`, `resolution` (`raw` or `5m`), `from`, optional `to` (Unix seconds), optional `limit` and `cursor` | Queue history page with retention floor and next cursor |
 | `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
 | `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
 | `group.list` | Omit or use `{}` | Array of group records |
@@ -74,6 +77,8 @@ The optional `watch.status.shared` array lists every configured group directory 
 
 The `startup` field is `first_start`, `after_clean_shutdown`, or `after_interrupted_shutdown`. Worker exits can also include a `stop_cause` such as `project_stop`, `project_restart`, `daemon_shutdown`, or `daemon_disconnected`. Startup failure classifications include `validation`, `spawn_rejected`, `resource_unavailable`, `readiness_timeout`, `state_publication`, and `cancelled`. The response fields and methods are additive to IPC v1.
 
+Queue current polls at ten seconds. New raw queue history items have a `coverage` object with `periodic`, `legacy`, `initial`, `availability_changed`, `reason_changed`, and `identity_changed` booleans. Five-minute queue history reports `pending.periodic_observations`, `transition_observations`, and `legacy_observations` alongside `observations`, `samples`, and `expected_samples`. A raw item can be both periodic and a transition. The new rollups aggregate successful periodic readings only and expect up to ten slots. Previously finalized ten-second rollups use a null `periodic_observations` field and keep their original statistics. See [queue history](queue-metrics.md#opt-in-current-readings-and-history) for gaps and retention cursors.
+
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
 
 Configuration mutations commit before the response. Worker lifecycle mutations acknowledge acceptance before the process reaches the requested state. With an idempotency key, the daemon uses it as the operation ID and can replay a committed success after a lost response or restart. Retry with the same method and arguments. Reusing a committed key for different arguments or a different method returns a conflict. Without a key, the server generates a fresh operation ID. There is no separate operation lookup in v1.
@@ -101,3 +106,5 @@ The endpoint uses a user-owned state directory with mode `0700`, a socket with m
 See [Laravel runtime and queue discovery](laravel-discovery.md) for selection precedence, limits, and the bootstrap trust boundary.
 
 See [process metrics](process-metrics.md) for gauge states, cursor recovery, and the raw-to-rollup cutover.
+
+See [queue depth metrics](queue-metrics.md) for adapter semantics and cursor recovery.

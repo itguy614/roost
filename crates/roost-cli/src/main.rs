@@ -1,6 +1,7 @@
 mod discovery;
 mod groups;
 mod metrics;
+mod queue_metrics;
 mod scheduler;
 mod watch;
 mod workers;
@@ -30,6 +31,10 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] metrics process current ID
   roost [--state-dir ABSOLUTE_PATH] metrics process history ID --from UNIX_SECONDS [--to UNIX_SECONDS] [--profile ID] [--resolution raw|5m] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] metrics project summary ID
+  roost [--state-dir ABSOLUTE_PATH] metrics queue enable ID
+  roost [--state-dir ABSOLUTE_PATH] metrics queue disable ID
+  roost [--state-dir ABSOLUTE_PATH] metrics queue current ID
+  roost [--state-dir ABSOLUTE_PATH] metrics queue history ID --from UNIX_SECONDS [--to UNIX_SECONDS] [--connection NAME] [--queue NAME] [--resolution raw|5m] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] log tail ID
   roost [--state-dir ABSOLUTE_PATH] worker crashes ID
   roost [--state-dir ABSOLUTE_PATH] provider list
@@ -64,6 +69,7 @@ enum Command {
     Discovery(discovery::Command),
     Group(groups::Command),
     Metrics(metrics::Command),
+    QueueMetrics(queue_metrics::Command),
     Scheduler(scheduler::Command),
     Watch(watch::Command),
 }
@@ -110,6 +116,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 Command::Discovery(command)
             } else if let Some(command) = groups::Command::parse(args)? {
                 Command::Group(command)
+            } else if let Some(command) = queue_metrics::Command::parse(args)? {
+                Command::QueueMetrics(command)
             } else if let Some(command) = metrics::Command::parse(args)? {
                 Command::Metrics(command)
             } else if let Some(command) = scheduler::Command::parse(args)? {
@@ -166,6 +174,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
             Command::Metrics(command) => command.execute(&mut client).await?,
+            Command::QueueMetrics(command) => command.execute(&mut client).await?,
             Command::Group(command) => {
                 let (result, partial_failure) = command.execute(&mut client).await?;
                 failed = partial_failure;
