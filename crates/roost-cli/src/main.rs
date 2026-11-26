@@ -1,4 +1,6 @@
+mod alerts;
 mod discovery;
+mod events;
 mod groups;
 mod metrics;
 mod queue_metrics;
@@ -13,6 +15,7 @@ use uuid::Uuid;
 
 const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] daemon status
+  roost [--state-dir ABSOLUTE_PATH] event history [--project ID] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] project add PATH
   roost [--state-dir ABSOLUTE_PATH] project list
   roost [--state-dir ABSOLUTE_PATH] project remove ID
@@ -31,12 +34,16 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] metrics process current ID
   roost [--state-dir ABSOLUTE_PATH] metrics process history ID --from UNIX_SECONDS [--to UNIX_SECONDS] [--profile ID] [--resolution raw|5m] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] metrics project summary ID
+  roost [--state-dir ABSOLUTE_PATH] metrics alerts list PROJECT_ID [--limit N] [--cursor CURSOR]
+  roost [--state-dir ABSOLUTE_PATH] metrics thresholds get PROFILE_ID
+  roost [--state-dir ABSOLUTE_PATH] metrics thresholds update PROFILE_ID --revision REV --rules-json JSON [--notifications on|off]
   roost [--state-dir ABSOLUTE_PATH] metrics queue enable ID
   roost [--state-dir ABSOLUTE_PATH] metrics queue disable ID
   roost [--state-dir ABSOLUTE_PATH] metrics queue current ID
   roost [--state-dir ABSOLUTE_PATH] metrics queue history ID --from UNIX_SECONDS [--to UNIX_SECONDS] [--connection NAME] [--queue NAME] [--resolution raw|5m] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] log tail ID
   roost [--state-dir ABSOLUTE_PATH] worker crashes ID
+  roost [--state-dir ABSOLUTE_PATH] worker crash get REPORT_ID
   roost [--state-dir ABSOLUTE_PATH] provider list
   roost [--state-dir ABSOLUTE_PATH] provider detect ID
   roost [--state-dir ABSOLUTE_PATH] provider resolve-php ID [--php PATH | --provider herd|system]
@@ -50,6 +57,7 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] scheduler stop ID
   roost [--state-dir ABSOLUTE_PATH] scheduler logs ID
   roost [--state-dir ABSOLUTE_PATH] scheduler crashes ID
+  roost [--state-dir ABSOLUTE_PATH] scheduler crash get REPORT_ID
   roost [--state-dir ABSOLUTE_PATH] group list
   roost [--state-dir ABSOLUTE_PATH] group get ID
   roost [--state-dir ABSOLUTE_PATH] group create NAME [--options-json JSON]
@@ -62,6 +70,7 @@ const USAGE: &str = "Usage:
 
 enum Command {
     Status,
+    Events(roost_ipc::events::EventHistoryParams),
     Add(PathBuf),
     List,
     Remove(Uuid),
@@ -69,6 +78,7 @@ enum Command {
     Discovery(discovery::Command),
     Group(groups::Command),
     Metrics(metrics::Command),
+    Alerts(alerts::Command),
     QueueMetrics(queue_metrics::Command),
     Scheduler(scheduler::Command),
     Watch(watch::Command),
@@ -112,12 +122,16 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Command::Remove(id)
         }
         _ => {
-            if let Some(command) = discovery::Command::parse(args)? {
+            if let Some(params) = events::parse(args)? {
+                Command::Events(params)
+            } else if let Some(command) = discovery::Command::parse(args)? {
                 Command::Discovery(command)
             } else if let Some(command) = groups::Command::parse(args)? {
                 Command::Group(command)
             } else if let Some(command) = queue_metrics::Command::parse(args)? {
                 Command::QueueMetrics(command)
+            } else if let Some(command) = alerts::Command::parse(args)? {
+                Command::Alerts(command)
             } else if let Some(command) = metrics::Command::parse(args)? {
                 Command::Metrics(command)
             } else if let Some(command) = scheduler::Command::parse(args)? {
@@ -153,6 +167,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         };
         let mut failed = false;
         let result = match command {
+            Command::Events(params) => client.event_history(&params).await?,
             Command::Status => serde_json::to_value(client.status().await?)?,
             Command::Add(path) => serde_json::to_value(
                 client
@@ -173,6 +188,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             )?,
             Command::Worker(command) => command.execute(&mut client).await?,
             Command::Discovery(command) => command.execute(&mut client).await?,
+            Command::Alerts(command) => command.execute(&mut client).await?,
             Command::Metrics(command) => command.execute(&mut client).await?,
             Command::QueueMetrics(command) => command.execute(&mut client).await?,
             Command::Group(command) => {

@@ -6,6 +6,9 @@ use std::{
 
 use roost_core::{
     CodeRestartPolicy, CrashRestartPolicy, DesiredState, ProjectId, WorkerProfile,
+    event::{Event, EventKind},
+    metrics::ProcessKind,
+    unix_timestamp,
     worker_runtime::{
         LaunchFailure, ObservedState, OutputStream, OutputSummary, ProcessCrash, ProcessExit,
         ProcessLease, ProcessProfileId, ProcessStatus, StopCause, WorkerLeaseState,
@@ -22,7 +25,7 @@ const LAUNCH_DEADLINE: Duration = Duration::from_secs(10);
 const EXIT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 const MAX_LAUNCH_ATTEMPTS: u8 = 3;
 
-pub(super) struct Slot<P: SupervisedProfile = WorkerProfile> {
+pub(crate) struct Slot<P: SupervisedProfile = WorkerProfile> {
     profile: P,
     php: PathBuf,
     allow_horizon: bool,
@@ -37,7 +40,9 @@ pub(super) struct Slot<P: SupervisedProfile = WorkerProfile> {
     startup_timed_out: bool,
     draining_since: Option<Instant>,
     launch_failures: u8,
-    code_restart_pending: bool,
+    restart_pending: Option<StopCause>,
+    recovery_event: Option<Event>,
+    recovery_event_sent: bool,
 }
 
 impl<P: SupervisedProfile> Slot<P> {
@@ -69,7 +74,9 @@ impl<P: SupervisedProfile> Slot<P> {
             startup_timed_out: false,
             draining_since: None,
             launch_failures: 0,
-            code_restart_pending: false,
+            restart_pending: None,
+            recovery_event: None,
+            recovery_event_sent: false,
         }
     }
 
@@ -79,6 +86,10 @@ impl<P: SupervisedProfile> Slot<P> {
 
     pub(super) fn has_guardian(&self) -> bool {
         self.guardian.is_some()
+    }
+
+    pub(super) fn has_recovery_event(&self) -> bool {
+        self.recovery_event.is_some()
     }
 
     pub(super) fn recovery_blocked(&self) -> bool {
@@ -127,7 +138,7 @@ impl<P: SupervisedProfile> Slot<P> {
     }
 
     pub(super) fn stop(&mut self, cause: StopCause) {
-        self.code_restart_pending = false;
+        self.restart_pending = None;
         self.status.desired_state = DesiredState::Stopped;
         self.retry_at = None;
         self.status.reason = Some("process stop requested".into());
@@ -161,6 +172,7 @@ impl<P: SupervisedProfile> Slot<P> {
             self.status.last_error = self.status.reason.clone();
             self.status.launch_failure = Some(LaunchFailure::Validation);
             self.retry_at = None;
+            self.record_recovery_failure();
             return Ok(());
         }
         let lease = ProcessLease {
@@ -219,6 +231,16 @@ impl<P: SupervisedProfile> Slot<P> {
     }
 
     pub(super) fn poll(&mut self, store: &Store) -> Result<(), Error> {
+        self.poll_guardian(store)?;
+        if let Some(event) = &self.recovery_event {
+            store.record_recovery_failure(event)?;
+            self.recovery_event_sent = true;
+            self.recovery_event = None;
+        }
+        Ok(())
+    }
+
+    fn poll_guardian(&mut self, store: &Store) -> Result<(), Error> {
         let Some(guardian) = &mut self.guardian else {
             return Ok(());
         };
@@ -344,14 +366,16 @@ impl<P: SupervisedProfile> Slot<P> {
                 store.finish_process::<P::Id>(id, report.as_ref())?;
                 self.detach();
                 self.status.last_exit = Some(exit);
-                let code_restart = std::mem::take(&mut self.code_restart_pending);
+                let restart = self.restart_pending.take();
                 if exit.stop_cause == Some(StopCause::StatePublicationFailed) {
                     self.after_launch_failure(LaunchFailure::StatePublication);
                 } else if self.startup_timed_out && exit.requested_stop {
                     self.after_launch_failure(LaunchFailure::ReadinessTimeout);
-                } else if code_restart && exit.stop_cause == Some(StopCause::ProjectRestart) {
+                } else if let Some(cause) = restart
+                    && exit.stop_cause == Some(cause)
+                {
                     self.status.state = ObservedState::Starting;
-                    self.status.reason = Some("restarting after a watched file change".into());
+                    self.status.reason = Some(restart_reason(cause).into());
                 } else {
                     self.after_exit(exit);
                 }
@@ -410,6 +434,7 @@ impl<P: SupervisedProfile> Slot<P> {
             self.status.reason = Some(format!("{reason}; startup will not retry"));
         }
         self.status.state = ObservedState::Failed;
+        self.record_recovery_failure();
     }
 
     fn after_exit(&mut self, exit: ProcessExit) {
@@ -439,6 +464,7 @@ impl<P: SupervisedProfile> Slot<P> {
             self.status.state = ObservedState::Failed;
             self.status.reason = Some(format!("{reason}; recovery stopped after 10 rapid exits"));
             self.status.last_error = self.status.reason.clone();
+            self.record_recovery_failure();
         } else {
             self.status.state = if exit.code == Some(0) && !exit.requested_stop {
                 ObservedState::Stopped
@@ -456,10 +482,37 @@ impl<P: SupervisedProfile> Slot<P> {
         self.status.recovery_blocked = true;
         self.status.last_error = Some(message.into());
         self.status.reason = self.status.last_error.clone();
+        self.record_recovery_failure();
+    }
+
+    fn record_recovery_failure(&mut self) {
+        if self.status.desired_state == DesiredState::Running
+            && !self.recovery_event_sent
+            && self.recovery_event.is_none()
+        {
+            self.recovery_event = Some(Event {
+                id: Uuid::new_v4(),
+                project_id: self.status.project_id,
+                profile_id: self.status.profile_id.uuid(),
+                slot: self.status.slot,
+                process_kind: ProcessKind::for_profile(P::Id::SCHEDULER),
+                kind: EventKind::PermanentRecoveryFailure,
+                at: unix_timestamp(),
+                crash_id: None,
+                actions_suppressed: false,
+            });
+        }
     }
 }
 
 impl Slot {
+    pub(super) fn request_slot_restart(&mut self, cause: StopCause) {
+        self.stop(cause);
+        self.restart_pending = Some(cause);
+        self.status.desired_state = DesiredState::Running;
+        self.status.reason = Some(restart_reason(cause).into());
+    }
+
     pub(super) fn request_code_restart(&mut self, changed_at: Instant) {
         if self.profile.code_restart == CodeRestartPolicy::OnChange
             && self.status.desired_state == DesiredState::Running
@@ -467,11 +520,16 @@ impl Slot {
             && self.has_guardian()
             && self.since <= changed_at
         {
-            self.stop(StopCause::ProjectRestart);
-            self.code_restart_pending = true;
-            self.status.desired_state = DesiredState::Running;
-            self.status.reason = Some("restarting after a watched file change".into());
+            self.request_slot_restart(StopCause::ProjectRestart);
         }
+    }
+}
+
+fn restart_reason(cause: StopCause) -> &'static str {
+    if cause == StopCause::ResourceThreshold {
+        "restarting after a sustained resource threshold breach"
+    } else {
+        "restarting after a watched file change"
     }
 }
 
@@ -480,6 +538,9 @@ fn exit_reason(exit: ProcessExit, stderr_seen: bool) -> String {
         let reason = match exit.stop_cause {
             Some(StopCause::ProjectStop) => "process stopped on user request",
             Some(StopCause::ProjectRestart) => "process stopped for project restart",
+            Some(StopCause::ResourceThreshold) => {
+                "process stopped for a resource threshold restart"
+            }
             Some(StopCause::DaemonShutdown) => "process stopped during daemon shutdown",
             Some(StopCause::DaemonDisconnected) => {
                 "process stopped after losing its daemon connection"

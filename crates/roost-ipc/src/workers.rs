@@ -2,12 +2,32 @@ use std::path::PathBuf;
 
 use roost_core::{
     CrashRestartPolicy, DesiredState, Project, ProjectId, WorkerProfile,
-    worker_runtime::{CrashReport, OutputSummary, WorkerStatus},
+    worker_runtime::{CrashReport, OutputSummary, ProcessCrash, WorkerStatus},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Client, ClientError, Mutation};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrashParams {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashOutputState {
+    Captured,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CrashDetail<P> {
+    #[serde(flatten)]
+    pub report: ProcessCrash<P>,
+    pub output_state: CrashOutputState,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +109,13 @@ impl Client {
         params: &AutostartParams,
     ) -> Result<Mutation<Project>, ClientError> {
         self.request("project.setAutostart", params).await
+    }
+
+    pub async fn worker_crash(
+        &mut self,
+        params: &CrashParams,
+    ) -> Result<CrashDetail<roost_core::WorkerProfileId>, ClientError> {
+        self.request("worker.crash.get", params).await
     }
 
     pub async fn recent_crashes(

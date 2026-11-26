@@ -5,7 +5,7 @@ use roost_ipc::{
     Client,
     discovery::ResolvePhpParams,
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
-    workers::{ProjectParams, StopParams},
+    workers::{CrashParams, ProjectParams, StopParams},
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -22,6 +22,7 @@ pub enum Command {
     Stop(StopParams),
     Logs(ProjectParams),
     Crashes(ProjectParams),
+    Crash(CrashParams),
 }
 
 impl Command {
@@ -31,6 +32,16 @@ impl Command {
         };
         if noun != "scheduler" {
             return Ok(None);
+        }
+        if verb == "crash"
+            && id == "get"
+            && let [report] = rest
+        {
+            return Ok(Some(Self::Crash(CrashParams {
+                id: utf8(report)?
+                    .parse()
+                    .map_err(|_| io::Error::other("report ID must be a UUID"))?,
+            })));
         }
         let id = parse_id(id)?;
         let params = ProjectParams { id };
@@ -101,6 +112,7 @@ impl Command {
             Self::Status(params) => serde_json::to_value(client.scheduler_status(&params).await?)?,
             Self::Stop(params) => serde_json::to_value(client.stop_scheduler(&params).await?)?,
             Self::Logs(params) => serde_json::to_value(client.scheduler_logs(&params).await?)?,
+            Self::Crash(params) => serde_json::to_value(client.scheduler_crash(&params).await?)?,
             Self::Crashes(params) => {
                 serde_json::to_value(client.scheduler_crashes(&params).await?)?
             }

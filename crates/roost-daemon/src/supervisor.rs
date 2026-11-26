@@ -23,7 +23,8 @@ mod slot;
 use crate::supervised::SupervisedProfile;
 pub(crate) use scheduler::SchedulerPlan;
 use scheduler::Schedulers;
-use slot::{Slot, status_for};
+pub(super) use slot::Slot;
+use slot::status_for;
 
 const MAX_ACTIVE: usize = 32;
 const MAX_OUTPUT_SLOTS: usize = 64;
@@ -72,6 +73,42 @@ impl Plan {
 }
 
 impl Supervisor {
+    pub(super) fn threshold_target(
+        &mut self,
+        store: &Store,
+        subject: roost_core::metrics::MetricSubject,
+    ) -> Result<Option<&mut Slot>, Error> {
+        if self.closing
+            || store.project_intent(subject.key.project_id)?.desired() != DesiredState::Running
+        {
+            return Ok(None);
+        }
+        let Some(runtime) = self
+            .projects
+            .get_mut(&subject.key.project_id)
+            .filter(|runtime| {
+                runtime.desired == DesiredState::Running && runtime.replacement.is_none()
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(slot) = runtime.slots.iter_mut().find(|slot| {
+            slot.desired() == DesiredState::Running && slot.metric_subject() == Some(subject)
+        }) else {
+            return Ok(None);
+        };
+        let Some(id) = slot.lease_id else {
+            return Ok(None);
+        };
+        let valid = store.process_lease::<roost_core::WorkerProfileId>(id)?.is_some_and(|lease|
+            matches!(lease.state, WorkerLeaseState::Running { identity } if identity == subject.process));
+        Ok(valid.then_some(slot))
+    }
+
+    pub(super) fn threshold_restart(slot: &mut Slot) {
+        slot.request_slot_restart(StopCause::ResourceThreshold);
+    }
+
     pub(crate) fn owned_metric_leases(&self) -> std::collections::HashSet<uuid::Uuid> {
         self.projects
             .values()
@@ -395,10 +432,9 @@ impl Supervisor {
     pub fn tick(&mut self) -> Result<(), Error> {
         let pending = self.projects.values().any(|runtime| {
             runtime.replacement.is_some()
-                || runtime
-                    .slots
-                    .iter()
-                    .any(|slot| slot.has_guardian() || slot.should_launch())
+                || runtime.slots.iter().any(|slot| {
+                    slot.has_guardian() || slot.should_launch() || slot.has_recovery_event()
+                })
         });
         let recover_now = !self.recovering.is_empty() && Instant::now() >= self.next_recovery;
         if !pending && !recover_now && !self.schedulers.pending() {

@@ -1,5 +1,7 @@
+pub mod alerts;
 pub mod discovery;
 pub mod endpoint;
+pub mod events;
 pub mod groups;
 pub mod metrics;
 pub mod queue_metrics;
@@ -27,6 +29,7 @@ pub const VERSION: u32 = 1;
 pub const METHODS: &[&str] = &[
     "daemon.hello",
     "daemon.status",
+    "event.history",
     "scheduler.configure",
     "scheduler.status",
     "scheduler.start",
@@ -34,6 +37,7 @@ pub const METHODS: &[&str] = &[
     "scheduler.restart",
     "scheduler.logs",
     "scheduler.crashes",
+    "scheduler.crash.get",
     "provider.list",
     "provider.detect",
     "provider.resolvePhp",
@@ -47,6 +51,7 @@ pub const METHODS: &[&str] = &[
     "project.start",
     "project.setAutostart",
     "worker.crashes",
+    "worker.crash.get",
     "project.stop",
     "project.restart",
     "worker.profile.create",
@@ -55,6 +60,9 @@ pub const METHODS: &[&str] = &[
     "watch.status",
     "watch.enable",
     "watch.disable",
+    "metrics.alerts.list",
+    "metrics.thresholds.get",
+    "metrics.thresholds.update",
     "metrics.process.current",
     "metrics.process.history",
     "metrics.project.summary",

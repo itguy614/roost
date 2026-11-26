@@ -1,3 +1,5 @@
+pub mod alerts;
+pub mod events;
 mod leases;
 pub mod metrics;
 pub mod queue_metrics;
@@ -70,6 +72,13 @@ const QUEUE_HISTORY_COVERAGE: &CStr = match CStr::from_bytes_with_nul(
     Err(_) => panic!("migration contains NUL"),
 };
 
+const EVENTS: &CStr = match CStr::from_bytes_with_nul(
+    concat!(include_str!("../migrations/008_events.sql"), "\0").as_bytes(),
+) {
+    Ok(sql) => sql,
+    Err(_) => panic!("migration contains NUL"),
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -127,17 +136,20 @@ impl Store {
                     store.0.exec(SCHEDULER)?;
                 }
                 Some("3") => store.0.exec(SCHEDULER)?,
-                Some("4" | "5" | "6" | "7") => (),
+                Some("4" | "5" | "6" | "7" | "8") => (),
                 _ => return Err(Error::Schema),
             }
-            if !matches!(version, Some("5" | "6" | "7")) {
+            if !matches!(version, Some("5" | "6" | "7" | "8")) {
                 store.0.exec(PROCESS_METRICS)?;
             }
-            if !matches!(version, Some("6" | "7")) {
+            if !matches!(version, Some("6" | "7" | "8")) {
                 store.0.exec(QUEUE_METRICS)?;
             }
-            if version != Some("7") {
+            if !matches!(version, Some("7" | "8")) {
                 store.0.exec(QUEUE_HISTORY_COVERAGE)?;
+            }
+            if version != Some("8") {
+                store.0.exec(EVENTS)?;
             }
             Ok(())
         })
@@ -480,13 +492,267 @@ mod tests {
     }
 
     #[test]
+    fn crash_event_failure_rolls_back_report_and_retention_expires_pinned_cursor() {
+        use crate::{events::EventQuery, metrics::HistoryPage};
+        use roost_core::{
+            scheduler::{SchedulerMode, SchedulerProfile, SchedulerProfileId},
+            worker_runtime::{ProcessExit, ProcessLease, WorkerLeaseState},
+        };
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let project = fixture.project();
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        store.create_project(&project).unwrap();
+        let profile_id = SchedulerProfileId(Uuid::new_v4());
+        store
+            .create_scheduler(&SchedulerProfile {
+                id: profile_id,
+                project_id: project.id,
+                enabled: true,
+                mode: SchedulerMode::ScheduleWork,
+                crash_restart: CrashRestartPolicy::Never,
+                graceful_stop_seconds: 1,
+                revision: Revision(1),
+            })
+            .unwrap();
+        let id = Uuid::new_v4();
+        let lease = ProcessLease {
+            id,
+            profile_id,
+            project_id: project.id,
+            slot: 0,
+            state: WorkerLeaseState::Reserved,
+        };
+        store.reserve_process(&lease).unwrap();
+        let lease = store.claim_process(lease).unwrap();
+        store
+            .record_process_state(
+                lease,
+                WorkerLeaseState::Exited {
+                    exit: ProcessExit {
+                        code: Some(7),
+                        signal: None,
+                        at: 1_800_000_000,
+                        requested_stop: false,
+                        stop_cause: None,
+                        forced: false,
+                    },
+                },
+            )
+            .unwrap();
+        store.0.exec(c"CREATE TRIGGER fail_event BEFORE INSERT ON daemon_events BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+        assert!(
+            store
+                .recover_completed_processes::<SchedulerProfileId>()
+                .is_err()
+        );
+        assert!(
+            store
+                .process_crash::<SchedulerProfileId>(id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .process_lease::<SchedulerProfileId>(id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .process_lifecycle_totals(project.id, None)
+                .unwrap()
+                .crashes,
+            0
+        );
+        store.0.exec(c"DROP TRIGGER fail_event").unwrap();
+        store
+            .recover_completed_processes::<SchedulerProfileId>()
+            .unwrap();
+        store
+            .recover_completed_processes::<SchedulerProfileId>()
+            .unwrap();
+        assert!(
+            store
+                .process_lease::<SchedulerProfileId>(id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .process_crash::<SchedulerProfileId>(id)
+                .unwrap()
+                .unwrap()
+                .output
+                .is_empty()
+        );
+        let HistoryPage::Rows { state, rows } = store
+            .event_history(EventQuery {
+                project: Some(project.id),
+                lineage: None,
+                after: 0,
+                high: None,
+                limit: 2,
+            })
+            .unwrap()
+        else {
+            panic!("expected event")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::json!(id));
+        store.0.exec(c"WITH RECURSIVE samples(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM samples WHERE n<2048)
+            INSERT INTO daemon_events(id,project_id,kind,data) SELECT 'seed-'||n,'other','process_crash','{}' FROM samples").unwrap();
+        let event = roost_core::event::Event {
+            id: Uuid::new_v4(),
+            project_id: project.id,
+            profile_id: profile_id.0,
+            slot: 0,
+            process_kind: roost_core::metrics::ProcessKind::Scheduler,
+            kind: roost_core::event::EventKind::PermanentRecoveryFailure,
+            at: 1_800_000_050,
+            crash_id: None,
+            actions_suppressed: false,
+        };
+        store.record_recovery_failure(&event).unwrap();
+        let HistoryPage::Expired(retained) = store
+            .event_history(EventQuery {
+                project: Some(project.id),
+                lineage: Some(&state.lineage),
+                after: 1,
+                high: Some(state.high),
+                limit: 2,
+            })
+            .unwrap()
+        else {
+            panic!("expected expired cursor")
+        };
+        assert_eq!(retained.pruned, 2);
+        let HistoryPage::Rows { rows, .. } = store
+            .event_history(EventQuery {
+                project: Some(project.id),
+                lineage: Some(&state.lineage),
+                after: 2,
+                high: None,
+                limit: 2,
+            })
+            .unwrap()
+        else {
+            panic!("watermark equality is safe")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::json!(event.id));
+    }
+
+    #[test]
+    fn alert_attempt_budget_and_cooldown_survive_reopen_and_rule_replacement() {
+        use roost_core::{
+            alerts::{Episode, Evidence, Rule},
+            metrics::{ProcessGeneration, ProcessKind},
+        };
+        let fixture = Fixture::new();
+        let db = fixture.db();
+        let project = fixture.project();
+        Store::initialize(&db).unwrap();
+        let store = Store::open(&db).unwrap();
+        store.create_project(&project).unwrap();
+        let mut profile = WorkerProfile {
+            id: WorkerProfileId(Uuid::new_v4()),
+            project_id: project.id,
+            name: "fixture".into(),
+            connection: "database".into(),
+            queues: vec![],
+            desired_instances: 1,
+            sleep_seconds: 3,
+            timeout_seconds: 60,
+            tries: 1,
+            graceful_stop_seconds: 1,
+            crash_restart: CrashRestartPolicy::Never,
+            code_restart: CodeRestartPolicy::Never,
+            notifications: false,
+            enabled: true,
+            revision: Revision(1),
+        };
+        store.create_worker_profile(&profile).unwrap();
+        let identity = ProcessGeneration {
+            project_id: project.id,
+            kind: ProcessKind::Worker,
+            profile_id: profile.id.0,
+            slot: 0,
+            instance_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut rule = Rule::RssBytes {
+            clear_at: 0,
+            breach_at: 1,
+            restart: true,
+        };
+        let open = |store: &Store, rule: &Rule, revision, at| {
+            store
+                .open_alert(
+                    Episode {
+                        id: Uuid::new_v4(),
+                        identity,
+                        rule: rule.clone(),
+                        rule_revision: revision,
+                        opened_at: at,
+                        breach_observed_at: at,
+                        breach_evidence: Evidence::RssBytes(3),
+                        actions_suppressed: false,
+                        restart_charged: false,
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        store
+            .transaction::<_, Error>(|store| {
+                store.replace_alert_rules(&profile, &[], std::slice::from_ref(&rule), 10000)
+            })
+            .unwrap();
+        let first = open(&store, &rule, profile.revision, 10001);
+        assert!(first.restart_charged);
+        let prior = store.alert_rules(&[profile.id]).unwrap();
+        rule = Rule::RssBytes {
+            clear_at: 0,
+            breach_at: 2,
+            restart: true,
+        };
+        profile = store
+            .transaction(|store| {
+                let profile = store.update_worker_profile(profile)?;
+                store.replace_alert_rules(&profile, &prior, std::slice::from_ref(&rule), 10005)?;
+                Ok::<_, Error>(profile)
+            })
+            .unwrap();
+        assert_eq!(
+            store.list_alerts(project.id, None, 1).unwrap()[0]["closed_reason"],
+            "rule_updated"
+        );
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        let suppressed = open(&store, &rule, profile.revision, 10010);
+        assert!(suppressed.actions_suppressed && !suppressed.restart_charged);
+        store.close_previous_alerts(10011).unwrap();
+        let second = open(&store, &rule, profile.revision, 10302);
+        assert!(second.restart_charged);
+        store.close_alert(second.id, 10303, "recovered").unwrap();
+        let capped = open(&store, &rule, profile.revision, 10603);
+        assert!(!capped.actions_suppressed && !capped.restart_charged);
+        store
+            .close_alert(capped.id, 10604, "generation_ended")
+            .unwrap();
+        assert!(open(&store, &rule, profile.revision, 13602).restart_charged);
+    }
+
+    #[test]
     fn initializes_reopens_and_rejects_newer_schema() {
         let fixture = Fixture::new();
         let db = fixture.db();
         assert!(Store::open(&db).is_err());
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["7"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
         assert_eq!(store.0.query(c"PRAGMA foreign_keys", &[]).unwrap(), ["1"]);
         let project = fixture.project();
         store.create_project(&project).unwrap();
@@ -494,9 +760,9 @@ mod tests {
         Store::initialize(&db).unwrap();
         let store = Store::open(&db).unwrap();
         assert_eq!(store.list_projects().unwrap(), [project]);
-        store.0.exec(c"PRAGMA user_version = 8").unwrap();
+        store.0.exec(c"PRAGMA user_version = 9").unwrap();
         assert!(matches!(Store::initialize(&db), Err(Error::Schema)));
-        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
+        assert_eq!(store.0.query(c"PRAGMA user_version", &[]).unwrap(), ["9"]);
     }
 
     #[test]
@@ -518,7 +784,7 @@ mod tests {
         old.create_project(&project).unwrap();
         assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["1"]);
         Store::initialize(&db).unwrap();
-        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["7"]);
+        assert_eq!(old.0.query(c"PRAGMA user_version", &[]).unwrap(), ["8"]);
         assert_eq!(old.list_projects().unwrap(), std::slice::from_ref(&project));
         assert_eq!(old.get_group(group.id).unwrap(), Some(group.clone()));
         assert_eq!(

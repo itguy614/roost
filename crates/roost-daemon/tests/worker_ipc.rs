@@ -20,6 +20,7 @@ use roost_core::{
 use roost_daemon::DaemonService;
 use roost_ipc::{
     AddParams, CONFLICT, Client, ClientError, INVALID_PARAMS, RemoveParams,
+    events::EventHistoryParams,
     groups::{
         CreateGroupParams, DeleteGroupParams, GroupLaunchParams, GroupMembershipParams,
         GroupOptions, GroupOutcome, GroupParams, GroupProjectLaunch, GroupStopParams,
@@ -29,7 +30,8 @@ use roost_ipc::{
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
     watch::{CodeRestartParams, DisableWatchParams, EnableWatchParams, WatchState, WatchStatus},
     workers::{
-        AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
+        AutostartParams, CrashParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams,
+        WorkerOptions,
     },
 };
 use roost_store::Store;
@@ -646,6 +648,24 @@ async fn invalid_executable_is_reported_without_a_shell_fallback() {
     assert_eq!(failed[0].launch_failure, Some(LaunchFailure::SpawnRejected));
     assert!(!failed[0].recovery_blocked);
     assert!(!app.join("should-not-exist").exists());
+    let history = client
+        .event_history(&EventHistoryParams {
+            project_id: Some(id),
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history["items"].as_array().unwrap().len(), 1);
+    assert_eq!(history["items"][0]["kind"], "permanent_recovery_failure");
+    assert!(
+        client
+            .recent_crashes(&ProjectParams { id })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     poll.abort();
 }
 
@@ -706,6 +726,44 @@ async fn keeps_useful_crash_output_across_reopen_and_explains_clean_exit() {
         .unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].exit.code, Some(7));
+    let params = CrashParams { id: reports[0].id };
+    let detail = client.worker_crash(&params).await.unwrap();
+    assert_eq!(detail.report.id, reports[0].id);
+    assert!(matches!(
+        detail.output_state,
+        roost_ipc::workers::CrashOutputState::Captured
+    ));
+    assert!(
+        matches!(client.scheduler_crash(&params).await, Err(ClientError::Rpc(error)) if error.code == roost_ipc::NOT_FOUND)
+    );
+    let history = client
+        .event_history(&EventHistoryParams {
+            project_id: Some(crashed),
+            limit: Some(1),
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history["items"][0]["kind"], "process_crash");
+    assert_eq!(
+        history["items"][0]["crash_id"],
+        serde_json::json!(params.id)
+    );
+    assert!(history["items"][0].get("output").is_none());
+    let cursor = history["next_cursor"].as_str().unwrap();
+    let drained = client
+        .event_history(&EventHistoryParams {
+            project_id: Some(crashed),
+            limit: Some(1),
+            cursor: Some(cursor.into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(drained["items"], serde_json::json!([]));
+    assert!(
+        matches!(client.event_history(&EventHistoryParams { project_id: Some(finished), limit: Some(1), cursor: Some(cursor.into()) }).await, Err(ClientError::Rpc(error)) if error.code == -32020)
+    );
+
     for (id, crashes) in [(crashed, 1), (finished, 0)] {
         let summary = client.project_metrics(&ProjectParams { id }).await.unwrap();
         assert_eq!(summary["lifecycle"]["crashes"], crashes);
@@ -1242,6 +1300,16 @@ async fn scheduler_crash_backoff_and_diagnostics_do_not_enter_worker_history() {
     assert_eq!(crashed.last_exit.unwrap().code, Some(7));
     let reports = client.scheduler_crashes(&params).await.unwrap();
     assert_eq!(reports.len(), 2);
+    assert_eq!(
+        client
+            .scheduler_crash(&CrashParams { id: reports[0].id })
+            .await
+            .unwrap()
+            .report
+            .id,
+        reports[0].id
+    );
+
     assert!(
         reports[0]
             .output
@@ -2216,6 +2284,174 @@ async fn metrics_follow_owned_worker_and_scheduler_generations_and_page_history(
     assert_eq!(
         client.project_metrics(&params).await.unwrap()["lifecycle"]["restarts"],
         1
+    );
+    terminate(&mut daemon).await;
+}
+
+#[tokio::test]
+async fn resource_episode_is_durable_and_manual_stop_cancels_further_restart() {
+    use roost_core::alerts::Rule;
+    use roost_ipc::alerts::{AlertListParams, ThresholdProfileParams, ThresholdUpdateParams};
+
+    let h = Harness::new();
+    let app = h.app("threshold", "graceful");
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let profile = client
+        .list_profiles(&ProjectParams { id })
+        .await
+        .unwrap()
+        .remove(0);
+    let params = ThresholdProfileParams {
+        profile_id: profile.id,
+    };
+    let mut update = ThresholdUpdateParams {
+        profile_id: profile.id,
+        expected_revision: profile.revision,
+        rules: vec![Rule::RssBytes {
+            clear_at: 0,
+            breach_at: 1,
+            restart: true,
+        }],
+        notifications: Some(true),
+        idempotency_key: None,
+    };
+    let result = client.update_thresholds(&update).await.unwrap();
+    assert!(result["result"]["notifications"].as_bool().unwrap());
+    assert!(
+        matches!(client.update_thresholds(&update).await, Err(ClientError::Rpc(error)) if error.code == CONFLICT)
+    );
+    update.expected_revision =
+        serde_json::from_value(result["result"]["revision"].clone()).unwrap();
+    assert_eq!(
+        client.update_thresholds(&update).await.unwrap()["result"]["revision"],
+        result["result"]["revision"]
+    );
+    client.start_project(&h.launch(id)).await.unwrap();
+    let stopped_generation = until_status(&mut client, id, |slots| {
+        slots
+            .first()
+            .is_some_and(|slot| slot.state == ObservedState::Running && slot.generation == 2)
+    })
+    .await;
+    assert_eq!(
+        stopped_generation[0].last_exit.unwrap().stop_cause,
+        Some(StopCause::ResourceThreshold)
+    );
+    let list = AlertListParams {
+        project_id: id,
+        cursor: None,
+        limit: None,
+    };
+    let history = client.list_alerts(&list).await.unwrap();
+    assert_eq!(history["alerts"][0]["restart_charged"], true);
+    assert!(
+        history["alerts"][0]["breach_evidence"]["value"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    let history = client
+        .event_history(&EventHistoryParams {
+            project_id: Some(id),
+            cursor: None,
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history["items"][0]["kind"], "resource_threshold");
+    let cursor = history["next_cursor"].as_str().unwrap().to_owned();
+    client
+        .stop_project(&StopParams {
+            id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    let stopped = until_status(&mut client, id, all_in(ObservedState::Stopped, 1)).await;
+    assert_eq!(stopped[0].generation, 2);
+    drop(client);
+    terminate(&mut daemon).await;
+    let (mut daemon, mut client) = h.daemon().await;
+    assert_eq!(
+        client.thresholds(&params).await.unwrap()["revision"],
+        result["result"]["revision"]
+    );
+    let history = client
+        .event_history(&EventHistoryParams {
+            project_id: Some(id),
+            cursor: Some(cursor),
+            limit: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history["items"], serde_json::json!([]));
+    assert!(
+        client
+            .list_processes(&ProjectParams { id })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    terminate(&mut daemon).await;
+}
+
+#[tokio::test]
+async fn manual_stop_during_threshold_cleanup_prevents_the_replacement() {
+    use roost_core::alerts::Rule;
+    use roost_ipc::alerts::ThresholdUpdateParams;
+
+    let h = Harness::new();
+    let app = h.app("threshold-race", "ignore");
+    let (mut daemon, mut client) = h.daemon().await;
+    let id = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Always)
+        .await;
+    let profile = client
+        .list_profiles(&ProjectParams { id })
+        .await
+        .unwrap()
+        .remove(0);
+    client
+        .update_thresholds(&ThresholdUpdateParams {
+            profile_id: profile.id,
+            expected_revision: profile.revision,
+            rules: vec![Rule::RssBytes {
+                clear_at: 0,
+                breach_at: 1,
+                restart: true,
+            }],
+            notifications: None,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    client.start_project(&h.launch(id)).await.unwrap();
+    let cleanup = until_status(&mut client, id, all_in(ObservedState::Stopping, 1)).await;
+    assert_eq!(cleanup[0].desired_state, DesiredState::Running);
+    assert_eq!(cleanup[0].generation, 1);
+    client
+        .stop_project(&StopParams {
+            id,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    let stopped = until_status(&mut client, id, all_in(ObservedState::Stopped, 1)).await;
+    assert_eq!(
+        stopped[0].last_exit.unwrap().stop_cause,
+        Some(StopCause::ResourceThreshold)
+    );
+    assert_eq!(stopped[0].desired_state, DesiredState::Stopped);
+    assert_eq!(stopped[0].generation, 1);
+    assert_eq!(stopped[0].restarts, 0);
+    assert!(
+        client
+            .recent_crashes(&ProjectParams { id })
+            .await
+            .unwrap()
+            .is_empty()
     );
     terminate(&mut daemon).await;
 }

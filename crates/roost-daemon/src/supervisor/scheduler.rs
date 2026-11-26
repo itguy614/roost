@@ -92,6 +92,7 @@ impl Schedulers {
             runtime.replacement.is_some()
                 || runtime.slot.has_guardian()
                 || runtime.slot.should_launch()
+                || runtime.slot.has_recovery_event()
         }) || self.recovery_due()
     }
 

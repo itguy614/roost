@@ -31,6 +31,7 @@ pub struct ProcessIdentity {
 pub enum StopCause {
     ProjectStop,
     ProjectRestart,
+    ResourceThreshold,
     DaemonShutdown,
     DaemonDisconnected,
     StartupTimeout,

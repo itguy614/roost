@@ -97,7 +97,7 @@ def database_stats(state, measured_from):
 
 
 def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket, redis_pid, variant, loaded,
-              enabled_projects=None, soak=False):
+              enabled_projects=None, soak=False, thresholds=False):
     enabled_projects = (0 if variant == "baseline" else 8) if enabled_projects is None else enabled_projects
     enabled = enabled_projects > 0
     root.mkdir()
@@ -109,6 +109,13 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             client = FIXTURE["ready"](lambda: FIXTURE["connect"](state))
             launch, running = FIXTURE["start_supervision"](root, client, 31, loaded)
             supervised = {"id": launch["id"]}
+            if thresholds:
+                for profile in client.request("worker.profile.list", supervised):
+                    client.request("metrics.thresholds.update", {"profile_id": profile["id"],
+                        "expected_revision": profile["revision"], "rules": [
+                            {"metric": "cpu_percent", "clear_at": 8000, "breach_at": 10000},
+                            {"metric": "rss_bytes", "clear_at": 0, "breach_at": 1},
+                        ]})
             projects = []
             for i in range(8):
                 app = root / f"queue-{i}"
@@ -140,6 +147,9 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
                          "from": int(wall_start) - 600, "limit": 256})]
             if enabled or variant == "scale":
                 methods.append(("metrics.queue.current", projects[0][1]))
+            if thresholds:
+                methods.extend([("metrics.alerts.list", {"project_id": launch["id"]}),
+                                ("event.history", {"project_id": launch["id"]})])
             latencies = {name: [] for name, _ in methods}
             checkpoint_reads = 0
             with contextlib.ExitStack() as cleanup:
@@ -186,6 +196,11 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             if enabled:
                 assert usages and all(FIXTURE["inspect"](client, project)[("redis", "primary")]["state"] == "fresh"
                                       for _, project in projects[:enabled_projects])
+            active_alerts = 0
+            if thresholds:
+                alerts = client.request("metrics.alerts.list", {"project_id": launch["id"]})["alerts"]
+                active_alerts = sum(alert["state"] == "active" for alert in alerts)
+                assert active_alerts == 31
             daemon_cpu = cpu_end - cpu_start
             children_cpu = child_end - child_start
             guardian_cpu = guardian_end - guardian_start
@@ -200,7 +215,7 @@ def benchmark(root, binary, accounting, vendor, seconds, interval, redis_socket,
             warnings = [line for line in Path(log.name).read_text().splitlines() if " WARN " in line or " ERROR " in line]
             print(json.dumps({"case": "soak_complete" if soak else "live",
                 "workload": "loaded" if loaded else "idle", "variant": variant, "queue_enabled": enabled,
-                "enabled_projects": enabled_projects,
+                "enabled_projects": enabled_projects, "active_alerts": active_alerts,
                 "seconds": round(elapsed, 3), "daemon_cpu_seconds": round(daemon_cpu, 3),
                 "php_count_probe_cpu_seconds_at_shutdown": round(php_cpu, 3),
                 "reaped_children_cpu_seconds_including_herd": round(children_cpu, 3),
@@ -439,6 +454,7 @@ def main():
     parser.add_argument("--seconds", default=150, type=int)
     parser.add_argument("--uncached", type=Path, help="also measure the prior queue build for 60 seconds")
     parser.add_argument("--candidate-only", action="store_true", help="repeat only the cached candidate")
+    parser.add_argument("--thresholds", action="store_true", help="evaluate two rules on all 31 workers and read alert and event IPC")
     parser.add_argument("--workload", choices=["idle", "loaded", "both"], default="both")
     parser.add_argument("--interval", default=2.0, type=float)
     modes = parser.add_mutually_exclusive_group()
@@ -449,6 +465,8 @@ def main():
     args = parser.parse_args()
     if args.herd_only and not args.laravel13:
         parser.error("--laravel13 is required for a Herd measurement")
+    if args.thresholds and not args.candidate_only:
+        parser.error("--thresholds requires --candidate-only")
     if args.soak and args.seconds < 3600:
         parser.error("--soak requires at least 3600 seconds")
     if not (args.storage_only or args.herd_only) and not all((args.baseline or args.candidate_only or args.scale or args.soak, args.candidate, args.laravel13)):
@@ -494,7 +512,7 @@ def main():
                     variants.append(("uncached", args.uncached, 60))
                 for variant, binary, seconds in variants:
                     benchmark(root / f"{label}-{variant}", binary, accounting, args.laravel13.resolve() / "vendor",
-                              seconds, args.interval, sock, redis.pid, variant, loaded)
+                              seconds, args.interval, sock, redis.pid, variant, loaded, thresholds=args.thresholds)
             seeded_storage(root)
         finally:
             redis.terminate()

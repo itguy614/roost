@@ -1,3 +1,5 @@
+pub mod alerts;
+pub mod event;
 pub mod queue_metrics;
 use std::{
     collections::HashSet,
