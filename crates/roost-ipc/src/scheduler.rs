@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use roost_core::{
     CrashRestartPolicy, ProjectId, Revision,
-    scheduler::{SchedulerCrash, SchedulerProfile, SchedulerStatus},
+    scheduler::{SchedulerCrash, SchedulerProfile, SchedulerProfileId, SchedulerStatus},
     worker_runtime::OutputSummary,
 };
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     Client, ClientError, Mutation,
-    workers::{Intent, ProjectParams, StopParams},
+    workers::{CrashDetail, CrashParams, Intent, ProjectParams, StopParams},
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,6 +90,13 @@ impl Client {
         params: &ProjectParams,
     ) -> Result<Vec<OutputSummary>, ClientError> {
         self.request("scheduler.logs", params).await
+    }
+
+    pub async fn scheduler_crash(
+        &mut self,
+        params: &CrashParams,
+    ) -> Result<CrashDetail<SchedulerProfileId>, ClientError> {
+        self.request("scheduler.crash.get", params).await
     }
 
     pub async fn scheduler_crashes(

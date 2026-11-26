@@ -41,7 +41,12 @@ impl SchedulerCall {
 
     pub fn execute(self, service: &DaemonService) -> Result<Value, RpcError> {
         let mut supervisor = service.workers.lock().map_err(|_| internal_error())?;
-        let store = Store::open(&service.db).map_err(store_error)?;
+        let store = if matches!(self, Self::Stop(_) | Self::Status(_)) {
+            Store::open_for_metric_writes(&service.db)
+        } else {
+            Store::open(&service.db)
+        }
+        .map_err(store_error)?;
         match self {
             Self::Configure(params) => {
                 let key = request_key("scheduler.configure", &params)?;

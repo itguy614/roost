@@ -44,6 +44,11 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `metrics.queue.configure` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result with project UUID and persisted queue probing opt-in |
 | `metrics.queue.current` | Project UUID `id` | Opt-in, polling state with cleanup degradation when applicable, and selector readings with freshness or an unavailable reason |
 | `metrics.queue.history` | `project_id`, optional symbolic `connection` and `queue`, `resolution` (`raw` or `5m`), `from`, optional `to` (Unix seconds), optional `limit` and `cursor` | Queue history page with retention floor and next cursor |
+| `worker.crash.get`, `scheduler.crash.get` | Crash report UUID `id` | Stored report with `output_state` |
+| `event.history` | Optional `project_id`, `limit` from 1 to 256, and `cursor` | Durable sequence-ordered events, `has_more`, `next_cursor`, and `pruned_through` |
+| `metrics.thresholds.get` | Worker `profile_id` | Current profile revision, notification opt-in, and rules |
+| `metrics.thresholds.update` | Worker `profile_id`, `expected_revision`, complete `rules` array, optional `notifications` and `idempotency_key` | Mutation result containing the current settings |
+| `metrics.alerts.list` | `project_id`, optional `limit` from 1 to 128 and `cursor` | Recent active and closed episodes with evidence, restart accounting, and next cursor |
 | `log.tail` | Project UUID `id` | Bounded output lines with instance ID, generation, timestamp, stream, byte count, newline count, and redacted `text` |
 | `worker.crashes` | Project UUID `id` | Recent persistent crash reports including exit metadata, reason, and redacted output |
 | `group.list` | Omit or use `{}` | Array of group records |
@@ -100,6 +105,8 @@ Configuration mutations commit before the response. Worker lifecycle mutations a
 | `-32007` | Probe output exceeded its limit |
 | `-32008` | All discovery slots are busy |
 | `-32020` | History cursor invalid, expired, or bound to another query or database lineage |
+
+For expired `event.history` cursors, `error.data` includes `pruned_through`, `recovery_cursor`, and `earliest_retained`. The latter is the first global retained sequence as a string and its original Unix timestamp `at`. Use the same filter with `recovery_cursor`.
 
 The endpoint uses a user-owned state directory with mode `0700`, a socket with mode `0600`, peer UID validation, and an exclusive lock for the daemon. The server accepts up to 32 active connections. Requests are capped at 64 KiB and responses at 4 MiB, excluding delimiters. Reads and writes have five-second deadlines. The server closes idle connections and connections that send an oversized request.
 

@@ -86,6 +86,25 @@ impl Store {
             if let Some(report) = report {
                 store.insert_crash_report(report)?;
                 store.count_metric_crash(report)?;
+                use roost_core::{
+                    event::{Event, EventKind},
+                    metrics::ProcessKind,
+                };
+                store.append_event(&Event {
+                    id: report.id,
+                    project_id: report.project_id,
+                    profile_id: report.profile_id.uuid(),
+                    slot: report.slot,
+                    process_kind: if P::SCHEDULER {
+                        ProcessKind::Scheduler
+                    } else {
+                        ProcessKind::Worker
+                    },
+                    kind: EventKind::ProcessCrash,
+                    at: report.exit.at,
+                    crash_id: Some(report.id),
+                    actions_suppressed: false,
+                })?;
             }
             Ok(())
         })
@@ -134,6 +153,20 @@ impl Store {
             .iter()
             .map(|row| serde_json::from_str(row).map_err(Error::from))
             .collect()
+    }
+
+    pub fn process_crash<P: ProcessProfileId>(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ProcessCrash<P>>, Error> {
+        self.0
+            .query(
+                &crash_sql::<P>("SELECT data FROM {crashes} WHERE id = ?1"),
+                &[Some(&id.to_string())],
+            )?
+            .first()
+            .map(|row| serde_json::from_str(row).map_err(Error::from))
+            .transpose()
     }
 
     fn insert_crash_report<P: ProcessProfileId>(

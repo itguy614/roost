@@ -71,6 +71,8 @@ Configure rules on worker profiles and evaluate each rule separately for every r
 
 Milestone 4.3 evaluates CPU thresholds using only fresh, correctly converted observations from the current owned process generation. Historical readings and rollups are for inspection. Alert evaluation and automatic restart decisions never consume historical readings, including data collected before the Mach timebase correction.
 
+A failed or incomplete evaluation cycle clears all transient streaks and dispatches no automatic actions. Already committed episodes and attempts remain durable. Simultaneous CPU and RSS breaches retain both episodes, with CPU first in line for the single restart charge. Durable cooldown and attempt eligibility use only verified monotonic elapsed intervals, with no time credit for clock steps, long sampling gaps, or daemon downtime.
+
 A meaningful rule update or deletion closes affected active episodes with `rule_updated` or `rule_removed`, preserves their historical evidence, cancels pending actions from the old revision, and resets sample streaks. The new rule requires three fresh samples collected after the change. A no-op update preserves the active episode. Edits and deletion preserve cooldown and attempt budgets for the logical slot and metric. Test a pending restart racing a rule change and an update while an episode is active.
 
 | State or input | Transition and action |

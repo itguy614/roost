@@ -92,16 +92,18 @@ fn calculate_cpu(
 struct Sampler {
     baselines: HashMap<ProcessGeneration, (MetricSubject, Baseline)>,
     next_maintenance: Option<Instant>,
+    alerts: crate::alerts::Evaluator,
+    alerts_failed: bool,
 }
 
 impl Sampler {
     fn tick(&mut self, service: &DaemonService) -> Result<(), ()> {
         let subjects = service.workers.lock().map_err(|_| ())?.metric_subjects();
+        let now = unix_timestamp();
         let measurements: Vec<_> = subjects
             .into_iter()
             .map(|subject| (subject, read_process_counters(subject.process).ok()))
             .collect();
-        let now = unix_timestamp();
         let mut baselines = HashMap::new();
         let mut current = Current::new();
         {
@@ -126,7 +128,17 @@ impl Sampler {
         let maintain = self
             .next_maintenance
             .is_none_or(|next| Instant::now() >= next);
-        if !current.is_empty() || maintain {
+        if !current.is_empty() || maintain || self.alerts.has_open() {
+            let subjects = self
+                .baselines
+                .values()
+                .map(|(subject, _)| *subject)
+                .collect::<Vec<_>>();
+            let failed = self.alerts.tick(service, &subjects, &current).is_err();
+            if failed && !self.alerts_failed {
+                tracing::warn!("resource alert evaluation did not finish");
+            }
+            self.alerts_failed = failed;
             let store = Store::open_for_metric_writes(&service.db).map_err(|_| ())?;
             let rows: Vec<_> = current
                 .values()

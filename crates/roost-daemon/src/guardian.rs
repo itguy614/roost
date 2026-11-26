@@ -92,6 +92,7 @@ fn encode_stop(cause: StopCause) -> u8 {
         StopCause::DaemonShutdown => 3,
         StopCause::StartupTimeout => 4,
         StopCause::GuardianWaitFailed => 5,
+        StopCause::ResourceThreshold => 6,
         _ => 6,
     }
 }
@@ -104,6 +105,7 @@ fn decode_stop(byte: u8) -> Option<StopCause> {
         3 => Some(StopCause::DaemonShutdown),
         4 => Some(StopCause::StartupTimeout),
         5 => Some(StopCause::GuardianWaitFailed),
+        6 => Some(StopCause::ResourceThreshold),
         _ => Some(StopCause::DaemonDisconnected),
     }
 }

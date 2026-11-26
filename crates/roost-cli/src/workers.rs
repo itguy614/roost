@@ -5,7 +5,8 @@ use roost_ipc::{
     Client,
     discovery::ResolvePhpParams,
     workers::{
-        AutostartParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams, WorkerOptions,
+        AutostartParams, CrashParams, CreateWorkerParams, LaunchParams, ProjectParams, StopParams,
+        WorkerOptions,
     },
 };
 use serde_json::Value;
@@ -17,6 +18,7 @@ pub enum Command {
     Processes(ProjectParams),
     Logs(ProjectParams),
     Crashes(ProjectParams),
+    Crash(CrashParams),
     Autostart(AutostartParams),
     Launch {
         php: ResolvePhpParams,
@@ -62,6 +64,13 @@ impl Command {
                     id: parse_id(id)?,
                     enabled,
                     idempotency_key: Some(Uuid::new_v4()),
+                })
+            }
+            (Some("worker"), Some("crash"), [action, id]) if action == "get" => {
+                Self::Crash(CrashParams {
+                    id: utf8(id)?
+                        .parse()
+                        .map_err(|_| io::Error::other("report ID must be a UUID"))?,
                 })
             }
             (Some("worker"), Some("crashes"), [id]) => {
@@ -113,6 +122,7 @@ impl Command {
             Self::Profiles(params) => serde_json::to_value(client.list_profiles(&params).await?)?,
             Self::Processes(params) => serde_json::to_value(client.list_processes(&params).await?)?,
             Self::Autostart(params) => serde_json::to_value(client.set_autostart(&params).await?)?,
+            Self::Crash(params) => serde_json::to_value(client.worker_crash(&params).await?)?,
             Self::Crashes(params) => serde_json::to_value(client.recent_crashes(&params).await?)?,
             Self::Logs(params) => serde_json::to_value(client.tail_logs(&params).await?)?,
             Self::Launch {

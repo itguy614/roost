@@ -62,10 +62,10 @@ def register(client, root, groups):
     return {"id": project}
 
 
-def start_supervision(root, client, workers=1, loaded=False):
+def start_supervision(root, client, workers=1, loaded=False, controlled_rss=False):
     fixture = root / "supervised"
     fixture.mkdir()
-    (fixture / "artisan").write_text("loaded" if loaded else "graceful")
+    (fixture / "artisan").write_text("controlled-rss" if controlled_rss else "loaded" if loaded else "graceful")
     php = root / "fixture-php"
     subprocess.run(["rustc", "--edition=2024", ROOT / "crates/roost-daemon/tests/fixtures/queue_worker.rs",
                     "-o", php], check=True)

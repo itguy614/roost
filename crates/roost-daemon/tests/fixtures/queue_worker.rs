@@ -20,6 +20,56 @@ extern "C" fn stop(_: i32) {
 
 extern "C" fn ignore(_: i32) {}
 
+// The comparison needs a predictable RSS drop when the load ends. Darwin's
+// allocator may keep freed regions resident, so the fixture owns a VM mapping.
+struct RssLoad(*mut u8);
+
+impl RssLoad {
+    const BYTES: usize = 64 * 1024 * 1024;
+
+    fn new() -> Self {
+        const READ_WRITE: i32 = 0x03;
+        const PRIVATE_ANONYMOUS: i32 = 0x1002;
+        unsafe extern "C" {
+            fn mmap(
+                address: *mut u8,
+                length: usize,
+                protection: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> *mut u8;
+        }
+        // SAFETY: mmap supplies the address and a private, writable region.
+        let pointer = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                Self::BYTES,
+                READ_WRITE,
+                PRIVATE_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(pointer as usize, usize::MAX, "could not map RSS fixture");
+        for offset in (0..Self::BYTES).step_by(4096) {
+            // SAFETY: each offset lies within the mapping. Touch each page.
+            unsafe { pointer.add(offset).write_volatile(1) };
+        }
+        Self(pointer)
+    }
+}
+
+impl Drop for RssLoad {
+    fn drop(&mut self) {
+        unsafe extern "C" {
+            fn munmap(address: *mut u8, length: usize) -> i32;
+        }
+        // SAFETY: this object uniquely owns the mapping of exactly this size.
+        assert_eq!(unsafe { munmap(self.0, Self::BYTES) }, 0);
+    }
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     if arguments == ["descendant"] {
@@ -73,11 +123,29 @@ fn main() -> ExitCode {
         println!("worker ready");
     }
     eprintln!("Authorization: Bearer secret-fixture-output");
+    let pid = std::process::id().to_string();
+    let mut memory = None;
+    let mut cpu_load = false;
+    let mut next_check = std::time::Instant::now();
     while !STOP.load(Ordering::Relaxed) {
+        if matches!(behavior.as_str(), "controlled-rss" | "controlled-cpu")
+            && std::time::Instant::now() >= next_check
+        {
+            next_check = std::time::Instant::now() + Duration::from_millis(200);
+            cpu_load = behavior == "controlled-cpu"
+                && fs::read_to_string("cpu-load-pid").is_ok_and(|target| target == pid);
+            let selected = behavior == "controlled-rss"
+                && fs::read_to_string("rss-load-pid").is_ok_and(|target| target == pid);
+            if selected && memory.is_none() {
+                memory = Some(RssLoad::new());
+            } else if !selected {
+                memory = None;
+            }
+        }
         if behavior == "soak_crash" && fs::remove_file("exit-once").is_ok() {
             return ExitCode::from(7);
         }
-        if behavior == "loaded" {
+        if behavior == "loaded" || cpu_load {
             let until = std::time::Instant::now() + Duration::from_millis(2);
             while std::time::Instant::now() < until {
                 std::hint::spin_loop();

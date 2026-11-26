@@ -1,5 +1,10 @@
+mod alert_rpc;
+mod alerts;
+mod alerts_clock;
 mod backoff;
+mod crash_rpc;
 mod discovery_rpc;
+mod event_rpc;
 mod group_rpc;
 pub mod guardian;
 mod metrics;
@@ -248,6 +253,7 @@ impl DaemonService {
         let intents = store.autostart_intents()?;
         let schedulers = store.autostart_schedulers()?;
         let startup = store.begin_daemon_run()?;
+        store.close_previous_alerts(roost_core::unix_timestamp())?;
         Ok(Self {
             workers: Mutex::new(Supervisor::new(binary, db.clone(), intents, schedulers)),
             process_metrics: Mutex::default(),
@@ -431,12 +437,22 @@ async fn dispatch(
             let _permit = permit;
             call.execute(&service)
         })
+    } else if method == "event.history" {
+        let params = decode(params)?;
+        tokio::task::spawn_blocking(move || event_rpc::history(&service, params))
     } else if method.starts_with("metrics.queue.") {
         let call = queue_metrics_rpc::QueueCall::decode(method, params)?;
+        tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if method.starts_with("metrics.alerts.") || method.starts_with("metrics.thresholds.") {
+        let call = alert_rpc::Call::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
     } else if method.starts_with("metrics.") {
         let call = metrics_rpc::MetricsCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if matches!(method, "worker.crash.get" | "scheduler.crash.get") {
+        let scheduler = method == "scheduler.crash.get";
+        let params = decode(params)?;
+        tokio::task::spawn_blocking(move || crash_rpc::get(&service, scheduler, params))
     } else if method.starts_with("scheduler.") {
         let call = scheduler_rpc::SchedulerCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
