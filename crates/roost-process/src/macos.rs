@@ -210,13 +210,18 @@ pub fn read_process_counters(expected: ProcessIdentity) -> io::Result<crate::Pro
         return Err(io::Error::last_os_error());
     }
     let usage = unsafe { usage.assume_init() };
+    let scale = mach_timebase().ok_or_else(|| io::Error::other("Mach CPU timebase unavailable"))?;
+    let cpu_ticks = u128::from(usage.ri_user_time) + u128::from(usage.ri_system_time);
+    let cpu_nanoseconds = scale
+        .nanoseconds(cpu_ticks)
+        .ok_or_else(|| io::Error::other("process CPU counter exceeds nanosecond range"))?;
     let awake_nanoseconds = clock_nanoseconds(libc::CLOCK_UPTIME_RAW)?;
     let sampled_at_nanoseconds = clock_nanoseconds(libc::CLOCK_MONOTONIC_RAW)?;
     verify()?;
     Ok(crate::ProcessCounters {
-        cpu_nanoseconds: usage.ri_user_time.saturating_add(usage.ri_system_time),
+        cpu_nanoseconds,
         rss_bytes: usage.ri_resident_size,
-        uptime_seconds: process_uptime(usage.ri_proc_start_abstime),
+        uptime_seconds: process_uptime(usage.ri_proc_start_abstime, scale),
         sampled_at_nanoseconds,
         awake_nanoseconds,
     })
@@ -232,19 +237,48 @@ fn clock_nanoseconds(kind: libc::clockid_t) -> io::Result<u64> {
     Ok((clock.tv_sec as u64) * 1_000_000_000 + clock.tv_nsec as u64)
 }
 
-// Kernel rusage reports process start in Mach timebase ticks. Keep these SDK
-// calls together despite the libc crate's deprecation of its Mach bindings.
+#[derive(Clone, Copy)]
+struct Timebase {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl Timebase {
+    fn nanoseconds(self, ticks: u128) -> Option<u64> {
+        u64::try_from(ticks * u128::from(self.numerator) / u128::from(self.denominator)).ok()
+    }
+}
+
+// proc_pid_rusage returns Mach ticks for CPU counters and process start.
+// clock_gettime already returns nanoseconds and must not be scaled again.
 #[allow(deprecated)]
-fn process_uptime(start: u64) -> Option<u64> {
-    let mut scale = libc::mach_timebase_info { numer: 0, denom: 0 };
-    // SAFETY: mach_timebase_info writes the provided struct.
-    if start == 0 || unsafe { libc::mach_timebase_info(&mut scale) } != 0 || scale.denom == 0 {
+fn mach_timebase() -> Option<Timebase> {
+    static TIMEBASE: std::sync::OnceLock<Option<Timebase>> = std::sync::OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut scale = libc::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: mach_timebase_info writes the supplied initialized struct.
+        if unsafe { libc::mach_timebase_info(&mut scale) } != 0
+            || scale.numer == 0
+            || scale.denom == 0
+        {
+            return None;
+        }
+        Some(Timebase {
+            numerator: scale.numer,
+            denominator: scale.denom,
+        })
+    })
+}
+
+#[allow(deprecated)]
+fn process_uptime(start: u64, scale: Timebase) -> Option<u64> {
+    if start == 0 {
         return None;
     }
     let elapsed = unsafe { libc::mach_absolute_time() }.checked_sub(start)?;
-    let seconds =
-        u128::from(elapsed) * u128::from(scale.numer) / u128::from(scale.denom) / 1_000_000_000;
-    u64::try_from(seconds).ok()
+    scale
+        .nanoseconds(u128::from(elapsed))
+        .map(|ns| ns / 1_000_000_000)
 }
 
 fn signal(pid: libc::pid_t, expected: ProcessIdentity, sig: i32) -> io::Result<()> {
@@ -326,6 +360,84 @@ mod tests {
                 ..ident
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn cpu_delta_matches_getrusage_on_the_host_timebase() {
+        const FIXTURE: &str = "ROOST_TEST_CPU_CONTROL";
+        if std::env::var_os(FIXTURE).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "macos::tests::cpu_delta_matches_getrusage_on_the_host_timebase",
+                    "--nocapture",
+                ])
+                .env(FIXTURE, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+
+        fn independent_cpu_ns() -> u64 {
+            let mut usage = MaybeUninit::<libc::rusage>::uninit();
+            // SAFETY: getrusage writes a rusage to the live buffer on success.
+            assert_eq!(
+                unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+                0
+            );
+            let usage = unsafe { usage.assume_init() };
+            let nanos = |part: libc::timeval| {
+                part.tv_sec as u64 * 1_000_000_000 + part.tv_usec as u64 * 1000
+            };
+            nanos(usage.ru_utime) + nanos(usage.ru_stime)
+        }
+
+        let ident = identity(&inspect(std::process::id() as i32).unwrap());
+        for (label, run) in [("idle", false), ("busy", true)] {
+            let measured_start = read_process_counters(ident).unwrap();
+            let independent_start = independent_cpu_ns();
+            if run {
+                let end = independent_start + 100_000_000;
+                while independent_cpu_ns() < end {
+                    for _ in 0..1024 {
+                        std::hint::black_box(17_u32.wrapping_mul(31));
+                    }
+                }
+            } else {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let independent = independent_cpu_ns() - independent_start;
+            let measured = read_process_counters(ident).unwrap().cpu_nanoseconds
+                - measured_start.cpu_nanoseconds;
+            eprintln!("{label}: proc_pid_rusage={measured} ns, getrusage={independent} ns");
+            assert!(
+                measured.abs_diff(independent) < 5_000_000,
+                "{label}: {measured} vs {independent}"
+            );
+        }
+        assert_eq!(
+            Timebase {
+                numerator: 1,
+                denominator: 1
+            }
+            .nanoseconds(120),
+            Some(120)
+        );
+        assert_eq!(
+            Timebase {
+                numerator: 125,
+                denominator: 3
+            }
+            .nanoseconds(120),
+            Some(5000)
         );
     }
 
