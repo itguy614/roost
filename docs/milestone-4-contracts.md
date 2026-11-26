@@ -69,6 +69,8 @@ Delivery is best effort. A helper crash between OS acceptance and its local jour
 
 Configure rules on worker profiles and evaluate each rule separately for every running worker slot's current generation. Profile and project aggregates are for inspection. There is one rule per profile and metric. CPU uses finite percentages with 100% per logical core and accepts values above 100%. RSS uses integer bytes. Both require `0 <= clear < breach`. Reject nonfinite CPU values, invalid RSS integers, duplicate metrics, unknown actions, and stale revisions. Resource-triggered restarts default to off.
 
+Milestone 4.3 evaluates CPU thresholds using only fresh, correctly converted observations from the current owned process generation. Historical readings and rollups are for inspection. Alert evaluation and automatic restart decisions never consume historical readings, including data collected before the Mach timebase correction.
+
 A meaningful rule update or deletion closes affected active episodes with `rule_updated` or `rule_removed`, preserves their historical evidence, cancels pending actions from the old revision, and resets sample streaks. The new rule requires three fresh samples collected after the change. A no-op update preserves the active episode. Edits and deletion preserve cooldown and attempt budgets for the logical slot and metric. Test a pending restart racing a rule change and an update while an episode is active.
 
 | State or input | Transition and action |
