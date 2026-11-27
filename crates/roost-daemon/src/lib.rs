@@ -9,6 +9,7 @@ mod group_rpc;
 pub mod guardian;
 mod metrics;
 mod metrics_rpc;
+mod notification_rpc;
 mod queue_metrics;
 mod queue_metrics_rpc;
 mod scheduler_rpc;
@@ -437,6 +438,12 @@ async fn dispatch(
             let _permit = permit;
             call.execute(&service)
         })
+    } else if method == "notifications.event.policy" {
+        let params = decode(params)?;
+        tokio::task::spawn_blocking(move || notification_rpc::policy(&service, params))
+    } else if method == "notifications.helper.status" {
+        let _: Empty = decode(params)?;
+        tokio::task::spawn_blocking(move || notification_rpc::status(&service))
     } else if method == "event.history" {
         let params = decode(params)?;
         tokio::task::spawn_blocking(move || event_rpc::history(&service, params))

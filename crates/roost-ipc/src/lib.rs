@@ -4,6 +4,7 @@ pub mod endpoint;
 pub mod events;
 pub mod groups;
 pub mod metrics;
+pub mod notifications;
 pub mod queue_metrics;
 pub mod scheduler;
 pub mod watch;
@@ -30,6 +31,8 @@ pub const METHODS: &[&str] = &[
     "daemon.hello",
     "daemon.status",
     "event.history",
+    "notifications.event.policy",
+    "notifications.helper.status",
     "scheduler.configure",
     "scheduler.status",
     "scheduler.start",
