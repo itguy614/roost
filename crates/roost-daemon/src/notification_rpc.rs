@@ -32,6 +32,7 @@ struct Status {
     updated_at: u64,
     connection: Connection,
     permission: Permission,
+    delivery: Option<DeliveryState>,
     last_received_event_id: Option<Uuid>,
     last_submission: Option<Outcome>,
     last_gap: Option<Gap>,
@@ -56,6 +57,14 @@ enum Permission {
     Authorized,
     Provisional,
     Ephemeral,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryState {
+    Operational,
+    WaitingForAuthorization,
+    JournalUncertain,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -119,7 +128,7 @@ pub(super) fn status(service: &DaemonService) -> Result<Value, RpcError> {
     })();
     let Some(status) = status else {
         return Ok(
-            json!({"connection":"unknown", "permission":"unknown", "last_seen_at":null,
+            json!({"connection":"unknown", "permission":"unknown", "delivery":"unknown", "last_seen_at":null,
             "last_received_event_id":null, "last_submission":null, "last_gap":null, "presentation":"unknown"}),
         );
     };
@@ -137,8 +146,12 @@ pub(super) fn status(service: &DaemonService) -> Result<Value, RpcError> {
     } else {
         json!("unknown")
     };
+    let delivery = match (fresh, status.delivery) {
+        (true, Some(state)) => serde_json::to_value(state).map_err(|_| internal_error())?,
+        _ => json!("unknown"),
+    };
     Ok(
-        json!({"connection":connection, "permission":permission, "pid":status.pid,
+        json!({"connection":connection, "permission":permission, "delivery":delivery, "pid":status.pid,
         "last_seen_at":crate::metrics_rpc::timestamp(status.updated_at), "last_received_event_id":status.last_received_event_id,
         "last_submission":status.last_submission, "last_gap":status.last_gap, "presentation":"unknown"}),
     )

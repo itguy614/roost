@@ -4,11 +4,15 @@ import Testing
 
 @MainActor private final class Sink: NotificationSink {
     var permissionValue = Permission.authorized
+    var permissionChecks = 0
     var responses: [SinkResult] = [.accepted]
     var identifiers = [String]()
     var beforeSubmit: () -> Void = {}
 
-    func permission() async -> Permission { permissionValue }
+    func permission() async -> Permission {
+        permissionChecks += 1
+        return permissionValue
+    }
 
     func submit(identifier: String, kind: String) async -> SinkResult {
         beforeSubmit()
@@ -111,6 +115,7 @@ struct DeliveryTests {
         let expired = try await waiting.process(page(event)) { _, _ in Issue.record("expired event looked up"); return .eligible }
         #expect(expired)
         #expect(waiting.journal.lastOutcome?.state == .expired)
+        #expect(waiting.state == .operational)
         #expect(sink.identifiers.isEmpty)
     }
 
@@ -165,20 +170,126 @@ struct DeliveryTests {
         #expect(sink.identifiers.isEmpty)
     }
 
-    @Test @MainActor func testRevokedPermissionPreventsRetryAfterAnAuthorizedAttempt() async throws {
+    @Test(arguments: [JournalWritePhase.beforeRename, .afterRename])
+    @MainActor func testAtomicRenameFaultControlsWhetherDeliveryCanContinue(phase: JournalWritePhase) async throws {
+        struct Injected: Error {}
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let files = try StateFiles(path: dir.path)
+        let lock = try files.lock()
+        defer { withExtendedLifetime(lock) {} }
+        let sink = Sink()
+        let event = Event(id: UUID(), kind: "process_crash", at: 1_000)
+        var clock: UInt64 = 1_010
+        var inject = true
+        let delivery = Delivery(journal: Journal(), persist: { candidate in
+            try files.writeJournal(candidate, faultAt: { point in
+                if inject, candidate.lastOutcome != nil, phase == point { throw Injected() }
+            })
+        }, sink: sink, now: { clock })
+        do {
+            _ = try await delivery.process(page(event)) { _, _ in .eligible }
+            Issue.record("expected terminal journal replacement to fail")
+        } catch is Injected {
+            #expect(phase == .beforeRename)
+        } catch StateFileError.journalDurabilityUncertain {
+            #expect(phase == .afterRename)
+        }
+        #expect(delivery.journal.cursor == nil)
+        #expect(delivery.journal.active?.attempts == 1)
+        #expect(sink.identifiers.count == 1)
+        inject = false
+        clock += 2
+
+        if phase == .beforeRename {
+            #expect(try files.readJournal() == delivery.journal)
+            #expect(delivery.state == .operational)
+            let consumed = try await delivery.process(page(event)) { _, _ in .eligible }
+            #expect(consumed)
+            #expect(sink.identifiers.count == 2)
+            #expect(Set(sink.identifiers).count == 1)
+        } else {
+            #expect(delivery.state == .journalUncertain)
+            let checks = sink.permissionChecks
+            do {
+                _ = try await delivery.process(page(event)) { _, _ in
+                    Issue.record("paused delivery performed a policy check")
+                    return .eligible
+                }
+                Issue.record("paused delivery processed the event")
+            } catch StateFileError.journalDurabilityUncertain {}
+            #expect(throws: StateFileError.journalDurabilityUncertain) {
+                try delivery.recover(kind: .retention, cursor: "recovery")
+            }
+            #expect(sink.permissionChecks == checks)
+            // A fresh engine starts from the journal reopened by the singleton owner.
+            let reopened = try files.readJournal()
+            #expect(reopened.cursor == "next")
+            #expect(reopened.lastOutcome?.state == .accepted)
+            let restarted = Delivery(journal: reopened, persist: files.writeJournal, sink: sink, now: { clock })
+            let empty = Page(lineage: lineage, items: [], next_cursor: "next", has_more: false)
+            let consumed = try await restarted.process(empty) { _, _ in
+                Issue.record("already consumed event was looked up")
+                return .eligible
+            }
+            #expect(consumed)
+            #expect(sink.identifiers.count == 1)
+        }
+    }
+
+    @Test(arguments: [Permission.undetermined, .unknown])
+    @MainActor func testAuthorizationWaitHoldsHeadWithoutSpendingAttempts(permission: Permission) async throws {
+        let sink = Sink()
+        sink.permissionValue = permission
+        let event = Event(id: UUID(), kind: "process_crash", at: 1_000)
+        let first = Page(lineage: lineage, items: [event], next_cursor: "first", has_more: true)
+        let second = Event(id: UUID(), kind: "process_crash", at: 1_001)
+        let delivery = Delivery(journal: Journal(), persist: { _ in }, sink: sink, now: { 1_010 })
+        let pending = try await delivery.process(first) { _, _ in .eligible }
+        #expect(!pending)
+        #expect(delivery.state == .waitingForAuthorization)
+        #expect(delivery.journal.active?.attempts == 0)
+        #expect(delivery.journal.cursor == nil)
+        do {
+            _ = try await delivery.process(page(second)) { _, _ in
+                Issue.record("later event bypassed pending receipt")
+                return .eligible
+            }
+            Issue.record("out-of-order page was accepted")
+        } catch DeliveryError.invalidPage {}
+        sink.permissionValue = .authorized
+        let consumed = try await delivery.process(first) { _, _ in .eligible }
+        #expect(consumed)
+        #expect(delivery.state == .operational)
+        #expect(delivery.journal.cursor == "first")
+        #expect(sink.identifiers.count == 1)
+    }
+
+    @Test(arguments: [true, false])
+    @MainActor func testEachRetryRechecksOptInAndPermissionBeforeSubmitting(optedOut: Bool) async throws {
         let sink = Sink()
         sink.responses = [.retryableFailure]
         let event = Event(id: UUID(), kind: "process_crash", at: 1_000)
         var clock: UInt64 = 1_010
+        var lookups = 0
         let delivery = Delivery(journal: Journal(), persist: { _ in }, sink: sink, now: { clock })
-        let pending = try await delivery.process(page(event)) { _, _ in .eligible }
+        let pending = try await delivery.process(page(event)) { _, _ in
+            lookups += 1
+            return .eligible
+        }
         #expect(!pending)
         clock += 2
-        sink.permissionValue = .denied
-        let consumed = try await delivery.process(page(event)) { _, _ in .eligible }
+        if !optedOut { sink.permissionValue = .denied }
+        let consumed = try await delivery.process(page(event)) { _, _ in
+            lookups += 1
+            return optedOut ? .optedOut : .eligible
+        }
         #expect(consumed)
-        #expect(delivery.journal.lastOutcome?.state == .denied)
+        #expect(sink.permissionChecks == 2)
+        #expect(lookups == 2)
         #expect(sink.identifiers.count == 1)
+        #expect(delivery.journal.lastOutcome?.state == (optedOut ? .optedOut : .denied))
     }
 
     @Test func testPrivateJournalAndSingleton() throws {

@@ -6,6 +6,7 @@ import UserNotifications
 
 @MainActor private final class NativeSink: NSObject, NotificationSink, UNUserNotificationCenterDelegate {
     private let center = UNUserNotificationCenter.current()
+    private var requestingPermission = false
 
     override init() {
         super.init()
@@ -18,6 +19,13 @@ import UserNotifications
     }
 
     func permission() async -> Permission {
+        let current = await systemPermission()
+        // macOS can report denied while an explicit consent prompt is visible.
+        // Leave eligible receipts pending until that request has actually resolved.
+        return requestingPermission && current == .denied ? .undetermined : current
+    }
+
+    private func systemPermission() async -> Permission {
         await bounded(.unknown) { complete in
             center.getNotificationSettings { settings in
                 let result: Permission
@@ -66,7 +74,10 @@ import UserNotifications
     }
 
     func requestPermission(app: NSApplication) async {
-        guard await permission() == .undetermined else { return }
+        guard await systemPermission() == .undetermined else { return }
+        requestingPermission = true
+        defer { requestingPermission = false }
+        log("authorization request started")
         if #available(macOS 14, *) { app.activate() } else { app.activate(ignoringOtherApps: true) }
         do {
             let granted = try await center.requestAuthorization(options: [.alert])
@@ -169,6 +180,7 @@ private func wallSeconds() -> UInt64 {
         let client = RoostClient(state: files)
         var previous: Connection?
         var previousPermission: Permission?
+        var previousDelivery: DeliveryState?
         var nextStatus = ContinuousClock.now
         var lastReceipt = engine.journal.lastReceived
         var previousGap = engine.journal.gap
@@ -180,6 +192,7 @@ private func wallSeconds() -> UInt64 {
             var connection: Connection = .connecting
             var more = false
             do {
+                guard engine.state != .journalUncertain else { throw StateFileError.journalDurabilityUncertain }
                 let page = try await client.page(cursor: engine.journal.cursor)
                 connection = .connected
                 let consumed = try await engine.process(page, policy: client.policy(id:lineage:))
@@ -213,14 +226,17 @@ private func wallSeconds() -> UInt64 {
             let now = wallSeconds()
             if connection != previous { log("connection=\(connection.rawValue)") }
             if permission != previousPermission { log("permission=\(permission.rawValue)") }
+            if engine.state != previousDelivery { log("delivery=\(engine.state.rawValue)") }
             if let receipt = engine.journal.lastReceived, receipt != lastReceipt { log("receipt=\(receipt)") }
             if let outcome = engine.journal.lastOutcome, outcome != lastOutcome { log("submission=\(outcome.state.rawValue) event=\(outcome.event_id)") }
             if let gap = engine.journal.gap, gap != previousGap { log("gap=\(gap.kind.rawValue)") }
-            if connection != previous || permission != previousPermission || engine.journal.lastOutcome != lastOutcome
+            if connection != previous || permission != previousPermission || engine.state != previousDelivery
+                || engine.journal.lastOutcome != lastOutcome
                 || engine.journal.lastReceived != lastReceipt || engine.journal.gap != previousGap
                 || ContinuousClock.now >= nextStatus {
                 do {
-                    try files.writeStatus(HelperStatus(pid: getpid(), now: now, connection: connection, permission: permission, journal: engine.journal))
+                    try files.writeStatus(HelperStatus(pid: getpid(), now: now, connection: connection,
+                                                       permission: permission, delivery: engine.state, journal: engine.journal))
                     nextStatus = ContinuousClock.now + .seconds(4)
                 } catch {
                     log("notification status could not be written")
@@ -237,6 +253,7 @@ private func wallSeconds() -> UInt64 {
             }
             previous = connection
             previousPermission = permission
+            previousDelivery = engine.state
             lastReceipt = engine.journal.lastReceived
             lastOutcome = engine.journal.lastOutcome
             previousGap = engine.journal.gap

@@ -2,8 +2,11 @@ import Darwin
 import Foundation
 
 public enum StateFileError: Error, Equatable {
+    case journalDurabilityUncertain
     case unsafeDirectory, unsafeFile, unavailable, duplicateHelper, oversized, unsupportedJournal
 }
+
+enum JournalWritePhase { case beforeRename, afterRename }
 
 public struct StateFiles: Sendable {
     public let directory: URL
@@ -64,18 +67,26 @@ public struct StateFiles: Sendable {
         guard data.count <= 16384 else { throw StateFileError.oversized }
         let journal = try JSONDecoder().decode(Journal.self, from: data)
         guard journal.version == 1 else { throw StateFileError.unsupportedJournal }
+        // A previous helper may have paused after rename but before directory sync.
+        // Commit the directory entry that this launch actually reopened before delivering.
+        try syncDirectory()
         return journal
     }
 
     public func writeJournal(_ journal: Journal) throws {
-        try save(journal, as: "notification-helper-journal.json", durable: true)
+        try writeJournal(journal, faultAt: { _ in })
+    }
+
+    func writeJournal(_ journal: Journal, faultAt: (JournalWritePhase) throws -> Void) throws {
+        try save(journal, as: "notification-helper-journal.json", durable: true, faultAt: faultAt)
     }
 
     public func writeStatus(_ status: HelperStatus) throws {
         try save(status, as: "notification-helper-status.json", durable: false)
     }
 
-    private func save<T: Encodable>(_ value: T, as name: String, durable: Bool) throws {
+    private func save<T: Encodable>(_ value: T, as name: String, durable: Bool,
+                                    faultAt: (JournalWritePhase) throws -> Void = { _ in }) throws {
         let data = try JSONEncoder().encode(value)
         guard data.count <= (durable ? 16384 : 8192) else { throw StateFileError.oversized }
         let temp = directory.appendingPathComponent(".notification-\(UUID())")
@@ -86,15 +97,25 @@ public struct StateFiles: Sendable {
         try stream.write(contentsOf: data)
         if durable { try stream.synchronize() }
         try stream.close()
+        try faultAt(.beforeRename)
         guard rename(temp.path, directory.appendingPathComponent(name).path) == 0 else {
             throw StateFileError.unavailable
         }
         if durable {
-            let dir = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-            guard dir >= 0 else { throw StateFileError.unavailable }
-            defer { close(dir) }
-            guard fsync(dir) == 0 else { throw StateFileError.unavailable }
+            do {
+                try faultAt(.afterRename)
+                try syncDirectory()
+            } catch {
+                throw StateFileError.journalDurabilityUncertain
+            }
         }
+    }
+
+    private func syncDirectory() throws {
+        let dir = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard dir >= 0 else { throw StateFileError.unavailable }
+        defer { close(dir) }
+        guard fsync(dir) == 0 else { throw StateFileError.unavailable }
     }
 
     private static func checkFile(_ fd: Int32, limit: Int64) throws {

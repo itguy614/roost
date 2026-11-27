@@ -29,6 +29,11 @@ public enum Connection: String, Codable, Sendable {
     case connecting, connected, disconnected, incompatible, degraded
 }
 
+public enum DeliveryState: String, Codable, Sendable {
+    case operational, waitingForAuthorization = "waiting_for_authorization"
+    case journalUncertain = "journal_uncertain"
+}
+
 public enum GapKind: String, Codable, Sendable {
     case retention, lineageChanged = "lineage_changed"
 }
@@ -76,15 +81,18 @@ public struct HelperStatus: Encodable {
     let updated_at: UInt64
     let connection: Connection
     let permission: Permission
+    let delivery: DeliveryState
     let last_received_event_id: UUID?
     let last_submission: Outcome?
     let last_gap: Gap?
 
-    public init(pid: Int32, now: UInt64, connection: Connection, permission: Permission, journal: Journal) {
+    public init(pid: Int32, now: UInt64, connection: Connection, permission: Permission,
+                delivery: DeliveryState, journal: Journal) {
         self.pid = pid
         self.updated_at = now
         self.connection = connection
         self.permission = permission
+        self.delivery = delivery
         self.last_received_event_id = journal.lastReceived
         self.last_submission = journal.lastOutcome
         self.last_gap = journal.gap
@@ -102,6 +110,7 @@ public enum DeliveryError: Error { case invalidPage }
 
 @MainActor public final class Delivery {
     public private(set) var journal: Journal
+    public private(set) var state: DeliveryState = .operational
     private let persist: (Journal) throws -> Void
     private let sink: NotificationSink
     private let now: () -> UInt64
@@ -116,17 +125,27 @@ public enum DeliveryError: Error { case invalidPage }
         self.now = now
     }
 
+    private func requireCertainJournal() throws {
+        if state == .journalUncertain { throw StateFileError.journalDurabilityUncertain }
+    }
+
     private func update(_ edit: (inout Journal) -> Void) throws {
         var next = journal
         edit(&next)
         if next != journal {
-            try persist(next)
+            do {
+                try persist(next)
+            } catch StateFileError.journalDurabilityUncertain {
+                state = .journalUncertain
+                throw StateFileError.journalDurabilityUncertain
+            }
             journal = next
         }
     }
 
     public func recover(kind: GapKind, cursor: String?, prunedThrough: String? = nil,
                         earliest: RetainedBoundary? = nil) throws {
+        try requireCertainJournal()
         if let cursor, cursor.isEmpty || cursor.utf8.count > 1024 { throw DeliveryError.invalidPage }
         try update {
             if let active = $0.active {
@@ -137,10 +156,12 @@ public enum DeliveryError: Error { case invalidPage }
             if kind == .lineageChanged { $0.lineage = nil }
             $0.gap = Gap(at: now(), kind: kind, pruned_through: prunedThrough, earliest_retained: earliest)
         }
+        state = .operational
     }
 
     /// Returns true only when this page has been durably consumed.
     public func process(_ page: Page, policy lookup: (UUID, String) async throws -> Policy) async throws -> Bool {
+        try requireCertainJournal()
         guard page.items.count <= 1, page.lineage.count == 32,
               page.lineage.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               !page.next_cursor.isEmpty, page.next_cursor.utf8.count <= 1024 else { throw DeliveryError.invalidPage }
@@ -161,12 +182,13 @@ public enum DeliveryError: Error { case invalidPage }
                 $0.lastReceived = event.id
             }
         }
-        func finish(_ state: Submission) throws -> Bool {
+        func finish(_ submission: Submission) throws -> Bool {
             try update {
-                $0.lastOutcome = Outcome(event_id: event.id, at: now(), state: state)
+                $0.lastOutcome = Outcome(event_id: event.id, at: now(), state: submission)
                 $0.active = nil
                 $0.cursor = page.next_cursor
             }
+            state = .operational
             return true
         }
         let wall = now()
@@ -187,7 +209,11 @@ public enum DeliveryError: Error { case invalidPage }
         case .eventUnavailable: return try finish(.unavailable)
         }
         if permission == .denied { return try finish(.denied) }
-        guard [.authorized, .provisional, .ephemeral].contains(permission) else { return false }
+        guard [.authorized, .provisional, .ephemeral].contains(permission) else {
+            state = .waitingForAuthorization
+            return false
+        }
+        state = .operational
         guard ["process_crash", "permanent_recovery_failure", "resource_threshold"].contains(event.kind) else {
             return try finish(.unsupported)
         }

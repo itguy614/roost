@@ -3014,7 +3014,7 @@ async fn notification_policy_uses_committed_event_lineage_and_live_profile() {
         "unknown"
     );
     let status = h.root.join("notification-helper-status.json");
-    let write = |at| {
+    let write = |at, delivery: Option<&str>| {
         let mut stream = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -3022,24 +3022,36 @@ async fn notification_policy_uses_committed_event_lineage_and_live_profile() {
             .mode(0o600)
             .open(&status)
             .unwrap();
-        write!(
-            stream,
-            "{}",
-            json!({"version":1,"pid":456,"updated_at":at,"connection":"connected",
+        let mut document = json!({"version":1,"pid":456,"updated_at":at,"connection":"connected",
             "permission":"authorized","last_received_event_id":event.id,
-            "last_submission":{"event_id":event.id,"at":at,"state":"accepted"},"last_gap":null})
-        )
-        .unwrap();
+            "last_submission":{"event_id":event.id,"at":at,"state":"accepted"},"last_gap":null});
+        if let Some(delivery) = delivery {
+            document["delivery"] = json!(delivery);
+        }
+        write!(stream, "{document}").unwrap();
     };
-    write(roost_core::unix_timestamp());
+    write(roost_core::unix_timestamp(), None);
     let fresh = client.notification_status().await.unwrap();
     assert_eq!(fresh["connection"], "connected");
     assert_eq!(fresh["last_submission"]["state"], "accepted");
     assert_eq!(fresh["presentation"], "unknown");
-    write(1);
+    assert_eq!(fresh["delivery"], "unknown");
+    for state in [
+        "operational",
+        "waiting_for_authorization",
+        "journal_uncertain",
+    ] {
+        write(roost_core::unix_timestamp(), Some(state));
+        assert_eq!(
+            client.notification_status().await.unwrap()["delivery"],
+            state
+        );
+    }
+    write(1, Some("waiting_for_authorization"));
     let stale = client.notification_status().await.unwrap();
     assert_eq!(stale["connection"], "stale");
     assert_eq!(stale["permission"], "unknown");
+    assert_eq!(stale["delivery"], "unknown");
     fs::remove_file(&status).unwrap();
     symlink(&h.db, &status).unwrap();
     assert_eq!(
