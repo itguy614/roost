@@ -239,6 +239,7 @@ pub enum ClientError {
 pub struct Client {
     stream: BufReader<UnixStream>,
     next_id: u64,
+    capabilities: Vec<String>,
 }
 
 impl Client {
@@ -256,6 +257,7 @@ impl Client {
         let mut client = Self {
             stream: BufReader::new(stream),
             next_id: 1,
+            capabilities: Vec::new(),
         };
         let hello: Hello = client
             .request(
@@ -268,7 +270,14 @@ impl Client {
         if hello.protocol_version != VERSION {
             return Err(ClientError::Response);
         }
+        client.capabilities = hello.capabilities;
         Ok(client)
+    }
+
+    pub fn supports(&self, method: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|capability| capability == method)
     }
 
     pub async fn status(&mut self) -> Result<Status, ClientError> {
@@ -324,7 +333,7 @@ impl Client {
         timeout(IO_TIMEOUT, write_frame(self.stream.get_mut(), &message)).await??;
         let frame = timeout(IO_TIMEOUT, read_frame(&mut self.stream, MAX_RESPONSE))
             .await??
-            .ok_or(ClientError::Response)?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "daemon closed IPC"))?;
         let response: Value = serde_json::from_slice(&frame)?;
         if response["jsonrpc"] != "2.0" || response["id"] != id {
             return Err(ClientError::Response);
