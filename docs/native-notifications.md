@@ -65,6 +65,8 @@ A duplicate Launch Services invocation against the same state directory exited a
 
 The review follow-up used separate, newly signed bundle identities in the logged-in macOS session. One fresh Allow prompt exposed a permission-reporting race: the prompt was visible and the outstanding OS request had yet to return, while settings temporarily reported denial. The corrected build kept a real committed crash at `waiting_for_authorization` on a second fresh identity. After choosing Allow, macOS returned `granted=true`, the helper became authorized and operational, and the same pending event advanced to OS acceptance and a matching Notification Center entry.
 
+Fresh Don’t Allow remains open. The additional fresh prompt attempts returned `granted=true`. Earlier testing established that a helper which macOS reports as denied skips a committed crash. It did not record a fresh Don’t Allow choice. Live System Settings revocation and restoration also remain open. In the banner trial, macOS accepted the request and Notification Center contained it. Focus logged suppression for that request, and a capture of the banner area did not show the notification. Visual banner confirmation with Focus off remains open.
+
 Formatting, strict Rust Clippy, 88 workspace tests and 11 Swift tests passed on this host. The Swift tests inject faults on both sides of the real journal rename, exercise unresolved permission and bounded retries, and verify fresh policy and permission checks before retries. The local development bundle passed strict signature verification.
 
 ## Cumulative resource comparison
