@@ -30,6 +30,30 @@ codesign --verify --strict "$APP"
 
 The signature is for this local test app. Distribution and system service installation are Milestone 6 gates.
 
+## Clean UI and the Roost theme
+
+Roost uses the published `@itguy614/clean-ui` npm package. The Vue entry point registers `createCleanUI()` and imports `@itguy614/clean-ui/styles`. Import named components and composables from the package root. Prefer the library's public props and slots, and use its sidebar, tables, pagination and feedback components before building a custom control. Use native behaviors for macOS window and application actions. [Clean UI documentation](https://itguy614.github.io/clean-ui/)
+
+The Roost theme lives in [`src/theme/roost.css`](src/theme/roost.css). The document applies `cui-theme-roost` so both regular and teleported components inherit the Roost tokens. `restoreColorMode()` follows system appearance by default and maintains the library's `dark` class. A future appearance setting can use the public `useColorMode().setMode()` for Light, Dark, or System and synchronize native window appearance through the desktop layer. Keep Roost-specific tokens and interaction styling here, with [approved UI v3](../../docs/ui/README.md) as the design reference.
+
+When a reusable component is missing, check the public documentation and existing Clean UI issues. Propose a focused issue upstream with the use case, expected semantics, keyboard and assistive-technology behavior, and a minimal example. Keep any Roost-specific composition local. [Clean UI issues](https://github.com/itguy614/clean-ui/issues)
+
+### Development showcase
+
+Run `npm --prefix apps/desktop run dev` and open `http://127.0.0.1:1420/?showcase` to inspect the live themed components. The showcase uses example data and can run without a daemon. The normal production build excludes it. For a native development-only review bundle, use the explicit showcase build mode.
+
+```sh
+cd apps/desktop
+npm run tauri -- build --bundles app --config \
+  '{"bundle":{"active":true},"build":{"beforeBuildCommand":"npm run build -- --mode showcase"}}'
+APP="$PWD/src-tauri/target/release/bundle/macos/Roost.app"
+codesign --force --sign - "$APP"
+codesign --verify --strict "$APP"
+open -n -a "$APP" --env ROOST_DESKTOP_APPEARANCE=light
+```
+
+Quit the showcase, then repeat the launch with `ROOST_DESKTOP_APPEARANCE=dark`. Rebuild with the regular build command to restore the dashboard bundle at that output location.
+
 ## Disposable smoke test
 
 In one terminal from the repository root, start a daemon with its own state. Keep the printed state path for the second terminal.
@@ -66,9 +90,9 @@ target/debug/roost --state-dir "$TEST_DIR/state" scheduler start "$PROJECT" "$TE
 
 Confirm the dashboard reaches 2 / 2 workers and 1 / 1 scheduler for Dispatch. Check the sidebar and table, select a project with the keyboard, then close the window and reopen it from the Dock. Quit the app before repeating with `ROOST_DESKTOP_APPEARANCE=dark`. Omit the appearance override to follow System Settings. For a fresh offline window point the test app at `"$TEST_DIR/absent"`. To verify disconnect recovery, stop the original test daemon with Control-C while the GUI is connected, confirm the last read is labeled as a previous snapshot, then start the daemon against the same private directory and wait for reconnection.
 
-A dashboard read negotiates IPC on one connection and caps per-project summary reads at eight. The list itself uses the existing bounded IPC response. A three-second deadline covers the entire snapshot. Visible refreshes run every five seconds after completion, with single-flight coalescing and a two- to fifteen-second retry backoff. Hidden or unmounted views stop scheduling reads; a result from an obsolete window/page scope is discarded. Unsupported or failed observations appear as such in the table. Daemon mutations, service management, and the shared streaming coordinator are handled in the planned later slices.
+A dashboard read negotiates IPC on one connection and reads the bounded project directory. The sidebar uses that full directory, independently of the eight-row dashboard page. A selected project is addressed by UUID and can add one summary read if it is outside the page. A three-second deadline covers the entire snapshot. Visible refreshes run every five seconds after completion, with single-flight coalescing and a two- to fifteen-second retry backoff. Hidden or unmounted views stop scheduling reads. Reopening labels cached data stale until the first successful read and displays the timestamp of the last successful update. Results from obsolete window, page or project scopes are discarded. Unsupported or failed observations appear as such in the table. Below or above desired counts describe a discrepancy. Recovery blocked is reserved for an unresolved count reported by the daemon. Daemon mutations, service management, and the shared streaming coordinator are handled in the planned later slices.
 
-## PR 1 native evidence
+## Initial desktop shell evidence
 
 The optimized local bundle displayed the populated dashboard and offline state in both appearances. A private-socket fixture that advertised IPC v2 produced the version-mismatch screen. A restart of the real test daemon preserved the GUI's last snapshot during the disconnect and refreshed it after reconnect. In a separate macOS run, a test-only timer invoked the native window close operation. No dashboard IPC connection opened during 6.5 seconds hidden. Opening the app through Launch Services refreshed on the same GUI PID. Exiting the GUI left both real daemon-owned fixture workers, their scheduler and the separately started native notification helper running. [Native window screenshots](https://github.com/itguy614/roost/tree/ba00eeae14775014e0d88d7d02c4efb6037289df)
 
@@ -85,3 +109,19 @@ The optimized resource smoke ran the same two test projects, two fixture workers
 | Daemon status IPC p95 | 2.46 ms | 1.09 ms | 1.00 ms |
 
 Each phase lasted 20.4 s. The hidden arm used the native test-only close trigger. The daemon alone peaked at 11.67 MiB in that arm. The WebKit grouping was estimated from the new process IDs in the launch interval. This smoke establishes costs for the small fixture workload. The approved 12% backend envelope continues to apply to the established full backend workload and excludes the GUI and WebKit. These measurements do not verify the macOS minimum, Intel, LaunchAgent, distribution or extended release reliability gates.
+
+## Clean UI review evidence
+
+The optimized regular and showcase bundles passed strict local signature verification. Real macOS captures show the live dashboard, offline state and development showcase in light and dark mode. The regular build emitted no showcase chunk. The first captured populated dashboard appeared after 1.07 s in light mode and 0.59 s in dark mode. Offline appeared after 0.61 s in each appearance. [Clean UI native screenshots](https://github.com/itguy614/roost/tree/01fe7f4253fcb7e77b6b81e461484480f88a41cf)
+
+The short resource rerun used two test projects, two fixture workers, one fixture scheduler and the standalone helper. Queue probes were off. Each phase lasted about 20.4 s. CPU is percent of one logical core and RSS is peak summed MiB for the process group. WebKit attribution uses the three new process IDs observed at GUI launch.
+
+| Process group | GUI absent CPU / RSS | GUI open CPU / RSS |
+| --- | ---: | ---: |
+| Daemon and descendants | 1.962% / 39.77 MiB | 2.059% / 39.58 MiB |
+| Standalone notification helper | 0.098% / 32.53 MiB | 0.147% / 32.30 MiB |
+| Tauri GUI host | — | 0.147% / 105.69 MiB |
+| WebKit processes started with the GUI | — | 1.029% / 111.75 MiB |
+| Daemon status IPC p95 | 2.39 ms | 2.68 ms |
+
+The daemon reconnected during the native smoke. Both fixture workers, the scheduler and the helper kept running after GUI exit in the resource run. Automated accessibility checks cover keyboard focus handoff, table and navigation semantics, and palette contrast. A manual VoiceOver pass remains open. The production frontend emitted approximately 590 kB JS before gzip (189 kB gzipped), triggering Vite's chunk-size warning. These short fixture measurements leave the full backend budget and platform release gates in place.

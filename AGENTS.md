@@ -23,6 +23,11 @@ Read `SPEC.md` before planning or editing. Treat it as the product baseline; fla
 - Do not commit generated artifacts, secrets or machine-local paths.
 - When an integration API is undocumented, build a discovery spike rather than inventing behavior.
 
+## Desktop UI
+- Use the published `@itguy614/clean-ui` package as Roost's Vue component system. Register `createCleanUI()` at app startup and import `@itguy614/clean-ui/styles` there. Import named components and composables from the public package root.
+- Prefer existing Clean UI components and documented props, slots, and tokens. Use native macOS UI where appropriate. Keep Roost tokens in `apps/desktop/src/theme/roost.css` and follow `docs/ui/README.md`.
+- For a genuinely missing shared component, check the Clean UI documentation and existing issues, then propose a scoped [Clean UI issue](https://github.com/itguy614/clean-ui/issues) with the use case, accessibility needs and a minimal example. Keep Roost's theme local and avoid duplicating library components.
+
 ## Definition of done for each change
 - Behavior works end to end or is explicitly marked incomplete.
 - Automated tests added and passing where executable.

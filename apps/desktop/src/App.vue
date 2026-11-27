@@ -1,18 +1,25 @@
 <script setup lang="ts">
+import {
+  CuiAlert, CuiButton, CuiEmptyState, CuiList, CuiListItem, CuiPagination,
+  CuiSidebar, CuiSidebarContent, CuiSidebarFooter, CuiSidebarHeader, CuiStatusDot,
+  CuiTable, CuiTableBody, CuiTableCell, CuiTableHead, CuiTableRow, CuiTooltip,
+} from '@itguy614/clean-ui'
 import { listen } from '@tauri-apps/api/event'
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { useDashboard, type Fault, type ProjectRow } from './dashboard'
+import { discrepancy, useDashboard, type Fault } from './dashboard'
 import icon from '../src-tauri/icons/icon.png'
 
 const dashboard = useDashboard()
-const activeProjectId = ref<string | null>(null)
 const heading = ref<HTMLElement | null>(null)
 const snapshot = computed(() => dashboard.snapshot)
-const activeProject = computed(() =>
-  snapshot.value?.projects.find((project) => project.id === activeProjectId.value),
-)
-const selectedTitle = computed(() => activeProject.value?.name ?? 'Dashboard')
-const problemCount = computed(() => snapshot.value?.projects.filter(needsAttention).length ?? 0)
+const activeProject = computed(() => {
+  const id = dashboard.selectedId
+  if (snapshot.value?.selected?.id === id) return snapshot.value.selected
+  return snapshot.value?.projects.find((project) => project.id === id)
+})
+const selectedTitle = computed(() => activeProject.value?.name ??
+  snapshot.value?.directory.find((project) => project.id === dashboard.selectedId)?.name ??
+  (dashboard.selectedId ? 'Project' : 'Dashboard'))
 const problems: Record<Fault, { title: string; description: string }> = {
   offline: { title: 'Roost daemon is offline', description: 'Start the daemon, then retry the connection.' },
   disconnected: { title: 'Connection lost', description: 'Roost will try to reconnect automatically.' },
@@ -25,6 +32,15 @@ const problems: Record<Fault, { title: string; description: string }> = {
   busy: { title: 'Dashboard is busy', description: 'Roost will try this read again.' },
 }
 const problem = computed(() => dashboard.fault && problems[dashboard.fault])
+const status = computed(() => {
+  if (dashboard.verifying) return 'Checking connection'
+  if (dashboard.fault === 'offline') return 'Daemon offline'
+  if (problem.value) return 'Daemon unavailable'
+  return 'Daemon connected'
+})
+const receivedTime = computed(() => dashboard.receivedAt === null ? null :
+  new Date(dashboard.receivedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }))
+const services = ['workers', 'scheduler'] as const
 
 let nativeVisible = true
 let mounted = false
@@ -45,7 +61,7 @@ onMounted(() => {
     if (mounted) unlisten = stop
     else stop()
   }).catch(() => {
-    // The document visibility listener also covers browser-only development.
+    // Document visibility remains available in a browser.
   })
 })
 
@@ -56,146 +72,144 @@ onUnmounted(() => {
   dashboard.setActive(false)
 })
 
-function needsAttention(project: ProjectRow) {
-  return project.observed.state === 'available' &&
-    (project.observed.summary.workers.unresolved > 0 || project.observed.summary.scheduler.unresolved > 0)
-}
-
 function navigate(id: string | null) {
-  activeProjectId.value = id
+  dashboard.selectProject(id)
   void nextTick(() => heading.value?.focus())
 }
 
 function selectPage(page: number) {
-  navigate(null)
-  dashboard.selectPage(page)
+  if (!dashboard.busy && !problem.value && !dashboard.verifying) dashboard.selectPage(page - 1)
 }
 </script>
 
 <template>
   <div class="shell antialiased">
-    <aside class="sidebar">
-      <div class="brand"><img :src="icon" alt="" width="25" height="25"> Roost</div>
-      <nav aria-label="Sidebar">
-        <button
-          class="nav-item"
-          :aria-current="!activeProject ? 'page' : undefined"
-          @click="navigate(null)"
-        >
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
-            <path d="M3.5 10h17M9 10v9.5" />
-          </svg>
-          Dashboard
-        </button>
-        <template v-if="snapshot?.projects.length">
-          <p class="nav-label">Projects</p>
-          <button
-            v-for="project in snapshot.projects"
-            :key="project.id"
-            class="nav-item"
-            :aria-current="activeProject?.id === project.id ? 'page' : undefined"
-            @click="navigate(project.id)"
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" />
-            </svg>
-            <span class="truncate">{{ project.name }}</span>
-          </button>
+    <CuiSidebar label="Roost sidebar" collapse-below="never">
+      <CuiSidebarHeader title="Roost">
+        <template #icon><img :src="icon" alt="" width="25" height="25"></template>
+      </CuiSidebarHeader>
+      <CuiSidebarContent>
+        <CuiList>
+          <CuiListItem title="Dashboard" :aria-current="dashboard.selectedId === null ? 'page' : undefined" @click="navigate(null)" />
+        </CuiList>
+        <template v-if="snapshot?.directory.length">
+          <p class="nav-label" id="project-nav">Projects</p>
+          <CuiList aria-labelledby="project-nav">
+            <CuiListItem
+              v-for="project in snapshot.directory"
+              :key="project.id"
+              :title="project.name"
+              :aria-current="dashboard.selectedId === project.id ? 'page' : undefined"
+              @click="navigate(project.id)"
+            />
+          </CuiList>
         </template>
-      </nav>
-      <p class="sidebar-status" role="status">
-        <span class="dot" :class="{ online: snapshot && !problem }" aria-hidden="true" />
-        {{ problem ? (dashboard.fault === 'offline' ? 'Daemon offline' : 'Daemon unavailable') : snapshot ? 'Daemon connected' : 'Connecting' }}
-      </p>
-    </aside>
+      </CuiSidebarContent>
+      <CuiSidebarFooter>
+        <p class="sidebar-status" role="status">
+          <CuiStatusDot :tone="dashboard.verifying ? 'info' : problem ? 'neutral' : 'success'" />
+          {{ status }}
+        </p>
+      </CuiSidebarFooter>
+    </CuiSidebar>
 
     <main>
       <header class="page-header">
         <div class="min-w-0">
           <h1 ref="heading" tabindex="-1">{{ selectedTitle }}</h1>
           <p v-if="activeProject" class="subtitle truncate" :title="activeProject.path">{{ activeProject.path }}</p>
-          <p v-else-if="snapshot" class="subtitle">{{ snapshot.total }} {{ snapshot.total === 1 ? 'project' : 'projects' }}</p>
+          <p v-else-if="snapshot && !dashboard.selectedId" class="subtitle">{{ snapshot.total }} {{ snapshot.total === 1 ? 'project' : 'projects' }}</p>
+          <p v-if="receivedTime" class="freshness" :class="{ stale: dashboard.stale }">
+            {{ dashboard.stale ? 'Stale snapshot from' : 'Last updated at' }} {{ receivedTime }}
+          </p>
         </div>
-        <button v-if="snapshot && !problem" class="button" :aria-disabled="dashboard.busy" @click="dashboard.refresh()">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M20 6v5h-5M20 11a8 8 0 1 0-2 7" />
-          </svg>
-          Refresh
-        </button>
+        <CuiTooltip v-if="snapshot && !problem && !dashboard.verifying" text="Read current state from the daemon" placement="bottom">
+          <CuiButton size="sm" color="surface-dark" :disabled="dashboard.busy" focusable-when-disabled @click="dashboard.refresh()">
+            Refresh
+          </CuiButton>
+        </CuiTooltip>
       </header>
 
-      <section v-if="problem" class="notice" role="status">
-        <h2>{{ problem.title }}</h2>
+      <CuiAlert v-if="problem" class="view-notice" :title="problem.title" color="warning" entrance="none" live="polite">
         <p>{{ problem.description }}</p>
         <p v-if="snapshot">Showing the last successful project snapshot.</p>
-        <button class="button primary" :aria-disabled="dashboard.busy" @click="dashboard.refresh()">
-          Retry connection
-        </button>
-      </section>
-      <p v-else-if="!snapshot" class="message" role="status">Connecting to the Roost daemon…</p>
+        <template #actions>
+          <CuiButton size="sm" variant="solid" :disabled="dashboard.busy" focusable-when-disabled @click="dashboard.refresh()">
+            Retry connection
+          </CuiButton>
+        </template>
+      </CuiAlert>
+      <CuiAlert v-else-if="dashboard.verifying" class="view-notice" title="Checking daemon connection" entrance="none" live="polite">
+        <span v-if="snapshot">Showing the previous snapshot until a new read succeeds.</span>
+      </CuiAlert>
 
-      <section v-if="snapshot && activeProject" class="project-detail" aria-label="Project status">
-        <dl>
-          <div><dt>Worker intent</dt><dd class="capitalize">{{ activeProject.desired_state }}</dd></div>
+      <section v-if="dashboard.selectedId" class="project-detail" aria-label="Project status">
+        <dl v-if="activeProject">
+          <div><dt>Worker intent</dt><dd>{{ activeProject.desired_state === 'running' ? 'Running requested' : 'Stopped requested' }}</dd></div>
           <template v-if="activeProject.observed.state === 'available'">
-            <div><dt>Workers running / desired</dt><dd>{{ activeProject.observed.summary.workers.running }} / {{ activeProject.observed.summary.workers.desired }}</dd></div>
-            <div><dt>Scheduler running / desired</dt><dd>{{ activeProject.observed.summary.scheduler.running }} / {{ activeProject.observed.summary.scheduler.desired }}</dd></div>
+            <div v-for="service in services" :key="service">
+              <dt><span class="capitalize">{{ service }}</span> running / desired</dt>
+              <dd>
+                {{ activeProject.observed.summary[service].running }} / {{ activeProject.observed.summary[service].desired }}
+                <span v-if="discrepancy(activeProject.observed.summary[service])" class="attention">
+                  {{ discrepancy(activeProject.observed.summary[service]) }}
+                </span>
+              </dd>
+            </div>
+            <div v-if="activeProject.desired_state === 'running' && activeProject.observed.summary.workers.desired === 0">
+              <dt>Worker capacity</dt><dd>No worker instances requested</dd>
+            </div>
           </template>
           <div v-else><dt>Observed status</dt><dd class="capitalize">{{ activeProject.observed.state }}</dd></div>
         </dl>
-        <p v-if="needsAttention(activeProject)" class="attention">Recovery blocked pending process cleanup.</p>
+        <p v-else-if="dashboard.busy" class="subtitle" role="status">Reading project status…</p>
+        <CuiEmptyState
+          v-else-if="!problem && !dashboard.verifying" size="sm" title-as="h2"
+          title="Project no longer registered" description="Choose another project from the sidebar."
+        />
       </section>
 
-      <template v-else-if="snapshot">
-        <section v-if="snapshot.total" aria-label="Registered projects">
-          <p v-if="problemCount && !problem" class="attention">
-            Recovery blocked in {{ problemCount }} {{ problemCount === 1 ? 'project on this page' : 'projects on this page' }}.
-          </p>
-          <div class="table-scroll">
-            <table>
-              <caption class="sr-only">Registered projects and their latest observed processes</caption>
-              <thead>
-                <tr>
-                  <th scope="col">Project</th>
-                  <th scope="col">Worker intent</th>
-                  <th scope="col">Workers <span>running / desired</span></th>
-                  <th scope="col">Scheduler <span>running / desired</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="project in snapshot.projects" :key="project.id">
-                  <th scope="row">
-                    <button class="project-link" @click="navigate(project.id)">{{ project.name }}</button>
-                    <span class="path truncate" :title="project.path">{{ project.path }}</span>
-                  </th>
-                  <td class="capitalize">{{ project.desired_state }}</td>
-                  <template v-if="project.observed.state === 'available'">
-                    <td>
-                      {{ project.observed.summary.workers.running }} / {{ project.observed.summary.workers.desired }}
-                      <span v-if="project.observed.summary.workers.unresolved" class="blocked">Recovery blocked</span>
-                    </td>
-                    <td>
-                      {{ project.observed.summary.scheduler.running }} / {{ project.observed.summary.scheduler.desired }}
-                      <span v-if="project.observed.summary.scheduler.unresolved" class="blocked">Recovery blocked</span>
-                    </td>
-                  </template>
-                  <td v-else colspan="2" class="muted capitalize">{{ project.observed.state }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <nav v-if="snapshot.total > snapshot.projects.length" class="pager" aria-label="Project pages">
-            <button class="button" :disabled="snapshot.page === 0 || dashboard.busy || !!problem" @click="selectPage(snapshot.page - 1)">Previous</button>
-            <span>Page {{ snapshot.page + 1 }}</span>
-            <button class="button" :disabled="!snapshot.has_next || dashboard.busy || !!problem" @click="selectPage(snapshot.page + 1)">Next</button>
-          </nav>
-        </section>
-        <section v-else-if="!problem" class="empty">
-          <h2>No projects yet</h2>
-          <p>Register a Laravel project with <code>roost project add PATH</code>.</p>
-        </section>
-      </template>
+      <section v-else-if="snapshot?.total" aria-label="Registered projects">
+        <CuiTable class="dashboard-table" size="sm" hoverable fixed-layout min-width="28rem">
+          <caption class="sr-only">Registered projects and their latest observed processes</caption>
+          <CuiTableHead>
+            <CuiTableRow>
+              <CuiTableCell width="37%" scope="col">Project</CuiTableCell>
+              <CuiTableCell width="23%" scope="col">Worker intent</CuiTableCell>
+              <CuiTableCell width="20%" scope="col">Workers <small>running / desired</small></CuiTableCell>
+              <CuiTableCell width="20%" scope="col">Scheduler <small>running / desired</small></CuiTableCell>
+            </CuiTableRow>
+          </CuiTableHead>
+          <CuiTableBody>
+            <CuiTableRow v-for="project in snapshot.projects" :key="project.id">
+              <CuiTableCell header scope="row">
+                <CuiButton class="project-link" size="sm" variant="ghost" @click="navigate(project.id)">{{ project.name }}</CuiButton>
+                <span class="path truncate" :title="project.path">{{ project.path }}</span>
+              </CuiTableCell>
+              <CuiTableCell>{{ project.desired_state === 'running' ? 'Running requested' : 'Stopped requested' }}
+                <small v-if="project.desired_state === 'running' && project.observed.state === 'available' && project.observed.summary.workers.desired === 0">
+                  No instances requested
+                </small>
+              </CuiTableCell>
+              <template v-if="project.observed.state === 'available'">
+                <CuiTableCell v-for="service in services" :key="service">
+                  {{ project.observed.summary[service].running }} / {{ project.observed.summary[service].desired }}
+                  <span v-if="discrepancy(project.observed.summary[service])" class="attention">
+                    {{ discrepancy(project.observed.summary[service]) }}
+                  </span>
+                </CuiTableCell>
+              </template>
+              <CuiTableCell v-else :colspan="2" class="subtitle capitalize">{{ project.observed.state }}</CuiTableCell>
+            </CuiTableRow>
+          </CuiTableBody>
+        </CuiTable>
+        <CuiPagination v-if="snapshot.pages > 1" class="pager" size="sm" hide-per-page hide-info
+          :current-page="snapshot.page + 1" :total-pages="snapshot.pages" @update:current-page="selectPage"
+        />
+      </section>
+      <CuiEmptyState v-else-if="snapshot && !problem && !dashboard.verifying" size="sm" title-as="h2"
+        title="No projects yet" description="Use roost project add PATH to register a Laravel project."
+      />
     </main>
   </div>
 </template>

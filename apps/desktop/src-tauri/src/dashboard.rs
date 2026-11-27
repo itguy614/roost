@@ -12,13 +12,21 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Serialize)]
 pub(crate) struct Dashboard {
     daemon: roost_ipc::Status,
+    directory: Vec<ProjectLink>,
     projects: Vec<ProjectRow>,
+    selected: Option<ProjectRow>,
     page: usize,
     total: usize,
-    has_next: bool,
+    pages: usize,
 }
 
 #[derive(Serialize)]
+struct ProjectLink {
+    id: ProjectId,
+    name: String,
+}
+
+#[derive(Clone, Serialize)]
 struct ProjectRow {
     id: ProjectId,
     name: String,
@@ -27,7 +35,7 @@ struct ProjectRow {
     observed: Observed,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "state", content = "summary", rename_all = "snake_case")]
 enum Observed {
     Available(ProjectSummary),
@@ -35,26 +43,34 @@ enum Observed {
     Unavailable,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ProjectSummary {
     workers: Counts,
     scheduler: Counts,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Counts {
     desired: u64,
     running: u64,
     unresolved: u64,
 }
 
-pub(crate) async fn read(state_dir: &Path, page: u32) -> Result<Dashboard, BridgeError> {
-    tokio::time::timeout(SNAPSHOT_TIMEOUT, fetch(state_dir, page))
+pub(crate) async fn read(
+    state_dir: &Path,
+    page: u32,
+    selected_id: Option<ProjectId>,
+) -> Result<Dashboard, BridgeError> {
+    tokio::time::timeout(SNAPSHOT_TIMEOUT, fetch(state_dir, page, selected_id))
         .await
         .map_err(|_| BridgeError::Timeout)?
 }
 
-async fn fetch(state_dir: &Path, page: u32) -> Result<Dashboard, BridgeError> {
+async fn fetch(
+    state_dir: &Path,
+    page: u32,
+    selected_id: Option<ProjectId>,
+) -> Result<Dashboard, BridgeError> {
     let mut client = Client::connect(state_dir).await.map_err(|error| {
         if matches!(
             &error,
@@ -72,41 +88,60 @@ async fn fetch(state_dir: &Path, page: u32) -> Result<Dashboard, BridgeError> {
     let daemon = client.status().await?;
     let projects = client.list_projects().await?;
     let total = projects.len();
-    let page = (page as usize).min(total.saturating_sub(1) / PAGE_SIZE);
+    let pages = total.div_ceil(PAGE_SIZE).max(1);
+    let page = (page as usize).min(pages - 1);
+    let directory = projects
+        .iter()
+        .map(|project| ProjectLink {
+            id: project.id,
+            name: project.name.clone(),
+        })
+        .collect();
     let mut rows = Vec::with_capacity(PAGE_SIZE);
-    for Project {
-        id,
-        name,
-        path,
-        desired_state,
-        ..
-    } in projects.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE)
-    {
-        let observed = if client.supports("metrics.project.summary") {
-            match client.project_metrics(&ProjectParams { id }).await {
-                Ok(data) => Observed::Available(
-                    serde_json::from_value(data).map_err(|_| BridgeError::InvalidResponse)?,
-                ),
-                Err(ClientError::Rpc(_)) => Observed::Unavailable,
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            Observed::Unsupported
-        };
-        rows.push(ProjectRow {
-            id,
-            name,
-            path: path.to_string_lossy().into_owned(),
-            desired_state,
-            observed,
-        });
+    for project in projects.iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
+        rows.push(read_row(&mut client, project).await?);
     }
+    let selected = if let Some(id) = selected_id {
+        if let Some(row) = rows.iter().find(|row| row.id == id) {
+            Some(row.clone())
+        } else if let Some(project) = projects.iter().find(|project| project.id == id) {
+            Some(read_row(&mut client, project).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(Dashboard {
         daemon,
+        directory,
         projects: rows,
+        selected,
         page,
         total,
-        has_next: (page + 1) * PAGE_SIZE < total,
+        pages,
+    })
+}
+
+async fn read_row(client: &mut Client, project: &Project) -> Result<ProjectRow, BridgeError> {
+    let id = project.id;
+    let observed = if client.supports("metrics.project.summary") {
+        match client.project_metrics(&ProjectParams { id }).await {
+            Ok(data) => Observed::Available(
+                serde_json::from_value(data).map_err(|_| BridgeError::InvalidResponse)?,
+            ),
+            Err(ClientError::Rpc(_)) => Observed::Unavailable,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        Observed::Unsupported
+    };
+    Ok(ProjectRow {
+        id,
+        name: project.name.clone(),
+        path: project.path.to_string_lossy().into_owned(),
+        desired_state: project.desired_state,
+        observed,
     })
 }
 
@@ -181,17 +216,48 @@ mod tests {
             ]}),
             _ => panic!("unadvertised request {method}"),
         }).await;
-        let data = serde_json::to_value(read(root.path(), 99).await.unwrap()).unwrap();
+        let data = serde_json::to_value(read(root.path(), 99, None).await.unwrap()).unwrap();
         assert_eq!(data["page"], 0);
         assert_eq!(data["projects"][0]["observed"]["state"], "unsupported");
         assert_eq!(data["projects"][0]["desired_state"], "stopped");
     }
 
     #[tokio::test]
+    async fn stable_directory_and_selected_project_are_independent_of_page() {
+        let root = fixture(|method| match method {
+            "daemon.hello" => json!({"result":{"protocol_version":1,"capabilities":["daemon.status","project.list","metrics.project.summary"]}}),
+            "daemon.status" => json!({"result":{"pid":12,"uptime_seconds":1,"protocol_version":1}}),
+            "project.list" => json!({"result":(1..=17).map(|n| json!({
+                "id":format!("37b85742-357b-43ea-bf6f-{n:012}"), "name":format!("Project {n}"), "path":"/tmp/project",
+                "provider":"herd","desired_state":"running","autostart":false,"watch_enabled":false,
+                "watch_rules":{"include":[],"exclude":[]},"config_owner":"local","revision":1
+            })).collect::<Vec<_>>() }),
+            "metrics.project.summary" => json!({"result":{
+                "workers":{"running":1,"desired":2,"unresolved":0},
+                "scheduler":{"running":0,"desired":0,"unresolved":0}
+            }}),
+            _ => panic!("unexpected request {method}"),
+        }).await;
+        let selected: ProjectId =
+            serde_json::from_value(json!("37b85742-357b-43ea-bf6f-000000000017")).unwrap();
+        let result = read(root.path(), 1, Some(selected)).await.unwrap();
+        assert_eq!(result.page, 1);
+        assert_eq!(result.pages, 3);
+        assert_eq!(result.directory.len(), 17);
+        assert_eq!(result.projects.len(), 8);
+        assert_eq!(result.projects[0].name, "Project 9");
+        let chosen = result.selected.unwrap();
+        assert_eq!(chosen.id, selected);
+        assert!(
+            matches!(chosen.observed, Observed::Available(summary) if summary.workers.running == 1 && summary.workers.desired == 2)
+        );
+    }
+
+    #[tokio::test]
     async fn missing_socket_and_protocol_mismatch_are_distinct() {
         let absent = tempfile::tempdir().unwrap();
         assert!(matches!(
-            read(&absent.path().join("missing"), 0).await,
+            read(&absent.path().join("missing"), 0, None).await,
             Err(BridgeError::Offline)
         ));
         let incompatible = fixture(|method| {
@@ -200,7 +266,7 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            read(incompatible.path(), 0).await,
+            read(incompatible.path(), 0, None).await,
             Err(BridgeError::Incompatible)
         ));
     }
@@ -213,7 +279,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         assert!(matches!(
-            read(root.path(), 0).await,
+            read(root.path(), 0, None).await,
             Err(BridgeError::Timeout)
         ));
         hold.abort();

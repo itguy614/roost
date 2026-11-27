@@ -12,6 +12,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@itguy614/clean-ui": "2.3.0",
     "@tauri-apps/api": "2.11.1",
     "pinia": "3.0.4",
     "vue": "3.5.46"

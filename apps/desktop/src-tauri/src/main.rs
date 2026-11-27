@@ -31,9 +31,10 @@ enum BridgeError {
 async fn dashboard_snapshot(
     bridge: tauri::State<'_, Bridge>,
     page: u32,
+    selected_id: Option<roost_core::ProjectId>,
 ) -> Result<dashboard::Dashboard, BridgeError> {
     let _active = bridge.active.try_lock().map_err(|_| BridgeError::Busy)?;
-    dashboard::read(&bridge.state_dir, page).await
+    dashboard::read(&bridge.state_dir, page, selected_id).await
 }
 
 fn main() {
