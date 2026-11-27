@@ -91,3 +91,58 @@ impl Store {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationPolicy {
+    Eligible,
+    OptedOut,
+    Suppressed,
+    Unsupported,
+    EventUnavailable,
+}
+
+impl Store {
+    pub fn notification_policy(
+        &self,
+        id: uuid::Uuid,
+        lineage: &str,
+    ) -> Result<NotificationPolicy, Error> {
+        use NotificationPolicy::*;
+        self.transaction_with(c"BEGIN", |store| {
+            if store.0.query(
+                c"SELECT 1 FROM daemon_event_state WHERE lineage=?1",
+                &[Some(lineage)],
+            )? != ["1"]
+            {
+                return Ok(EventUnavailable);
+            }
+            let event: Option<Event> = store.one(
+                c"SELECT data FROM daemon_events WHERE id=?1",
+                &id.to_string(),
+            )?;
+            let Some(event) = event else {
+                return Ok(EventUnavailable);
+            };
+            if event.actions_suppressed {
+                return Ok(Suppressed);
+            }
+            if event.process_kind != roost_core::metrics::ProcessKind::Worker {
+                return Ok(Unsupported);
+            }
+            let profile =
+                store.get_worker_profile(roost_core::WorkerProfileId(event.profile_id))?;
+            Ok(
+                if profile.is_some_and(|profile| {
+                    profile.project_id == event.project_id
+                        && profile.enabled
+                        && profile.notifications
+                }) {
+                    Eligible
+                } else {
+                    OptedOut
+                },
+            )
+        })
+    }
+}

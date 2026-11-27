@@ -92,13 +92,13 @@ pub(super) fn history(
     };
     let next = serde_json::to_string(&Cursor {
         project,
-        lineage: state.lineage,
+        lineage: state.lineage.clone(),
         after,
         high: more.then_some(high),
     })
     .map_err(|_| internal_error())?;
     Ok(
-        json!({"items": rows, "next_cursor": next, "has_more": more, "pruned_through":state.pruned.to_string()}),
+        json!({"items": rows, "lineage":state.lineage, "next_cursor": next, "has_more": more, "pruned_through":state.pruned.to_string()}),
     )
 }
 

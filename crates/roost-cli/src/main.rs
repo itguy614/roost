@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] daemon status
+  roost [--state-dir ABSOLUTE_PATH] notifications status
   roost [--state-dir ABSOLUTE_PATH] event history [--project ID] [--limit N] [--cursor CURSOR]
   roost [--state-dir ABSOLUTE_PATH] project add PATH
   roost [--state-dir ABSOLUTE_PATH] project list
@@ -70,6 +71,7 @@ const USAGE: &str = "Usage:
 
 enum Command {
     Status,
+    NotificationStatus,
     Events(roost_ipc::events::EventHistoryParams),
     Add(PathBuf),
     List,
@@ -106,6 +108,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             return Ok(ExitCode::SUCCESS);
         }
         [noun, verb] if noun == "daemon" && verb == "status" => Command::Status,
+        [noun, verb] if noun == "notifications" && verb == "status" => Command::NotificationStatus,
         [noun, verb] if noun == "project" && verb == "list" => Command::List,
         [noun, verb, path] if noun == "project" && verb == "add" => {
             let path = std::path::absolute(path)?;
@@ -168,6 +171,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         let mut failed = false;
         let result = match command {
             Command::Events(params) => client.event_history(&params).await?,
+            Command::NotificationStatus => client.notification_status().await?,
             Command::Status => serde_json::to_value(client.status().await?)?,
             Command::Add(path) => serde_json::to_value(
                 client

@@ -51,6 +51,8 @@ See [queue depth metrics](docs/queue-metrics.md) for opt-in and pending-count se
 
 See [process metrics](docs/process-metrics.md) for the CLI walkthrough, history and retention semantics, and benchmark reproduction.
 
+See [native notifications](docs/native-notifications.md) for the windowless helper, local test bundle, and delivery verification.
+
 ## Run a queue worker on macOS
 
 Start the daemon as above and register a Laravel app with a configured queue connection. Use the project UUID returned by `project add`. Roost uses Herd by default when the PHP path is omitted. You can also pass an explicit executable or select `--provider system`. See [Laravel runtime and queue discovery](docs/laravel-discovery.md) for the discovery commands and a demo.

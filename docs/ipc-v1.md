@@ -45,7 +45,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `metrics.queue.current` | Project UUID `id` | Opt-in, polling state with cleanup degradation when applicable, and selector readings with freshness or an unavailable reason |
 | `metrics.queue.history` | `project_id`, optional symbolic `connection` and `queue`, `resolution` (`raw` or `5m`), `from`, optional `to` (Unix seconds), optional `limit` and `cursor` | Queue history page with retention floor and next cursor |
 | `worker.crash.get`, `scheduler.crash.get` | Crash report UUID `id` | Stored report with `output_state` |
-| `event.history` | Optional `project_id`, `limit` from 1 to 256, and `cursor` | Durable sequence-ordered events, `has_more`, `next_cursor`, and `pruned_through` |
+| `event.history` | Optional `project_id`, `limit` from 1 to 256, and `cursor` | Durable sequence-ordered events, `lineage`, `has_more`, `next_cursor`, and `pruned_through` |
+| `notifications.event.policy` | Committed event UUID `id` and event-history `lineage` | `eligible`, `opted_out`, `suppressed`, `unsupported`, or `event_unavailable`, rechecked against the live worker profile |
+| `notifications.helper.status` | Omit or use `{}` | Timestamped helper connection, permission and delivery state, last receipt, last terminal submission, last retention or lineage gap, and unknown presentation |
 | `metrics.thresholds.get` | Worker `profile_id` | Current profile revision, notification opt-in, and rules |
 | `metrics.thresholds.update` | Worker `profile_id`, `expected_revision`, complete `rules` array, optional `notifications` and `idempotency_key` | Mutation result containing the current settings |
 | `metrics.alerts.list` | `project_id`, optional `limit` from 1 to 128 and `cursor` | Recent active and closed episodes with evidence, restart accounting, and next cursor |
@@ -115,3 +117,7 @@ See [Laravel runtime and queue discovery](laravel-discovery.md) for selection pr
 See [process metrics](process-metrics.md) for gauge states, cursor recovery, and the raw-to-rollup cutover.
 
 See [queue depth metrics](queue-metrics.md) for adapter semantics and cursor recovery.
+
+The helper status `delivery` field is independent of the IPC connection and OS permission. It is `operational` while the loop can process events, `waiting_for_authorization` while an eligible pending event is held for undetermined or unknown OS permission, and `journal_uncertain` if delivery is paused until an operator restarts the helper after an ambiguous journal replacement. A missing, stale, or older heartbeat reports `delivery: "unknown"`.
+
+See [native notifications](native-notifications.md) for the local journal, permission and OS delivery semantics.

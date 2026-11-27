@@ -2923,3 +2923,139 @@ async fn wait_for_alert_failure(client: &mut Client, diagnostics: &Path) {
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
 }
+
+#[tokio::test]
+async fn notification_policy_uses_committed_event_lineage_and_live_profile() {
+    use roost_core::{
+        event::{Event, EventKind},
+        metrics::ProcessKind,
+    };
+    use roost_ipc::{alerts::ThresholdUpdateParams, notifications::EventPolicyParams};
+    use serde_json::json;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, symlink};
+    let h = Harness::new();
+    let service = h.service();
+    let (mut client, _) = Harness::client(&service).await;
+    let app = h.app("notification", "graceful");
+    let project = h
+        .register(&mut client, &app, 1, CrashRestartPolicy::Never)
+        .await;
+    let profile = client
+        .list_profiles(&ProjectParams { id: project })
+        .await
+        .unwrap()
+        .remove(0);
+    let event = Event {
+        id: Uuid::new_v4(),
+        project_id: project,
+        profile_id: profile.id.0,
+        slot: 0,
+        process_kind: ProcessKind::Worker,
+        kind: EventKind::PermanentRecoveryFailure,
+        at: roost_core::unix_timestamp(),
+        crash_id: None,
+        actions_suppressed: false,
+    };
+    let store = Store::open(&h.db).unwrap();
+    store.record_recovery_failure(&event).unwrap();
+    let history = client
+        .event_history(&EventHistoryParams {
+            project_id: None,
+            limit: Some(1),
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    let lineage = history["lineage"].as_str().unwrap().to_owned();
+    let mut params = EventPolicyParams {
+        id: event.id,
+        lineage: "foreign".into(),
+    };
+    let first: serde_json::Value = client.notification_policy(&params).await.unwrap();
+    assert_eq!(first["policy"], "event_unavailable");
+    params.lineage = lineage;
+    let first: serde_json::Value = client.notification_policy(&params).await.unwrap();
+    assert_eq!(first["policy"], "opted_out");
+    let mut update = ThresholdUpdateParams {
+        profile_id: profile.id,
+        expected_revision: profile.revision,
+        rules: Vec::new(),
+        notifications: Some(true),
+        idempotency_key: None,
+    };
+    let revision = client.update_thresholds(&update).await.unwrap()["result"]["revision"].clone();
+    let eligible: serde_json::Value = client.notification_policy(&params).await.unwrap();
+    assert_eq!(eligible["policy"], "eligible");
+    for (process_kind, suppressed, expected) in [
+        (ProcessKind::Worker, true, "suppressed"),
+        (ProcessKind::Scheduler, false, "unsupported"),
+    ] {
+        let other = Event {
+            id: Uuid::new_v4(),
+            process_kind,
+            actions_suppressed: suppressed,
+            ..event.clone()
+        };
+        store.record_recovery_failure(&other).unwrap();
+        params.id = other.id;
+        let policy: serde_json::Value = client.notification_policy(&params).await.unwrap();
+        assert_eq!(policy["policy"], expected);
+    }
+    update.expected_revision = serde_json::from_value(revision).unwrap();
+    update.notifications = Some(false);
+    client.update_thresholds(&update).await.unwrap();
+    params.id = event.id;
+    let revoked: serde_json::Value = client.notification_policy(&params).await.unwrap();
+    assert_eq!(revoked["policy"], "opted_out");
+
+    assert_eq!(
+        client.notification_status().await.unwrap()["connection"],
+        "unknown"
+    );
+    let status = h.root.join("notification-helper-status.json");
+    let write = |at, delivery: Option<&str>| {
+        let mut stream = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&status)
+            .unwrap();
+        let mut document = json!({"version":1,"pid":456,"updated_at":at,"connection":"connected",
+            "permission":"authorized","last_received_event_id":event.id,
+            "last_submission":{"event_id":event.id,"at":at,"state":"accepted"},"last_gap":null});
+        if let Some(delivery) = delivery {
+            document["delivery"] = json!(delivery);
+        }
+        write!(stream, "{document}").unwrap();
+    };
+    write(roost_core::unix_timestamp(), None);
+    let fresh = client.notification_status().await.unwrap();
+    assert_eq!(fresh["connection"], "connected");
+    assert_eq!(fresh["last_submission"]["state"], "accepted");
+    assert_eq!(fresh["presentation"], "unknown");
+    assert_eq!(fresh["delivery"], "unknown");
+    for state in [
+        "operational",
+        "waiting_for_authorization",
+        "journal_uncertain",
+    ] {
+        write(roost_core::unix_timestamp(), Some(state));
+        assert_eq!(
+            client.notification_status().await.unwrap()["delivery"],
+            state
+        );
+    }
+    write(1, Some("waiting_for_authorization"));
+    let stale = client.notification_status().await.unwrap();
+    assert_eq!(stale["connection"], "stale");
+    assert_eq!(stale["permission"], "unknown");
+    assert_eq!(stale["delivery"], "unknown");
+    fs::remove_file(&status).unwrap();
+    symlink(&h.db, &status).unwrap();
+    assert_eq!(
+        client.notification_status().await.unwrap()["connection"],
+        "unknown"
+    );
+}
