@@ -59,9 +59,9 @@ For reconnect evidence, stop the test daemon with `kill -TERM "$DAEMON_PID"`, wa
 
 On Apple Silicon macOS 26.6.2, a signed bundle under `~/Applications` reused the bundle identifier and designated requirement of the previously approved notification spike. The windowless helper reported `authorized`, durably recorded receipt of a real daemon worker-crash event, then recorded OS acceptance. The matching stable request was found in Notification Center. A different bundle identity on this host reported `denied` and durably skipped a real crash event without submitting it. A separate event with worker notifications disabled was skipped by the authorized helper.
 
-A duplicate Launch Services invocation against the same state directory exited at the lock before requesting permission. Restarting the daemon produced a disconnect and reconnect on the same helper PID. Build 3 used the same bundle identifier and signing requirement, resumed the unchanged journal with a new PID, retained authorization, and submitted a newly committed crash event exactly once during the observed run. Notification Center contained the new request. The preserved journal cursor prevented resubmission of the earlier event.
+A duplicate Launch Services invocation against the same state directory exited at the lock before requesting permission. Restarting the daemon produced a disconnect and reconnect on the same helper PID. Build 3 used the same bundle identifier and signing requirement, resumed the unchanged journal with a new PID, retained authorization, and submitted a newly committed crash event exactly once during the observed run. Notification Center contained the new request. The preserved journal cursor prevented resubmission of the earlier event. Running against an earlier v1 daemon without the notification-policy capability produced `incompatible`, sent no submissions, and preserved the copied journal byte for byte.
 
-The prior spike supplies the observed Allow prompt for the reused identity. The production denial run observed the system's reported denied state. A fresh production prompt choice, live revocation through System Settings, and visually observed banner presentation remain manual checks. The automated fake sink exercises revocation between attempts and retains permission, acceptance, and presentation as separate states.
+The prior spike supplies the observed Allow prompt for the reused identity. The production denial run observed the system's reported denied state. A fresh production prompt choice, live revocation through System Settings, and visually observed banner presentation remain manual checks. The automated fake sink exercises revocation between attempts and retains permission, acceptance, and presentation as separate states. Formatting, strict Rust Clippy, 88 workspace tests and nine Swift tests passed on this host.
 
 ## Cumulative resource comparison
 
@@ -72,5 +72,18 @@ cargo build --release --workspace --locked
 python3 scripts/benchmark-queue-metrics.py --notification-app "$APP" \
   --candidate target/release/roost-daemon --laravel13 "$LARAVEL13_FIXTURE" --seconds 120
 ```
+
+### Measured cost
+
+Both arms ran the optimized code at `a28fab8` on the Apple Silicon macOS 26.6.2 test host.
+
+| Helper | Measured time | Combined CPU, one core | Peak daemon RSS | Peak helper RSS | Worst local IPC p95 | OS accepted / in Notification Center |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Off | 120.21 s | 10.96% | 15.06 MiB | — | 15.71 ms | 0 / 0 |
+| On | 120.61 s | 11.84% | 15.27 MiB | 32.55 MiB | 16.29 ms | 2 / 2 |
+
+The helper used 0.177 CPU seconds, or 0.15% of one core, in the measured window. The combined change was 0.89 percentage points in this pair. Other process costs varied between arms. CPU attribution covers the measured Roost, Herd, PHP, guardian and Redis processes. Shared macOS service CPU is outside that attribution. Helper status IPC p95 was 0.60 ms with delivery enabled. Both arms completed 96 Laravel PHP probes and had a two-second maximum persisted process sampling gap. SQLite and sampled journal footprint peaked at 573,440 bytes with the helper off and 619,120 bytes with it on. These fresh fixtures do not establish steady-state database size.
+
+The helper-on run logged one `resource alert evaluation did not finish` warning from the pre-existing alert evaluator. That log does not identify the underlying cause. Both resource episodes, the recovery, the guardian restart, and both native deliveries completed. The helper-off arm had no daemon warnings or errors. All measured combined CPU, daemon RSS, and IPC p95 targets were met for this workload.
 
 Physical sleep/wake, Intel, minimum macOS compatibility, and launchd operation remain release gates. Multi-day retention and storage recycling, journal peaks, and repeated queue identity churn remain Milestone 6 work. The Swift Testing runner on the Command Line Tools host links a newer testing framework than the helper's macOS 13 deployment target. Host tests do not establish support for the proposed minimum version.
