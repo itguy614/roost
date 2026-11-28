@@ -1,6 +1,8 @@
 use std::{
+    fs::Metadata,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use roost_core::{
@@ -11,6 +13,7 @@ use roost_core::{
 use roost_ipc::{
     AddParams, CONFLICT, Client, ClientError, INVALID_PARAMS, NOT_FOUND, RemoveParams,
     discovery::ResolvePhpParams,
+    mutations::{LaunchFence, ReceiptParams},
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
     watch::{DisableWatchParams, EnableWatchParams, WatchStatus},
     workers::{
@@ -128,7 +131,14 @@ pub(crate) async fn detail(client: &mut Client, project: &Project) -> Result<Det
             "queue.suggestions",
         ]
         .into_iter()
-        .filter(|method| client.supports(method))
+        .filter(|method| {
+            if *method == "provider.resolvePhp" {
+                client.supports(method) && client.supports("project.launchFence")
+            } else {
+                client.supports(method)
+                    && (method.starts_with("queue.") || client.supports("mutation.receipt"))
+            }
+        })
         .collect(),
     })
 }
@@ -141,6 +151,7 @@ pub(crate) enum Action {
     },
     Remove {
         id: ProjectId,
+        revision: roost_core::Revision,
     },
     StartWorkers {
         id: ProjectId,
@@ -171,6 +182,7 @@ pub(crate) enum Action {
     },
     SetAutostart {
         id: ProjectId,
+        revision: roost_core::Revision,
         enabled: bool,
     },
     Watch {
@@ -255,22 +267,87 @@ fn action_error(error: ClientError) -> ActionError {
     }
 }
 
-pub(crate) async fn resolve(
+#[derive(Debug, PartialEq, Eq)]
+struct ExecutableStamp {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    changed: (i64, i64),
+    modified: (i64, i64),
+}
+
+impl From<Metadata> for ExecutableStamp {
+    fn from(meta: Metadata) -> Self {
+        Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            bytes: meta.len(),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+        }
+    }
+}
+
+pub(crate) struct PreparedLaunch {
+    fence: LaunchFence,
+    ticket: Uuid,
+    php: PathBuf,
+    stamp: ExecutableStamp,
+    prepared: Instant,
+}
+
+impl PreparedLaunch {
+    pub(crate) fn ticket(&self) -> Uuid {
+        self.ticket
+    }
+
+    fn runtime(&self, id: ProjectId, ticket: Uuid) -> Result<(&Path, &LaunchFence), ActionError> {
+        if self.fence.project_id == id
+            && self.ticket == ticket
+            && self.prepared.elapsed() < Duration::from_secs(60)
+            && std::fs::metadata(&self.php)
+                .ok()
+                .is_some_and(|meta| ExecutableStamp::from(meta) == self.stamp)
+        {
+            Ok((&self.php, &self.fence))
+        } else {
+            Err(ActionError::Rejected {
+                reason: "expired_launch",
+            })
+        }
+    }
+}
+
+pub(crate) async fn prepare(
     state: &Path,
     id: ProjectId,
     provider: Option<PhpProvider>,
-) -> Result<ResolvedPhp, BridgeError> {
+) -> Result<PreparedLaunch, BridgeError> {
     let mut client = Client::connect(state).await?;
-    if !client.supports("provider.resolvePhp") {
+    if !client.supports("provider.resolvePhp") || !client.supports("project.launchFence") {
         return Err(BridgeError::Unsupported);
     }
-    Ok(client
+    let fence = client.launch_fence(&ProjectParams { id }).await?;
+    let ResolvedPhp { path, .. } = client
         .resolve_php(&ResolvePhpParams {
             id,
             provider,
             php: None,
         })
-        .await?)
+        .await?;
+    let stamp = std::fs::metadata(&path)
+        .map_err(|_| BridgeError::Unavailable)?
+        .into();
+    if client.launch_fence(&ProjectParams { id }).await? != fence {
+        return Err(BridgeError::Unavailable);
+    }
+    Ok(PreparedLaunch {
+        fence,
+        ticket: Uuid::new_v4(),
+        php: path,
+        stamp,
+        prepared: Instant::now(),
+    })
 }
 
 #[derive(Serialize)]
@@ -313,194 +390,223 @@ pub(crate) async fn discover(
     })
 }
 
-pub(crate) async fn execute(
-    state: &Path,
-    action: Action,
-    key: Uuid,
-    prepared_php: Option<PathBuf>,
-) -> Result<Receipt, ActionError> {
-    let mut client = Client::connect(state)
-        .await
-        .map_err(|error| ActionError::Connection {
-            fault: error.into(),
-        })?;
-    if !client.supports(action.method()) {
-        return Err(ActionError::Connection {
-            fault: BridgeError::Unsupported,
-        });
-    }
-    tokio::time::timeout(
-        ACTION_DEADLINE,
-        send(&mut client, action, key, prepared_php),
-    )
-    .await
-    .map_err(|_| ActionError::Uncertain)?
+pub(crate) struct WireAction {
+    request: ReceiptParams,
+    project: Option<ProjectId>,
 }
 
-async fn send(
-    client: &mut Client,
-    action: Action,
-    key: Uuid,
-    prepared_php: Option<PathBuf>,
-) -> Result<Receipt, ActionError> {
-    let method = action.method();
-    let key = Some(key);
-    let (operation_id, project_id) = match action {
-        Action::Add { path } => {
-            let reply = client
-                .add_project(&AddParams {
+impl WireAction {
+    pub(crate) fn key(&self) -> Uuid {
+        self.request.operation_id
+    }
+
+    pub(crate) fn new(
+        action: Action,
+        key: Uuid,
+        prepared: Option<&PreparedLaunch>,
+    ) -> Result<Self, ActionError> {
+        let method = action.method();
+        let runtime = action
+            .launch()
+            .map(|(id, ticket)| {
+                prepared
+                    .ok_or(ActionError::Rejected {
+                        reason: "expired_launch",
+                    })?
+                    .runtime(id, ticket)
+            })
+            .transpose()?;
+        let idempotency_key = Some(key);
+        let (project, params) = match action {
+            Action::Add { path } => (
+                None,
+                serde_json::to_value(AddParams {
                     path,
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::Remove { id } => {
-            let reply = client
-                .remove_project(&RemoveParams {
+                    idempotency_key,
+                }),
+            ),
+            Action::Remove { id, revision } => (
+                Some(id),
+                serde_json::to_value(RemoveParams {
                     id,
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::StartWorkers {
-            id, allow_horizon, ..
-        }
-        | Action::RestartWorkers {
-            id, allow_horizon, ..
-        } => {
-            let request = LaunchParams {
-                id,
-                php: prepared_php.ok_or(ActionError::Rejected {
-                    reason: "expired_launch",
-                })?,
-                allow_horizon,
-                idempotency_key: key,
-            };
-            let reply = if method == "project.restart" {
-                client.restart_project(&request).await
-            } else {
-                client.start_project(&request).await
+                    idempotency_key,
+                    expected_revision: Some(revision),
+                }),
+            ),
+            Action::StartWorkers {
+                id, allow_horizon, ..
             }
-            .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::StopWorkers { id } => {
-            let reply = client
-                .stop_project(&StopParams {
+            | Action::RestartWorkers {
+                id, allow_horizon, ..
+            } => {
+                let (php, fence) = runtime.expect("worker launch resolved above");
+                (
+                    Some(id),
+                    serde_json::to_value(LaunchParams {
+                        id,
+                        php: php.to_owned(),
+                        allow_horizon,
+                        idempotency_key,
+                        fence: Some(fence.clone()),
+                    }),
+                )
+            }
+            Action::StopWorkers { id } | Action::StopScheduler { id } => (
+                Some(id),
+                serde_json::to_value(StopParams {
                     id,
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::ConfigureScheduler { id } => {
-            let reply = client
-                .configure_scheduler(&ConfigureSchedulerParams {
+                    idempotency_key,
+                }),
+            ),
+            Action::ConfigureScheduler { id } => (
+                Some(id),
+                serde_json::to_value(ConfigureSchedulerParams {
                     id,
                     expected_revision: None,
                     options: SchedulerOptions::default(),
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.project_id)
-        }
-        Action::StartScheduler { id, .. } | Action::RestartScheduler { id, .. } => {
-            let request = SchedulerLaunchParams {
-                id,
-                php: prepared_php.ok_or(ActionError::Rejected {
-                    reason: "expired_launch",
-                })?,
-                idempotency_key: key,
-            };
-            let reply = if method == "scheduler.restart" {
-                client.restart_scheduler(&request).await
-            } else {
-                client.start_scheduler(&request).await
+                    idempotency_key,
+                }),
+            ),
+            Action::StartScheduler { id, .. } | Action::RestartScheduler { id, .. } => {
+                let (php, fence) = runtime.expect("scheduler launch resolved above");
+                (
+                    Some(id),
+                    serde_json::to_value(SchedulerLaunchParams {
+                        id,
+                        php: php.to_owned(),
+                        idempotency_key,
+                        fence: Some(fence.clone()),
+                    }),
+                )
             }
-            .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::StopScheduler { id } => {
-            let reply = client
-                .stop_scheduler(&StopParams {
-                    id,
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::SetAutostart { id, enabled } => {
-            let reply = client
-                .set_autostart(&AutostartParams {
+            Action::SetAutostart {
+                id,
+                revision,
+                enabled,
+            } => (
+                Some(id),
+                serde_json::to_value(AutostartParams {
                     id,
                     enabled,
-                    idempotency_key: key,
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::Watch {
-            id,
-            revision,
-            enabled,
-        } => {
-            let reply = if enabled {
-                client
-                    .enable_watch(&EnableWatchParams {
-                        id,
-                        expected_revision: revision,
-                        rules: None,
-                        idempotency_key: key,
-                    })
-                    .await
-            } else {
-                client
-                    .disable_watch(&DisableWatchParams {
-                        id,
-                        expected_revision: revision,
-                        idempotency_key: key,
-                    })
-                    .await
-            }
-            .map_err(action_error)?;
-            (reply.operation_id, reply.result.id)
-        }
-        Action::CreateProfile {
-            id,
-            name,
-            connection,
-            queues,
-            instances,
-        } => {
-            let reply = client
-                .create_worker(&CreateWorkerParams {
+                    idempotency_key,
+                    expected_revision: Some(revision),
+                }),
+            ),
+            Action::Watch {
+                id,
+                revision,
+                enabled: true,
+            } => (
+                Some(id),
+                serde_json::to_value(EnableWatchParams {
+                    id,
+                    expected_revision: revision,
+                    rules: None,
+                    idempotency_key,
+                }),
+            ),
+            Action::Watch {
+                id,
+                revision,
+                enabled: false,
+            } => (
+                Some(id),
+                serde_json::to_value(DisableWatchParams {
+                    id,
+                    expected_revision: revision,
+                    idempotency_key,
+                }),
+            ),
+            Action::CreateProfile {
+                id,
+                name,
+                connection,
+                queues,
+                instances,
+            } => (
+                Some(id),
+                serde_json::to_value(CreateWorkerParams {
                     project_id: id,
                     name,
                     connection,
-                    idempotency_key: key,
+                    idempotency_key,
                     options: WorkerOptions {
                         queues,
                         instances,
                         ..WorkerOptions::default()
                     },
-                })
-                .await
-                .map_err(action_error)?;
-            (reply.operation_id, reply.result.project_id)
+                }),
+            ),
+        };
+        Ok(Self {
+            request: ReceiptParams {
+                operation_id: key,
+                method: method.into(),
+                params: params.map_err(|_| ActionError::Rejected {
+                    reason: "validation",
+                })?,
+            },
+            project,
+        })
+    }
+
+    pub(crate) async fn submit(&self, state: &Path) -> Result<Receipt, ActionError> {
+        let mut client = Client::connect(state)
+            .await
+            .map_err(|error| ActionError::Connection {
+                fault: error.into(),
+            })?;
+        if !client.supports(&self.request.method) || !client.supports("mutation.receipt") {
+            return Err(ActionError::Connection {
+                fault: BridgeError::Unsupported,
+            });
         }
-    };
-    Ok(Receipt {
-        operation_id,
-        project_id,
-    })
+        let reply = tokio::time::timeout(
+            ACTION_DEADLINE,
+            client.submit_mutation(&self.request.method, &self.request.params),
+        )
+        .await
+        .map_err(|_| ActionError::Uncertain)?
+        .map_err(action_error)?;
+        self.decode_receipt(reply)
+    }
+
+    pub(crate) async fn recover(&self, state: &Path) -> Result<Option<Receipt>, ActionError> {
+        let mut client = Client::connect(state)
+            .await
+            .map_err(|error| ActionError::Connection {
+                fault: error.into(),
+            })?;
+        if !client.supports("mutation.receipt") {
+            return Err(ActionError::Connection {
+                fault: BridgeError::Unsupported,
+            });
+        }
+        client
+            .mutation_receipt(&self.request)
+            .await
+            .map_err(action_error)?
+            .map(|reply| self.decode_receipt(reply))
+            .transpose()
+    }
+
+    fn decode_receipt(
+        &self,
+        reply: roost_ipc::Mutation<serde_json::Value>,
+    ) -> Result<Receipt, ActionError> {
+        if reply.operation_id != self.request.operation_id {
+            return Err(ActionError::Uncertain);
+        }
+        let project_id = match self.project {
+            Some(id) => id,
+            None => serde_json::from_value(reply.result["id"].clone())
+                .map_err(|_| ActionError::Uncertain)?,
+        };
+        Ok(Receipt {
+            operation_id: reply.operation_id,
+            project_id,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -513,6 +619,15 @@ mod tests {
 
     use super::*;
 
+    async fn execute(
+        state: &Path,
+        action: Action,
+        key: Uuid,
+        prepared: Option<&PreparedLaunch>,
+    ) -> Result<Receipt, ActionError> {
+        WireAction::new(action, key, prepared)?.submit(state).await
+    }
+
     struct Daemon(Child);
     impl Drop for Daemon {
         fn drop(&mut self) {
@@ -522,6 +637,67 @@ mod tests {
                 .status();
             let _ = self.0.wait();
         }
+    }
+
+    fn start_daemon(state: &Path, bin: &Path) -> Daemon {
+        Daemon(
+            Command::new(std::env::var_os("ROOST_SMOKE_DAEMON").unwrap())
+                .arg("--state-dir")
+                .arg(state)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    async fn drop_committed_reply(state: &Path, request: &WireAction) {
+        use roost_ipc::{
+            MAX_REQUEST, MAX_RESPONSE, endpoint::SOCKET_NAME, read_frame, write_frame,
+        };
+        use tokio::{
+            io::BufReader,
+            net::{UnixListener, UnixStream},
+        };
+
+        let proxy = state.with_extension("proxy");
+        fs::create_dir(&proxy).unwrap();
+        fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = proxy.join(SOCKET_NAME);
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let daemon_socket = state.join(SOCKET_NAME);
+        let relay = tokio::spawn(async move {
+            let (outbound, _) = listener.accept().await.unwrap();
+            let mut outbound = BufReader::new(outbound);
+            let mut daemon = BufReader::new(UnixStream::connect(daemon_socket).await.unwrap());
+            let mut response = Vec::new();
+            for forward_to_client in [true, false] {
+                let frame = read_frame(&mut outbound, MAX_REQUEST)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                write_frame(daemon.get_mut(), &frame).await.unwrap();
+                response = read_frame(&mut daemon, MAX_RESPONSE)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if forward_to_client {
+                    write_frame(outbound.get_mut(), &response).await.unwrap();
+                }
+            }
+            // The real daemon's receipt has arrived at the relay. Close the
+            // desktop connection before delivering any of the mutation reply.
+            serde_json::from_slice::<serde_json::Value>(&response).unwrap()
+        });
+        assert!(matches!(
+            request.submit(&proxy).await,
+            Err(ActionError::Uncertain)
+        ));
+        assert_eq!(
+            relay.await.unwrap()["result"]["operation_id"],
+            request.key().to_string()
+        );
     }
 
     #[test]
@@ -569,14 +745,7 @@ mod tests {
         let php = bin.join("php");
         fs::copy(std::env::var_os("ROOST_SMOKE_WORKER").unwrap(), &php).unwrap();
         fs::set_permissions(&php, fs::Permissions::from_mode(0o700)).unwrap();
-        let _daemon = Daemon(
-            Command::new(std::env::var_os("ROOST_SMOKE_DAEMON").unwrap())
-                .args(["--state-dir", state.to_str().unwrap()])
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-                .stdout(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let _daemon = start_daemon(&state, &bin);
 
         wait_for(|| async { Client::connect(&state).await.is_ok() }).await;
         let path = root.path().join("Dispatch");
@@ -633,19 +802,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let resolved = resolve(&state, id, Some(PhpProvider::System))
+        let resolved = prepare(&state, id, Some(PhpProvider::System))
             .await
             .unwrap();
-        assert_eq!(resolved.path, php);
+        assert_eq!(resolved.php, php);
         execute(
             &state,
             Action::StartWorkers {
                 id,
-                ticket: Uuid::new_v4(),
+                ticket: resolved.ticket(),
                 allow_horizon: false,
             },
             Uuid::new_v4(),
-            Some(resolved.path.clone()),
+            Some(&resolved),
         )
         .await
         .unwrap();
@@ -653,10 +822,10 @@ mod tests {
             &state,
             Action::StartScheduler {
                 id,
-                ticket: Uuid::new_v4(),
+                ticket: resolved.ticket(),
             },
             Uuid::new_v4(),
-            Some(resolved.path.clone()),
+            Some(&resolved),
         )
         .await
         .unwrap();
@@ -696,11 +865,11 @@ mod tests {
             &state,
             Action::RestartWorkers {
                 id,
-                ticket: Uuid::new_v4(),
+                ticket: resolved.ticket(),
                 allow_horizon: false,
             },
             Uuid::new_v4(),
-            Some(resolved.path),
+            Some(&resolved),
         )
         .await
         .unwrap();
@@ -795,9 +964,250 @@ mod tests {
         )
         .await
         .unwrap();
-        execute(&state, Action::Remove { id }, Uuid::new_v4(), None)
+        let latest = cli.get_project(&roost_ipc::GetParams { id }).await.unwrap();
+        execute(
+            &state,
+            Action::Remove {
+                id,
+                revision: latest.revision,
+            },
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(cli.list_projects().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the built daemon and CLI alongside ROOST_SMOKE_WORKER"]
+    async fn real_daemon_recovers_lost_reply_and_fences_unaccepted_mutations() {
+        let root = tempfile::Builder::new()
+            .prefix("roost-desk-receipt-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let state = root.path().join("state");
+        let path = root.path().join("Dispatch Team");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("artisan"), "graceful").unwrap();
+        let php = root.path().join("php");
+        fs::copy(std::env::var_os("ROOST_SMOKE_WORKER").unwrap(), &php).unwrap();
+        let daemon = start_daemon(&state, root.path());
+        wait_for(|| async { Client::connect(&state).await.is_ok() }).await;
+
+        let id = execute(&state, Action::Add { path }, Uuid::new_v4(), None)
+            .await
+            .unwrap()
+            .project_id;
+        let mut cli = Client::connect(&state).await.unwrap();
+        let cli_path =
+            PathBuf::from(std::env::var_os("ROOST_SMOKE_DAEMON").unwrap()).with_file_name("roost");
+        let cli_state = state.clone();
+        let configure_cli = tokio::task::spawn_blocking(move || {
+            Command::new(cli_path)
+                .arg("--state-dir")
+                .arg(cli_state)
+                .args([
+                    "scheduler",
+                    "configure",
+                    &id.0.to_string(),
+                    "--options-json",
+                    r#"{"graceful_stop_seconds":27}"#,
+                ])
+                .output()
+                .unwrap()
+        });
+        // The real CLI races a prepared desktop create with different options.
+        let (cli_result, desktop_result) = tokio::join!(
+            configure_cli,
+            execute(
+                &state,
+                Action::ConfigureScheduler { id },
+                Uuid::new_v4(),
+                None
+            ),
+        );
+        let cli_result = cli_result.unwrap();
+        let cli_won = cli_result.status.success();
+        assert_ne!(cli_won, desktop_result.is_ok(), "{cli_result:?}");
+        if !cli_won {
+            assert!(
+                String::from_utf8_lossy(&cli_result.stderr).contains("revision"),
+                "{cli_result:?}"
+            );
+        }
+        let configured = cli
+            .scheduler_status(&ProjectParams { id })
+            .await
+            .unwrap()
+            .profile
+            .unwrap();
+        assert_eq!(
+            configured.graceful_stop_seconds,
+            if cli_won { 27 } else { 15 }
+        );
+        assert!(matches!(
+            execute(
+                &state,
+                Action::ConfigureScheduler { id },
+                Uuid::new_v4(),
+                None
+            )
+            .await,
+            Err(ActionError::Rejected { reason: "conflict" })
+        ));
+        assert_eq!(
+            cli.scheduler_status(&ProjectParams { id })
+                .await
+                .unwrap()
+                .profile
+                .unwrap()
+                .revision,
+            configured.revision
+        );
+
+        cli.configure_scheduler(&ConfigureSchedulerParams {
+            id,
+            expected_revision: Some(configured.revision),
+            options: SchedulerOptions {
+                graceful_stop_seconds: 31,
+                ..Default::default()
+            },
+            idempotency_key: Some(Uuid::new_v4()),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            execute(
+                &state,
+                Action::ConfigureScheduler { id },
+                Uuid::new_v4(),
+                None
+            )
+            .await,
+            Err(ActionError::Rejected { reason: "conflict" })
+        ));
+        assert_eq!(
+            cli.scheduler_status(&ProjectParams { id })
+                .await
+                .unwrap()
+                .profile
+                .unwrap()
+                .graceful_stop_seconds,
+            31
+        );
+
+        let prepared = prepare(&state, id, Some(PhpProvider::System))
             .await
             .unwrap();
-        assert!(cli.list_projects().await.unwrap().is_empty());
+        let launch = || Action::StartScheduler {
+            id,
+            ticket: prepared.ticket(),
+        };
+        let accepted = WireAction::new(launch(), Uuid::new_v4(), Some(&prepared)).unwrap();
+        let unaccepted = WireAction::new(launch(), Uuid::new_v4(), Some(&prepared)).unwrap();
+        drop_committed_reply(&state, &accepted).await;
+        wait_for(|| async { accepted.recover(&state).await.unwrap().is_some() }).await;
+        let receipt = accepted.recover(&state).await.unwrap().unwrap();
+        assert_eq!(receipt.project_id, id);
+        assert_eq!(receipt.operation_id, accepted.key());
+        assert!(unaccepted.recover(&state).await.unwrap().is_none());
+        let wrong_payload =
+            WireAction::new(Action::StopScheduler { id }, accepted.key(), None).unwrap();
+        assert!(matches!(
+            wrong_payload.recover(&state).await,
+            Err(ActionError::Rejected { reason: "conflict" })
+        ));
+
+        let revision = cli
+            .get_project(&roost_ipc::GetParams { id })
+            .await
+            .unwrap()
+            .revision;
+        execute(
+            &state,
+            Action::SetAutostart {
+                id,
+                revision,
+                enabled: true,
+            },
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap();
+        for action in [
+            Action::SetAutostart {
+                id,
+                revision,
+                enabled: false,
+            },
+            Action::Remove { id, revision },
+        ] {
+            assert!(matches!(
+                execute(&state, action, Uuid::new_v4(), None).await,
+                Err(ActionError::Rejected { reason: "conflict" })
+            ));
+        }
+        assert!(
+            cli.get_project(&roost_ipc::GetParams { id })
+                .await
+                .unwrap()
+                .autostart
+        );
+        assert!(matches!(
+            unaccepted.submit(&state).await,
+            Err(ActionError::Rejected { reason: "conflict" })
+        ));
+        assert!(accepted.recover(&state).await.unwrap().is_some());
+
+        execute(&state, Action::StopScheduler { id }, Uuid::new_v4(), None)
+            .await
+            .unwrap();
+        let before_restart = prepare(&state, id, Some(PhpProvider::System))
+            .await
+            .unwrap();
+        let prior_daemon = WireAction::new(
+            Action::StartScheduler {
+                id,
+                ticket: before_restart.ticket(),
+            },
+            Uuid::new_v4(),
+            Some(&before_restart),
+        )
+        .unwrap();
+        fs::write(&php, "replaced runtime").unwrap();
+        assert!(matches!(
+            WireAction::new(
+                Action::StartScheduler {
+                    id,
+                    ticket: before_restart.ticket()
+                },
+                Uuid::new_v4(),
+                Some(&before_restart)
+            ),
+            Err(ActionError::Rejected {
+                reason: "expired_launch"
+            })
+        ));
+        drop(daemon);
+        let _daemon = start_daemon(&state, root.path());
+        wait_for(|| async { Client::connect(&state).await.is_ok() }).await;
+        assert!(accepted.recover(&state).await.unwrap().is_some());
+        assert!(prior_daemon.recover(&state).await.unwrap().is_none());
+        assert!(matches!(
+            prior_daemon.submit(&state).await,
+            Err(ActionError::Rejected { reason: "conflict" })
+        ));
+        assert_eq!(
+            Client::connect(&state)
+                .await
+                .unwrap()
+                .scheduler_status(&ProjectParams { id })
+                .await
+                .unwrap()
+                .desired_state,
+            DesiredState::Stopped
+        );
     }
 }

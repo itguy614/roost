@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  CuiAlert, CuiButton, CuiEmptyState, CuiList, CuiListItem, CuiPagination,
+  CuiAlert, CuiButton, CuiConfirmDialog, CuiEmptyState, CuiList, CuiListItem, CuiPagination,
   CuiSidebar, CuiSidebarContent, CuiSidebarFooter, CuiSidebarHeader, CuiStatusDot,
   CuiTable, CuiTableBody, CuiTableCell, CuiTableHead, CuiTableRow, CuiTooltip,
 } from '@itguy614/clean-ui'
@@ -34,7 +34,7 @@ const problems: Record<Fault, { title: string; description: string }> = {
   busy: { title: 'Dashboard is busy', description: 'Roost will try this read again.' },
 }
 const operations = useProjectOperations(dashboard.invalidate, navigate)
-const { busy: operationBusy, confirmation, notice, replay, locked: operationLocked } = operations
+const { busy: operationBusy, confirmation, confirmationOrigin, notice, replay, locked: operationLocked } = operations
 const actionsLocked = computed(() => operationLocked.value || dashboard.stale || dashboard.verifying || !!dashboard.fault)
 const problem = computed(() => dashboard.fault && problems[dashboard.fault])
 const status = computed(() => {
@@ -77,7 +77,8 @@ onUnmounted(() => {
   dashboard.setActive(false)
 })
 
-function navigate(id: string | null) {
+function navigate(id: string | null, removed?: string) {
+  if (removed && dashboard.selectedId !== removed) return
   dashboard.selectProject(id)
   void nextTick(() => heading.value?.focus())
 }
@@ -152,17 +153,22 @@ function selectPage(page: number) {
         <span v-if="snapshot">Showing the previous snapshot until a new read succeeds.</span>
       </CuiAlert>
 
-      <CuiAlert v-if="confirmation" class="view-notice" :title="confirmation.label" color="warning" entrance="none" live="polite">
-        {{ confirmation.message }}
-        <template #actions>
-          <CuiButton size="sm" @click="confirmation = undefined">Cancel</CuiButton>
-          <CuiButton size="sm" variant="solid" :disabled="dashboard.stale || dashboard.verifying || !!dashboard.fault" @click="operations.confirm()">Confirm</CuiButton>
-        </template>
-      </CuiAlert>
-      <CuiAlert v-if="notice || replay" class="view-notice" :color="notice?.error || replay ? 'warning' : 'info'" entrance="none" live="polite">
+      <CuiConfirmDialog
+        :visible="!!confirmation" :variant="confirmation?.action.kind === 'remove' ? 'danger' : 'warning'"
+        :title="confirmation?.label" :message="confirmation && `${confirmation.target}. ${confirmation.message}`"
+        :confirm-text="confirmation?.label" initial-focus=".cui-modal-footer button" :return-focus="confirmationOrigin ?? undefined"
+        :loading="dashboard.stale || dashboard.verifying || !!dashboard.fault"
+        @confirm="operations.confirm()" @update:visible="!$event && operations.cancel()"
+      />
+      <CuiAlert v-if="notice || replay" class="view-notice" :title="notice?.title ?? (replay && `${replay.label} — ${replay.target}`)"
+        :color="notice?.error || replay ? 'warning' : 'info'" entrance="none" live="polite">
         {{ notice?.text ?? 'Checking the earlier request…' }}
         <template v-if="replay" #actions>
-          <CuiButton size="sm" :disabled="operationBusy || dashboard.stale || dashboard.verifying || !!dashboard.fault" @click="operations.retry()">Retry same request</CuiButton>
+          <CuiButton size="sm" :disabled="operationBusy || dashboard.stale || dashboard.verifying || !!dashboard.fault"
+            @click="operations.reconcile()">Check receipt</CuiButton>
+          <CuiButton size="sm" color="surface-dark" :disabled="operationBusy" @click="operations.reconcile(true)">
+            Return to project status
+          </CuiButton>
         </template>
       </CuiAlert>
 

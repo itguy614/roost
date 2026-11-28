@@ -31,12 +31,15 @@ type WorkerLaunch = { kind: 'start_workers' | 'restart_workers'; id: string; tic
 type Launch = WorkerLaunch | { kind: 'start_scheduler' | 'restart_scheduler'; id: string; ticket: string }
 export type ProjectAction = Launch
   | { kind: 'add'; path: string }
-  | { kind: 'remove' | 'stop_workers' | 'stop_scheduler' | 'configure_scheduler'; id: string }
+  | { kind: 'remove'; id: string; revision: number }
+  | { kind: 'stop_workers' | 'stop_scheduler' | 'configure_scheduler'; id: string }
   | { kind: 'watch'; id: string; revision: number; enabled: boolean }
-  | { kind: 'set_autostart'; id: string; enabled: boolean }
+  | { kind: 'set_autostart'; id: string; revision: number; enabled: boolean }
   | { kind: 'create_profile'; id: string; name: string; connection: string; queues: string[]; instances: number }
 
-interface Request { action: ProjectAction; key: string; label: string }
+export interface ProjectTarget { id: string; name: string; path: string }
+interface Decision { action: ProjectAction; label: string; target: string; returnFocus?: HTMLElement }
+interface Request extends Decision { key: string }
 interface Receipt { project_id: string; operation_id: string }
 type ActionError =
   | { kind: 'uncertain' }
@@ -60,11 +63,14 @@ const rejected: Record<string, string> = {
   expired_launch: 'The prepared PHP runtime is unavailable. Resolve it again before launching.',
 }
 
-export function useProjectOperations(refresh: () => void, select: (id: string | null) => void) {
+function operationTitle(decision: Decision) { return `${decision.label} — ${decision.target}` }
+
+export function useProjectOperations(refresh: () => void, select: (id: string | null, removed?: string) => void) {
   const busy = ref(false)
   const replay = shallowRef<Request>()
-  const confirmation = shallowRef<{ action: ProjectAction; label: string; message: string }>()
-  const notice = shallowRef<{ text: string; error: boolean }>()
+  const confirmation = shallowRef<Decision & { message: string }>()
+  const confirmationOrigin = shallowRef<HTMLElement>()
+  const notice = shallowRef<{ title: string; text: string; error: boolean }>()
   const locked = computed(() => busy.value || !!replay.value || !!confirmation.value)
 
   async function send(request: Request) {
@@ -72,29 +78,26 @@ export function useProjectOperations(refresh: () => void, select: (id: string | 
     notice.value = undefined
     try {
       const receipt = await invoke<Receipt>('project_action', { action: request.action, key: request.key })
-      replay.value = undefined
-      if (request.action.kind === 'add') select(receipt.project_id)
-      if (request.action.kind === 'remove') select(null)
-      notice.value = { text: `${request.label} accepted. The project view refreshes from daemon observations.`, error: false }
+      accepted(request, receipt)
     } catch (error) {
       const result = error as ActionError | null
       const action = request.action
       if (result?.kind === 'rejected') {
-        replay.value = undefined
         if (result.reason === 'horizon' && 'allow_horizon' in action && !action.allow_horizon) {
+          confirmationOrigin.value = request.returnFocus
           confirmation.value = {
+            ...request,
             action: { ...action, allow_horizon: true },
-            label: request.label,
             message: 'Horizon is listed in this project. Queue workers can compete with Horizon. Confirm only if you intend to run both.',
           }
         } else {
-          notice.value = { text: rejected[result.reason] ?? 'The daemon rejected this operation.', error: true }
+          notice.value = { title: operationTitle(request), text: rejected[result.reason] ?? 'The daemon rejected this operation. Project status has been refreshed.', error: true }
         }
-      } else if (result?.kind === 'connection' && !replay.value) {
-        notice.value = { text: 'The operation could not connect to a compatible daemon. Check the connection and try again.', error: true }
+      } else if (result?.kind === 'connection') {
+        notice.value = { title: operationTitle(request), text: 'The operation could not connect to a compatible daemon. Check the connection and try again.', error: true }
       } else {
         replay.value = request
-        notice.value = { text: 'The daemon reply was lost or inconclusive. Retry the same request to recover its acknowledgement.', error: true }
+        notice.value = { title: operationTitle(request), text: 'The daemon reply was lost or inconclusive. Check the original receipt, or return to project status to reconcile the result.', error: true }
       }
     } finally {
       busy.value = false
@@ -102,68 +105,100 @@ export function useProjectOperations(refresh: () => void, select: (id: string | 
     }
   }
 
+  function accepted(request: Request, receipt: Receipt) {
+    replay.value = undefined
+    if (request.action.kind === 'add') select(receipt.project_id)
+    if (request.action.kind === 'remove') select(null, request.action.id)
+    notice.value = { title: operationTitle(request), text: 'Accepted by the daemon. Check observed state to confirm completion.', error: false }
+  }
+
   async function add() {
     if (locked.value) return
     busy.value = true
     try {
       const path = await invoke<string | null>('choose_project_directory')
-      if (path) await send({ action: { kind: 'add', path }, key: operationKey(), label: 'Project registration' })
+      if (path) await send({ action: { kind: 'add', path }, key: operationKey(), label: 'Register project', target: path })
     } catch {
-      notice.value = { text: 'The project directory could not be selected.', error: true }
+      notice.value = { title: 'Register project', text: 'The project directory could not be selected.', error: true }
     } finally {
       busy.value = false
     }
   }
 
-  async function discover(id: string, system: boolean) {
+  async function discover(project: ProjectTarget, system: boolean) {
     if (locked.value) return
     busy.value = true
     try {
       return await invoke<{
         connections: Connections
         suggestions: { suggestions: { name: string }[] } | null
-      }>('discover_project_queues', { id, provider: system ? 'system' : null })
+      }>('discover_project_queues', { id: project.id, provider: system ? 'system' : null })
     } catch {
-      notice.value = { text: 'Queue discovery could not read the project’s Laravel configuration. Check the PHP runtime and try again.', error: true }
+      notice.value = { title: `Discover queues — ${project.path}`, text: 'Queue discovery could not read the project’s Laravel configuration. Check the PHP runtime and try again.', error: true }
     } finally {
       busy.value = false
       refresh()
     }
   }
 
-  async function launch(kind: Launch['kind'], id: string, label: string, system: boolean) {
+  async function launch(kind: Launch['kind'], project: ProjectTarget, label: string, system: boolean, returnFocus?: HTMLElement) {
     if (locked.value) return
     busy.value = true
+    const { id, path } = project
     try {
       const ticket = await invoke<string>('resolve_project_php', { id, provider: system ? 'system' : null })
       const action = { kind, id, ticket, allow_horizon: false } as const
       const payload: Launch = kind === 'start_workers' || kind === 'restart_workers'
         ? { ...action, kind }
         : { kind, id, ticket }
-      await send({ action: payload, key: operationKey(), label })
+      await send({ action: payload, key: operationKey(), label, target: path, returnFocus })
     } catch {
-      notice.value = { text: 'PHP could not be resolved for this launch. Check the project provider or choose System PHP.', error: true }
+      notice.value = { title: `${label} — ${path}`, text: 'PHP could not be resolved for this launch. Check the project provider or choose System PHP.', error: true }
     } finally {
       busy.value = false
     }
   }
 
-  function act(action: ProjectAction, label: string, message?: string) {
+  function act(action: ProjectAction, label: string, project: ProjectTarget, message?: string, returnFocus?: HTMLElement) {
     if (locked.value) return
-    if (message) confirmation.value = { action, label, message }
-    else void send({ action, label, key: operationKey() })
+    const decision = { action, label, target: project.path, returnFocus }
+    if (message) {
+      confirmationOrigin.value = returnFocus
+      confirmation.value = { ...decision, message }
+    } else void send({ ...decision, key: operationKey() })
   }
 
   function confirm() {
     const current = confirmation.value
     if (!current || busy.value) return
     confirmation.value = undefined
-    void send({ action: current.action, label: current.label, key: operationKey() })
+    void send({ ...current, key: operationKey() })
   }
 
-  function retry() {
-    if (replay.value && !busy.value) void send(replay.value)
+  function cancel() {
+    confirmation.value = undefined
   }
 
-  return { busy, replay, confirmation, notice, locked, add, discover, launch, act, confirm, retry }
+  async function reconcile(discard = false) {
+    const current = replay.value
+    if (!current || busy.value) return
+    busy.value = true
+    try {
+      const receipt = await invoke<Receipt | null>('reconcile_project_action', { key: current.key, discard })
+      if (receipt) accepted(current, receipt)
+      else {
+        replay.value = undefined
+        notice.value = { title: operationTitle(current), text: discard
+          ? 'Check the latest project status before deciding whether another action is needed.'
+          : 'No committed receipt was found. Check the latest project status before deciding whether another action is needed.', error: true }
+      }
+    } catch {
+      notice.value = { title: operationTitle(current), text: 'Receipt recovery is unavailable. Check again when connected, or return to project status.', error: true }
+    } finally {
+      busy.value = false
+      refresh()
+    }
+  }
+
+  return { busy, replay, confirmation, confirmationOrigin, notice, locked, add, discover, launch, act, confirm, cancel, reconcile }
 }

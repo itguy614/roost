@@ -249,3 +249,38 @@ describe('desktop shell', () => {
   })
 
 })
+
+
+it('names the original project in the removal dialog and cancels without sending a mutation', async () => {
+  nativeListen.mockResolvedValue(() => {})
+  const project = { ...populated.projects[0], desired_state: 'stopped' as const, observed: { state: 'available' as const,
+    summary: { workers: { desired: 0, running: 0, unresolved: 0 }, scheduler: { desired: 0, running: 0, unresolved: 0 } },
+  } }
+  ipc.mockResolvedValue({ ...populated, projects: [project], selected: project, detail: {
+    revision: 1, provider: 'system', autostart: false, watch_enabled: false, config_owner: 'local',
+    profiles: [], workers: [], scheduler: null, watch: null, connections: null, capabilities: ['project.remove'],
+  } })
+  const app = mountShell()
+  try {
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1)
+    app.find('.project-link').click()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1)
+    const remove = [...app.root.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Remove project')!
+    remove.focus()
+    remove.click()
+    await flushPromises()
+    const dialog = document.querySelector<HTMLElement>('[role=dialog]')!
+    expect(dialog).not.toBeNull()
+    expect(dialog.textContent).toContain('/tmp/Fulfillment')
+    expect(document.getElementById(dialog.getAttribute('aria-labelledby')!)?.textContent).toContain('Remove project')
+    const cancel = [...dialog.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Cancel')!
+    await vi.advanceTimersByTimeAsync(1)
+    cancel.click()
+    await flushPromises()
+    expect(ipc.mock.calls.map(([command]) => command)).toEqual(['dashboard_snapshot', 'dashboard_snapshot'])
+  } finally {
+    app.unmount()
+  }
+})

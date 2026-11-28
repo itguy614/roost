@@ -13,13 +13,13 @@ const WINDOW_VISIBLE: &str = "roost://window-visible";
 struct Bridge {
     state_dir: PathBuf,
     active: Mutex<()>,
-    operation: Mutex<Option<PreparedLaunch>>,
+    operation: Mutex<Operations>,
 }
 
-struct PreparedLaunch {
-    id: roost_core::ProjectId,
-    ticket: uuid::Uuid,
-    php: PathBuf,
+#[derive(Default)]
+struct Operations {
+    prepared: Option<project_ops::PreparedLaunch>,
+    last: Option<project_ops::WireAction>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,14 +68,10 @@ async fn resolve_project_php(
     id: roost_core::ProjectId,
     provider: Option<roost_core::PhpProvider>,
 ) -> Result<uuid::Uuid, BridgeError> {
-    let mut launch = bridge.operation.try_lock().map_err(|_| BridgeError::Busy)?;
-    let resolved = project_ops::resolve(&bridge.state_dir, id, provider).await?;
-    let ticket = uuid::Uuid::new_v4();
-    *launch = Some(PreparedLaunch {
-        id,
-        ticket,
-        php: resolved.path,
-    });
+    let mut ops = bridge.operation.try_lock().map_err(|_| BridgeError::Busy)?;
+    let prepared = project_ops::prepare(&bridge.state_dir, id, provider).await?;
+    let ticket = prepared.ticket();
+    ops.prepared = Some(prepared);
     Ok(ticket)
 }
 
@@ -95,26 +91,43 @@ async fn project_action(
     action: project_ops::Action,
     key: uuid::Uuid,
 ) -> Result<project_ops::Receipt, project_ops::ActionError> {
-    let launch = bridge
-        .operation
-        .try_lock()
-        .map_err(|_| project_ops::ActionError::Connection {
-            fault: BridgeError::Busy,
-        })?;
-    let php = match action.launch() {
-        Some((id, ticket)) => Some(
-            launch
-                .as_ref()
-                .filter(|prepared| prepared.id == id && prepared.ticket == ticket)
-                .ok_or(project_ops::ActionError::Rejected {
-                    reason: "expired_launch",
-                })?
-                .php
-                .clone(),
-        ),
-        None => None,
+    let mut ops =
+        bridge
+            .operation
+            .try_lock()
+            .map_err(|_| project_ops::ActionError::Connection {
+                fault: BridgeError::Busy,
+            })?;
+    if ops.last.as_ref().is_some_and(|last| last.key() == key) {
+        return Err(project_ops::ActionError::Uncertain);
+    }
+    let request = project_ops::WireAction::new(action, key, ops.prepared.as_ref())?;
+    let result = request.submit(&bridge.state_dir).await;
+    ops.last = Some(request);
+    result
+}
+
+#[tauri::command]
+async fn reconcile_project_action(
+    bridge: tauri::State<'_, Bridge>,
+    key: uuid::Uuid,
+    discard: bool,
+) -> Result<Option<project_ops::Receipt>, project_ops::ActionError> {
+    let mut ops =
+        bridge
+            .operation
+            .try_lock()
+            .map_err(|_| project_ops::ActionError::Connection {
+                fault: BridgeError::Busy,
+            })?;
+    let Some(request) = ops.last.as_ref().filter(|last| last.key() == key) else {
+        return Ok(None);
     };
-    project_ops::execute(&bridge.state_dir, action, key, php).await
+    if discard {
+        ops.last = None;
+        return Ok(None);
+    }
+    request.recover(&bridge.state_dir).await
 }
 
 fn main() {
@@ -131,7 +144,7 @@ fn main() {
         .manage(Bridge {
             state_dir,
             active: Mutex::new(()),
-            operation: Mutex::new(None),
+            operation: Mutex::new(Operations::default()),
         })
         .setup(|app| {
             // Apply an app-local appearance for visual smoke runs. System appearance is the default.
@@ -150,7 +163,8 @@ fn main() {
             choose_project_directory,
             resolve_project_php,
             discover_project_queues,
-            project_action
+            project_action,
+            reconcile_project_action
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

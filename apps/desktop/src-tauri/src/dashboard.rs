@@ -121,7 +121,7 @@ async fn fetch(
     Ok(Dashboard {
         daemon,
         detail,
-        can_add_project: client.supports("project.add"),
+        can_add_project: client.supports("project.add") && client.supports("mutation.receipt"),
         directory,
         projects: rows,
         selected,

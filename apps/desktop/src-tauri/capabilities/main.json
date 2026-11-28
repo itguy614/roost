@@ -11,6 +11,7 @@
     "allow-choose-project-directory",
     "allow-resolve-project-php",
     "allow-discover-project-queues",
-    "allow-project-action"
+    "allow-project-action",
+    "allow-reconcile-project-action"
   ]
 }

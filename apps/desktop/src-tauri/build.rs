@@ -6,6 +6,7 @@ fn main() {
             "resolve_project_php",
             "discover_project_queues",
             "project_action",
+            "reconcile_project_action",
         ]),
     ))
     .expect("desktop build configuration is valid");
