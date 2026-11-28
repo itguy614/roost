@@ -67,7 +67,7 @@ const USAGE: &str = "Usage:
   roost [--state-dir ABSOLUTE_PATH] group add-project ID PROJECT_ID --revision REV
   roost [--state-dir ABSOLUTE_PATH] group remove-project ID PROJECT_ID --revision REV
   roost [--state-dir ABSOLUTE_PATH] group start|restart ID [--php PATH | --provider herd|system] [--allow-horizon]
-  roost [--state-dir ABSOLUTE_PATH] group stop ID";
+  roost [--state-dir ABSOLUTE_PATH] group stop ID [--revision REV]";
 
 enum Command {
     Status,

@@ -81,10 +81,18 @@ impl Command {
                     action == "add-project",
                 )
             }
-            (Some("stop"), [id]) => Self::Stop(GroupStopParams {
-                id: group_id(id)?,
-                idempotency_key: key,
-            }),
+            (Some("stop"), [id, options @ ..]) => {
+                let expected_revision = match options {
+                    [] => None,
+                    [flag, rev] if flag == "--revision" => Some(revision(rev)?),
+                    _ => return Err(io::Error::other("expected optional --revision REV")),
+                };
+                Self::Stop(GroupStopParams {
+                    id: group_id(id)?,
+                    expected_revision,
+                    idempotency_key: key,
+                })
+            }
             (Some("start" | "restart"), [id, options @ ..]) => {
                 let id = group_id(id)?;
                 let (allow_horizon, options) = match options.split_last() {
@@ -159,6 +167,7 @@ async fn launch(
             id: params.id,
             php,
             allow_horizon,
+            fence: None,
         });
     }
     let params = GroupLaunchParams {
