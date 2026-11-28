@@ -1,0 +1,109 @@
+/* Set at the document root so Clean UI's teleported controls inherit Roost tokens. */
+html.cui-theme-roost {
+  color-scheme: light;
+  --cui-font-sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  --cui-font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --cui-surface-base: #fff;
+  --cui-surface-light-bg: #f5f6f8;
+  --cui-surface-dark: #687384;
+  --cui-border: #dfe3e9;
+  --cui-border-strong: #8290a1;
+  --cui-text-body: #242831;
+  --cui-text-secondary: #515b6a;
+  --cui-text-emphasis: #242831;
+  --cui-text-tertiary: #646e7d;
+  --cui-primary: #1457a9;
+  --cui-primary-hover: #114882;
+  --cui-primary-active: #103d70;
+  --cui-primary-bg: #dfebfc;
+  --cui-primary-subtle: #ecf3fd;
+  --cui-primary-border: #8ba8cb;
+  --cui-primary-text: #fff;
+  --cui-primary-focus-ring: #2174ce;
+  --cui-success: #177044;
+  --cui-success-bg: #e8f5ed;
+  --cui-success-text: #fff;
+  --cui-success-border: #94bba4;
+  --cui-warning: #804714;
+  --cui-warning-bg: #fff7e9;
+  --cui-warning-text: #fff;
+  --cui-warning-border: #ddba88;
+  --cui-warning-focus-ring: #895614;
+  --cui-error: #a3323f;
+  --cui-error-bg: #fff0f1;
+  --cui-error-text: #fff;
+  --cui-error-border: #d899a0;
+  --cui-info: #1457a9;
+  --cui-info-bg: #eff5ff;
+  --cui-info-text: #fff;
+  --cui-info-border: #b8cce7;
+  --cui-sidebar-bg: var(--cui-surface-light-bg);
+  --cui-sidebar-border: var(--cui-border);
+  --cui-sidebar-pressed-bg: var(--cui-primary-bg);
+  --cui-sidebar-pressed-border: var(--cui-primary-bg);
+  --cui-sidebar-pressed-color: var(--cui-primary);
+  --cui-table-head-bg: #f8f9fb;
+  --cui-table-row-hover-bg: #f4f7fa;
+  --cui-list-hover-bg: var(--cui-table-row-hover-bg);
+  --cui-density-scale: .9;
+  --cui-density-gap-scale: .94;
+  --cui-radius-md: .375rem;
+  --cui-press-scale: 1;
+  --roost-space: .5rem;
+  --roost-small: .8125rem;
+}
+
+html.cui-theme-roost.dark {
+  color-scheme: dark;
+  --cui-surface-base: #1d2026;
+  --cui-surface-light-bg: #24272e;
+  --cui-surface-dark: #a1aabb;
+  --cui-border: #383d48;
+  --cui-border-strong: #697489;
+  --cui-text-body: #e9edf3;
+  --cui-text-secondary: #adb6c6;
+  --cui-text-emphasis: #f4f6f9;
+  --cui-text-tertiary: #9aa5b7;
+  --cui-primary: #9bcaff;
+  --cui-primary-hover: #c2ddff;
+  --cui-primary-active: #dcecff;
+  --cui-primary-bg: #263b56;
+  --cui-primary-subtle: #28374a;
+  --cui-primary-border: #6284af;
+  --cui-primary-solid: #a5cbfd;
+  --cui-primary-solid-hover: #bad8fd;
+  --cui-primary-solid-active: #8eb8f0;
+  --cui-primary-text: #172945;
+  --cui-primary-focus-ring: #88bfff;
+  --cui-success: #6fd49b;
+  --cui-success-bg: #22372e;
+  --cui-success-text: #102a1c;
+  --cui-success-border: #496e5c;
+  --cui-warning: #f3c482;
+  --cui-warning-bg: #342b22;
+  --cui-warning-text: #33210c;
+  --cui-warning-border: #71573b;
+  --cui-warning-focus-ring: #edb870;
+  --cui-error: #f7a6ad;
+  --cui-error-bg: #3c272c;
+  --cui-error-text: #351920;
+  --cui-error-border: #80545c;
+  --cui-info: #9bcaff;
+  --cui-info-bg: #263446;
+  --cui-info-text: #172945;
+  --cui-info-border: #4d6582;
+  --cui-table-head-bg: #262a31;
+  --cui-table-row-hover-bg: #2b3039;
+}
+
+html.cui-theme-roost .cui-button {
+  --cui-button-focus-ring: var(--cui-primary-focus-ring);
+}
+
+html.cui-theme-roost .cui-sidebar [aria-current="page"] {
+  font-weight: 600;
+}
+
+html.cui-theme-roost :focus-visible {
+  outline-color: var(--cui-primary-focus-ring);
+}

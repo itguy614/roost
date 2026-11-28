@@ -17,6 +17,8 @@ cargo test --workspace --locked
 
 Run the tests in a session that permits filesystem Unix socket binds. The workspace also tests the protocol over connected Unix socket pairs, including malformed input and concurrent clients.
 
+For the native macOS shell, see [desktop development and smoke tests](apps/desktop/README.md).
+
 ## Smoke test
 
 From the repository root, run these commands in one terminal. This uses an isolated state directory and a fixture that exercises the `artisan` file check without requiring a Laravel runtime.
