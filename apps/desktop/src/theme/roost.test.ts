@@ -36,5 +36,10 @@ it('keeps both palettes readable for text, status and keyboard focus', () => {
       contrast(role, `${role}-bg`, 4.5)
       contrast(`${role}-text`, role, 4.5)
     }
+    for (const role of ['warning', 'error']) {
+      for (const fill of ['solid', 'solid-hover', 'solid-active']) {
+        contrast(`${role}-text`, `${role}-${fill}`, 4.5)
+      }
+    }
   }
 })
