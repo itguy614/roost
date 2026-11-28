@@ -121,6 +121,11 @@ impl WorkerCall {
                 let (operation_id, result) =
                     worker_mutation(&store, params.idempotency_key, &key, || {
                         supervisor.validate_mutation()?;
+                        crate::mutation_rpc::validate_revision(
+                            &store,
+                            params.id,
+                            params.expected_revision,
+                        )?;
                         let mut project =
                             store.get_project(params.id)?.ok_or(StoreError::NotFound)?;
                         if project.autostart != params.enabled {
@@ -153,6 +158,12 @@ impl WorkerCall {
                 let mut plan = None;
                 let (operation_id, result) =
                     worker_mutation(&store, params.idempotency_key, &key, || {
+                        crate::mutation_rpc::validate_launch(
+                            service,
+                            &store,
+                            params.id,
+                            params.fence.as_ref(),
+                        )?;
                         plan = supervisor.prepare(
                             &store,
                             params.id,

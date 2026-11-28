@@ -95,6 +95,12 @@ impl SchedulerCall {
                 let mut plan = None;
                 let (operation_id, result) =
                     worker_mutation(&store, params.idempotency_key, &key, || {
+                        crate::mutation_rpc::validate_launch(
+                            service,
+                            &store,
+                            params.id,
+                            params.fence.as_ref(),
+                        )?;
                         plan = supervisor.prepare_scheduler(
                             &store,
                             params.id,

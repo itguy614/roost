@@ -122,6 +122,7 @@ impl Command {
                     None => client.resolve_php(&php).await?.path,
                 };
                 let params = SchedulerLaunchParams {
+                    fence: None,
                     id: php.id,
                     php: path,
                     idempotency_key: Some(Uuid::new_v4()),

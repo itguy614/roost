@@ -185,6 +185,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             Command::Remove(id) => serde_json::to_value(
                 client
                     .remove_project(&RemoveParams {
+                                                expected_revision: None,
                         id: roost_core::ProjectId(id),
                         idempotency_key: Some(Uuid::new_v4()),
                     })

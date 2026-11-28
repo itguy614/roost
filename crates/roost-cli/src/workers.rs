@@ -61,6 +61,7 @@ impl Command {
                     _ => return Err(io::Error::other("autostart expects on or off")),
                 };
                 Self::Autostart(AutostartParams {
+                    expected_revision: None,
                     id: parse_id(id)?,
                     enabled,
                     idempotency_key: Some(Uuid::new_v4()),
@@ -137,6 +138,7 @@ impl Command {
                     None => client.resolve_php(&php).await?.path,
                 };
                 let params = LaunchParams {
+                    fence: None,
                     id: php.id,
                     php: path,
                     allow_horizon,

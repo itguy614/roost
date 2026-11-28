@@ -159,6 +159,7 @@ impl Harness {
 
     fn launch(&self, id: ProjectId) -> LaunchParams {
         LaunchParams {
+            fence: None,
             id,
             php: self.php.clone(),
             allow_horizon: false,
@@ -237,6 +238,7 @@ async fn concurrent_start_restart_stop_and_redacted_output() {
         .collect();
     let denied = a
         .remove_project(&RemoveParams {
+            expected_revision: None,
             id,
             idempotency_key: None,
         })
@@ -293,6 +295,7 @@ async fn concurrent_start_restart_stop_and_redacted_output() {
             .all(|worker| !exists(worker.identity.unwrap().pid))
     );
     a.remove_project(&RemoveParams {
+        expected_revision: None,
         id,
         idempotency_key: None,
     })
@@ -422,6 +425,7 @@ async fn real_daemon_signals_recover_only_opted_in_intent_after_cleanup() {
 
     client
         .set_autostart(&AutostartParams {
+            expected_revision: None,
             id,
             enabled: true,
             idempotency_key: None,
@@ -583,6 +587,7 @@ async fn horizon_requires_explicit_confirmation_and_unconfirmed_lease_blocks_sta
 
     client
         .set_autostart(&AutostartParams {
+            expected_revision: None,
             id,
             enabled: true,
             idempotency_key: None,
@@ -795,6 +800,7 @@ fn scheduler_config(id: ProjectId, policy: CrashRestartPolicy) -> ConfigureSched
 
 fn scheduler_launch(h: &Harness, id: ProjectId) -> SchedulerLaunchParams {
     SchedulerLaunchParams {
+        fence: None,
         id,
         php: h.php.clone(),
         idempotency_key: Some(Uuid::new_v4()),
@@ -932,6 +938,7 @@ async fn concurrent_scheduler_requests_share_one_lease_and_queue_worker_intent_i
     assert_eq!(scheduler_ready(&mut a, id, None).await, second);
     let denied = a
         .remove_project(&RemoveParams {
+            expected_revision: None,
             id,
             idempotency_key: None,
         })
@@ -1018,6 +1025,7 @@ async fn real_daemon_recovery_waits_for_scheduler_group_and_honors_saved_stop() 
         .unwrap();
     client
         .set_autostart(&AutostartParams {
+            expected_revision: None,
             id,
             enabled: true,
             idempotency_key: None,
@@ -1204,6 +1212,7 @@ async fn real_daemon_recovers_scheduler_and_queue_worker_for_the_same_project() 
         .unwrap();
     client
         .set_autostart(&AutostartParams {
+            expected_revision: None,
             id,
             enabled: true,
             idempotency_key: None,

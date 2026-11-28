@@ -43,6 +43,8 @@ pub struct LaunchParams {
     #[serde(default)]
     pub allow_horizon: bool,
     pub idempotency_key: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::mutations::LaunchFence>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,6 +103,8 @@ pub struct AutostartParams {
     pub id: ProjectId,
     pub enabled: bool,
     pub idempotency_key: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<roost_core::Revision>,
 }
 
 impl Client {

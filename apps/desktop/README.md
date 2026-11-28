@@ -1,6 +1,6 @@
 # Roost desktop development
 
-The desktop shell uses the existing private Roost socket and IPC v1. Its window shows live project registration and observed worker and scheduler counts. The standalone daemon and notification helper have their own lifetimes. Closing the window hides it. Opening Roost again shows the window and refreshes its data. Quit Roost exits the UI.
+The desktop shell uses the existing private Roost socket and IPC v1. Its window shows live project registration and observed worker and scheduler counts. Project operations use the same daemon methods as the CLI. The standalone daemon and notification helper have their own lifetimes. Closing the window hides it. Opening Roost again shows the window and refreshes its data. Quit Roost exits the UI.
 
 ## Build and verify
 
@@ -91,6 +91,57 @@ target/debug/roost --state-dir "$TEST_DIR/state" scheduler start "$PROJECT" "$TE
 Confirm the dashboard reaches 2 / 2 workers and 1 / 1 scheduler for Dispatch. Check the sidebar and table, select a project with the keyboard, then close the window and reopen it from the Dock. Quit the app before repeating with `ROOST_DESKTOP_APPEARANCE=dark`. Omit the appearance override to follow System Settings. For a fresh offline window point the test app at `"$TEST_DIR/absent"`. To verify disconnect recovery, stop the original test daemon with Control-C while the GUI is connected, confirm the last read is labeled as a previous snapshot, then start the daemon against the same private directory and wait for reconnection.
 
 A dashboard read negotiates IPC on one connection and reads the bounded project directory. The sidebar uses that full directory, independently of the eight-row dashboard page. A selected project is addressed by UUID and can add one summary read if it is outside the page. A three-second deadline covers the entire snapshot. Visible refreshes run every five seconds after completion, with single-flight coalescing and a two- to fifteen-second retry backoff. Hidden or unmounted views stop scheduling reads. Reopening labels cached data stale until the first successful read and displays the timestamp of the last successful update. Results from obsolete window, page or project scopes are discarded. Unsupported or failed observations appear as such in the table. Below or above desired counts describe a discrepancy. Recovery blocked is reserved for an unresolved count reported by the daemon. Daemon mutations, service management, and the shared streaming coordinator are handled in the planned later slices.
+
+## Project operations
+
+Open **Add project** to select a directory through the native macOS picker. The daemon validates the Laravel directory and returns the project UUID. The project view supports worker profile creation with ordered queue names, independent worker and scheduler intents, project autostart, watch status and revisioned watch enable/disable, and registration removal with confirmation.
+
+Use **Discover queue connections** for a deliberate read of Laravel configuration. The view follows the daemon's connection snapshot, including watcher invalidation. Static queue-name suggestions are incomplete and never create a profile. The configured PHP provider is used by default. **Use System PHP for this launch** selects the existing one-operation override. Rust keeps the resolved PHP path for up to 60 seconds, checks the executable’s file identity before submission, and binds the launch ticket to the project UUID, daemon instance, and saved configuration revisions. Horizon requires explicit confirmation. Known cleanup blocks disable launches, and the daemon revalidates ownership and process identity.
+
+The desktop keeps intent acknowledgement separate from observed process state. After an uncertain reply, **Check receipt** looks up the exact original method, payload, and operation UUID without resubmitting. The app retains one unresolved request in memory while it runs. **Return to project status** discards the local request and refreshes, including when the daemon is offline. A missing receipt or quitting also takes the desktop back to live state reconciliation. Inspect the current project and its lifecycle before deciding whether a new action is needed. The desktop never issues a replacement mutation on behalf of an uncertain request. Quitting discards the unresolved request and the next launch reads daemon state. The daemon and its workers keep running.
+
+**Configure scheduler** is create-only. If the CLI already created a scheduler, the desktop displays the conflict and refreshes. Watch changes, autostart and removal compare against the last displayed project revision. The desktop keeps configuration edits restricted to locally managed projects and leaves the daemon in charge of validation, confirmation of process ownership, and cleanup.
+
+Run the real-daemon bridge fixture from the repository root after the standalone workspace build.
+
+```sh
+SMOKE_DIR=$(mktemp -d /private/tmp/roost-desktop-ops.XXXXXX)
+rustc --edition=2024 crates/roost-daemon/tests/fixtures/queue_worker.rs -o "$SMOKE_DIR/php"
+ROOST_SMOKE_WORKER="$SMOKE_DIR/php" ROOST_SMOKE_DAEMON="$PWD/target/debug/roost-daemon" \
+  cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked \
+  real_daemon -- --ignored
+```
+
+Group editing and lifecycle, general profile edits and scaling, saved provider/project edits, and portable configuration are follow-up pieces of Milestone 5.2.
+
+### Project operations evidence
+
+A macOS 26.6.2 smoke used two disposable Laravel 13.43.0 projects with Laravel Herd and empty SQLite queues. A local WebView test driver clicked the production project controls. The GUI discovered the database and sync connections, launched a real queue worker and scheduler, and left the other project stopped. Independent IPC reads confirmed both observed running states. The native picker was opened and cancelled against an isolated daemon. An in-process driver invoked the AppKit Cancel action, and a local IPC relay observed zero registration requests. Accepted-folder cases use the interactive procedure below. The real-daemon Rust fixtures verify registration validation and replay, scheduler and worker independence, worker PID replacement, concurrent scheduler creation, stale revision handling, recovery after a lost reply, and prepared launch rejection after configuration change or daemon restart.
+
+For an interactive native picker smoke, use a disposable state directory and the signed local bundle from the setup commands above.
+
+```sh
+PICKER_ROOT=$(mktemp -d /private/tmp/roost-picker.XXXXXX)
+mkdir "$PICKER_ROOT/Dispatch" "$PICKER_ROOT/Invalid Folder" "$PICKER_ROOT/Project With Spaces"
+touch "$PICKER_ROOT/Dispatch/artisan" "$PICKER_ROOT/Project With Spaces/artisan"
+target/debug/roost-daemon --state-dir "$PICKER_ROOT/state" &
+PICKER_DAEMON=$!
+ROOST_DESKTOP_STATE_DIR="$PICKER_ROOT/state" "$APP/Contents/MacOS/roost-desktop" &
+```
+
+Open **Add project** and cancel once. The list should stay empty. Then use **Add project** and `Command–Shift–G` to navigate to each test folder under `PICKER_ROOT`. Choose **Dispatch**, **Invalid Folder**, **Dispatch** again, and **Project With Spaces** in that order. Return to **Dashboard** after the successful registration. Expect acceptance, Laravel validation failure, a duplicate conflict, and acceptance with the complete spaced path. Check that `target/debug/roost --state-dir "$PICKER_ROOT/state" project list` reports only the two expected registrations. Quit the test GUI and stop the disposable daemon with `kill -TERM "$PICKER_DAEMON"`.
+
+The optimized resource smoke sampled 15.3 seconds per phase with one Laravel worker, one scheduler and the separately running notification helper. Queue measurement probes were disabled. CPU is percent of one logical core and RSS is peak summed MiB per group.
+
+| Group | GUI absent CPU / RSS | Dashboard open CPU / RSS |
+| --- | ---: | ---: |
+| Daemon and descendants | 1.437% / 129.41 MiB | 1.568% / 129.17 MiB |
+| Notification helper | 0.131% / 32.47 MiB | 0.065% / 32.20 MiB |
+| Desktop host | — | 0.131% / 105.94 MiB |
+| Three WebKit processes started with GUI | — | 0.849% / 112.14 MiB |
+| Daemon status IPC p95 | 1.05 ms | 0.98 ms |
+
+The backend memory column includes both PHP processes. The measurements cover this fixture workload. The regular build emitted approximately 605 kB of minified JavaScript (193 kB gzip), and Vite still reports its chunk warning. Full workload, platform and accessibility acceptance gates remain open.
 
 ## Initial desktop shell evidence
 

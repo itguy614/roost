@@ -4,6 +4,7 @@ pub mod endpoint;
 pub mod events;
 pub mod groups;
 pub mod metrics;
+pub mod mutations;
 pub mod notifications;
 pub mod queue_metrics;
 pub mod scheduler;
@@ -30,6 +31,8 @@ pub const VERSION: u32 = 1;
 pub const METHODS: &[&str] = &[
     "daemon.hello",
     "daemon.status",
+    "mutation.receipt",
+    "project.launchFence",
     "event.history",
     "notifications.event.policy",
     "notifications.helper.status",
@@ -163,6 +166,8 @@ pub struct GetParams {
 pub struct RemoveParams {
     pub id: ProjectId,
     pub idempotency_key: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<roost_core::Revision>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
