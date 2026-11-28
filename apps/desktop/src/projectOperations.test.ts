@@ -80,3 +80,31 @@ it('allows leaving a disconnected receipt lookup without submitting a replacemen
   ])
   expect(ipc).toHaveBeenLastCalledWith('reconcile_project_action', { key, discard: true })
 })
+
+it('returns to current state after an exact receipt lookup finds no committed record', async () => {
+  ipc.mockRejectedValueOnce({ kind: 'uncertain' }).mockResolvedValueOnce(null)
+  const refresh = vi.fn()
+  const ops = useProjectOperations(refresh, vi.fn())
+  ops.act({ kind: 'stop_scheduler', id: project.id }, 'Stop scheduler', project)
+  await vi.waitFor(() => expect(ops.replay.value).toBeDefined())
+
+  await ops.reconcile()
+  expect(ops.locked.value).toBe(false)
+  expect(ops.notice.value?.title).toContain('/tmp/Dispatch')
+  expect(ops.notice.value?.text).toContain('No committed receipt was found')
+  expect(refresh).toHaveBeenCalledTimes(2)
+  expect(ipc.mock.calls.map(([command]) => command)).toEqual(['project_action', 'reconcile_project_action'])
+})
+
+it('starts an independent desktop session without resubmitting an unresolved operation', async () => {
+  ipc.mockRejectedValueOnce({ kind: 'uncertain' })
+  const original = useProjectOperations(vi.fn(), vi.fn())
+  original.act({ kind: 'stop_workers', id: project.id }, 'Stop workers', project)
+  await vi.waitFor(() => expect(original.locked.value).toBe(true))
+
+  const reopened = useProjectOperations(vi.fn(), vi.fn())
+  await reopened.reconcile()
+  expect(reopened.locked.value).toBe(false)
+  expect(reopened.replay.value).toBeUndefined()
+  expect(ipc).toHaveBeenCalledOnce()
+})

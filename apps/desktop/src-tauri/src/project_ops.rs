@@ -1097,6 +1097,24 @@ mod tests {
             31
         );
 
+        let mut expired = prepare(&state, id, Some(PhpProvider::System))
+            .await
+            .unwrap();
+        expired.prepared -= Duration::from_secs(61);
+        assert!(matches!(
+            WireAction::new(
+                Action::StartScheduler {
+                    id,
+                    ticket: expired.ticket()
+                },
+                Uuid::new_v4(),
+                Some(&expired)
+            ),
+            Err(ActionError::Rejected {
+                reason: "expired_launch"
+            })
+        ));
+
         let prepared = prepare(&state, id, Some(PhpProvider::System))
             .await
             .unwrap();
