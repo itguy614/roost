@@ -124,7 +124,7 @@ impl GroupCall {
                 })
             }
             Self::Launch(params, restart) => {
-                lifecycle::launch(&mut supervisor, &store, params, restart)
+                lifecycle::launch(service, &mut supervisor, &store, params, restart)
             }
             Self::Stop(params) => lifecycle::stop(&mut supervisor, &store, params),
         }

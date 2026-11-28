@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::{at_revision, group};
 use crate::{
-    encode, request_key, store_error,
+    DaemonService, encode, mutation_rpc, request_key, store_error,
     supervisor::{Error, Plan, SchedulerPlan, Supervisor},
     worker_rpc::worker_error,
 };
@@ -30,12 +30,19 @@ struct Start {
 
 impl Start {
     fn prepare(
+        service: &DaemonService,
         supervisor: &Supervisor,
         store: &Store,
         id: ProjectId,
         launch: Option<&GroupProjectLaunch>,
         restart: bool,
     ) -> Result<Self, Error> {
+        mutation_rpc::validate_launch(
+            service,
+            store,
+            id,
+            launch.and_then(|item| item.fence.as_ref()),
+        )?;
         let workers = store
             .list_worker_profiles(id)?
             .iter()
@@ -111,6 +118,7 @@ impl Start {
 }
 
 pub(super) fn launch(
+    service: &DaemonService,
     supervisor: &mut Supervisor,
     store: &Store,
     params: GroupLaunchParams,
@@ -152,17 +160,23 @@ pub(super) fn launch(
             let mut projects = Vec::new();
             for member in members {
                 let id = member.id;
-                let prepared =
-                    Start::prepare(supervisor, store, id, launches.get(&id).copied(), restart)
-                        .and_then(|plan| {
-                            let growth = supervisor.additional_capacity(
-                                id,
-                                plan.workers.as_ref(),
-                                plan.scheduler.as_ref(),
-                            );
-                            capacity = capacity.checked_sub(growth).ok_or(Error::Capacity)?;
-                            Ok(plan)
-                        });
+                let prepared = Start::prepare(
+                    service,
+                    supervisor,
+                    store,
+                    id,
+                    launches.get(&id).copied(),
+                    restart,
+                )
+                .and_then(|plan| {
+                    let growth = supervisor.additional_capacity(
+                        id,
+                        plan.workers.as_ref(),
+                        plan.scheduler.as_ref(),
+                    );
+                    capacity = capacity.checked_sub(growth).ok_or(Error::Capacity)?;
+                    Ok(plan)
+                });
                 let outcome = match prepared {
                     Ok(plan) => {
                         let outcome = plan.outcome();
@@ -203,7 +217,11 @@ pub(super) fn stop(
     let mut stopped = Vec::new();
     let (operation_id, result) = store
         .try_mutate(params.idempotency_key, &key, |store| {
-            group(store, params.id)?;
+            if let Some(revision) = params.expected_revision {
+                at_revision(store, params.id, revision)?;
+            } else {
+                group(store, params.id)?;
+            }
             let mut projects = Vec::new();
             for member in store.group_projects(params.id)? {
                 let id = member.id;

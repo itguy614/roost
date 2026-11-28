@@ -74,12 +74,16 @@ pub struct GroupProjectLaunch {
     pub php: PathBuf,
     #[serde(default)]
     pub allow_horizon: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::mutations::LaunchFence>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupStopParams {
     pub id: GroupId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<Revision>,
     pub idempotency_key: Option<Uuid>,
 }
 
@@ -179,5 +183,25 @@ impl Client {
         params: &GroupStopParams,
     ) -> Result<Mutation<GroupLifecycle>, ClientError> {
         self.request("group.stop", params).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_group_payloads_keep_their_receipt_shape() {
+        let id = Uuid::nil();
+        let member = json!({"id": id, "php": "/usr/bin/php", "allow_horizon": false});
+        let stop = json!({"id": id, "idempotency_key": id});
+        let launch: GroupProjectLaunch = serde_json::from_value(member.clone()).unwrap();
+        let params: GroupStopParams = serde_json::from_value(stop.clone()).unwrap();
+
+        assert!(launch.fence.is_none());
+        assert!(params.expected_revision.is_none());
+        assert_eq!(serde_json::to_value(launch).unwrap(), member);
+        assert_eq!(serde_json::to_value(params).unwrap(), stop);
     }
 }

@@ -27,6 +27,7 @@ use roost_ipc::{
         UpdateGroupParams,
     },
     metrics::{HistoryParams, Resolution},
+    mutations::ReceiptParams,
     scheduler::{ConfigureSchedulerParams, SchedulerLaunchParams, SchedulerOptions},
     watch::{CodeRestartParams, DisableWatchParams, EnableWatchParams, WatchState, WatchStatus},
     workers::{
@@ -1777,6 +1778,185 @@ async fn group_membership_and_shared_paths_are_revisioned_and_durable() {
 }
 
 #[tokio::test]
+async fn guarded_group_actions_reject_stale_projects_and_membership() {
+    let h = Harness::new();
+    let (mut daemon, mut client) = h.daemon().await;
+    let alpha = h
+        .register(
+            &mut client,
+            &h.app("alpha", "graceful"),
+            1,
+            CrashRestartPolicy::Never,
+        )
+        .await;
+    let beta = h
+        .register(
+            &mut client,
+            &h.app("beta", "graceful"),
+            1,
+            CrashRestartPolicy::Never,
+        )
+        .await;
+    let gamma = h
+        .register(
+            &mut client,
+            &h.app("gamma", "graceful"),
+            1,
+            CrashRestartPolicy::Never,
+        )
+        .await;
+    let group = group_members(&mut client, &h.root, &[alpha, beta]).await;
+
+    let mut launches = Vec::new();
+    for id in [alpha, beta] {
+        launches.push(GroupProjectLaunch {
+            id,
+            php: h.php.clone(),
+            allow_horizon: false,
+            fence: Some(client.launch_fence(&ProjectParams { id }).await.unwrap()),
+        });
+    }
+    let profile = client
+        .list_profiles(&ProjectParams { id: alpha })
+        .await
+        .unwrap()
+        .remove(0);
+    client
+        .set_code_restart(&CodeRestartParams {
+            id: profile.id,
+            expected_revision: profile.revision,
+            policy: CodeRestartPolicy::OnChange,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+    let key = Uuid::new_v4();
+    let mut launch = GroupLaunchParams {
+        id: group.id,
+        expected_revision: group.revision,
+        launches,
+        idempotency_key: Some(key),
+    };
+    let receipt = ReceiptParams {
+        operation_id: key,
+        method: "group.start".into(),
+        params: serde_json::to_value(&launch).unwrap(),
+    };
+    let started = client.start_group(&launch).await.unwrap();
+    assert!(started.result.projects.iter().any(|project| project.id == alpha
+        && matches!(&project.outcome, GroupOutcome::Failed { error } if error.code == CONFLICT)));
+    assert!(
+        started
+            .result
+            .projects
+            .iter()
+            .any(|project| project.id == beta
+                && matches!(
+                    project.outcome,
+                    GroupOutcome::Accepted {
+                        workers: true,
+                        scheduler: false
+                    }
+                ))
+    );
+    assert!(
+        client
+            .list_processes(&ProjectParams { id: alpha })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let beta_pid = worker_pid(&mut client, beta).await;
+
+    let updated = client
+        .add_project_to_group(&GroupMembershipParams {
+            id: group.id,
+            project_id: gamma,
+            expected_revision: group.revision,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap()
+        .result;
+    client.start_project(&h.launch(gamma)).await.unwrap();
+    let gamma_pid = worker_pid(&mut client, gamma).await;
+    let stop_key = Uuid::new_v4();
+    let stale_stop = GroupStopParams {
+        id: group.id,
+        expected_revision: Some(group.revision),
+        idempotency_key: Some(stop_key),
+    };
+    assert!(
+        matches!(client.stop_group(&stale_stop).await, Err(ClientError::Rpc(error)) if error.code == CONFLICT)
+    );
+    assert!(
+        client
+            .mutation_receipt(&ReceiptParams {
+                operation_id: stop_key,
+                method: "group.stop".into(),
+                params: serde_json::to_value(&stale_stop).unwrap(),
+            })
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (id, pid) in [(beta, beta_pid), (gamma, gamma_pid)] {
+        assert_eq!(worker_pid(&mut client, id).await, pid);
+    }
+    let stopped = client
+        .stop_group(&GroupStopParams {
+            id: group.id,
+            expected_revision: Some(updated.group.revision),
+            idempotency_key: Some(Uuid::new_v4()),
+        })
+        .await
+        .unwrap()
+        .result;
+    assert_eq!(stopped.projects.len(), 3);
+    for id in [beta, gamma] {
+        until_status(&mut client, id, all_in(ObservedState::Stopped, 1)).await;
+    }
+
+    launch.expected_revision = updated.group.revision;
+    launch.idempotency_key = Some(Uuid::new_v4());
+    launch.launches.clear();
+    for id in [alpha, beta, gamma] {
+        launch.launches.push(GroupProjectLaunch {
+            id,
+            php: h.php.clone(),
+            allow_horizon: false,
+            fence: Some(client.launch_fence(&ProjectParams { id }).await.unwrap()),
+        });
+    }
+    terminate(&mut daemon).await;
+
+    let (mut daemon, mut client) = h.daemon().await;
+    let rejected = client.restart_group(&launch).await.unwrap();
+    assert_eq!(rejected.result.projects.len(), 3);
+    assert!(rejected.result.projects.iter().all(|project|
+        matches!(&project.outcome, GroupOutcome::Failed { error } if error.code == CONFLICT)));
+    assert_eq!(
+        client
+            .mutation_receipt(&receipt)
+            .await
+            .unwrap()
+            .unwrap()
+            .result,
+        serde_json::to_value(started.result).unwrap()
+    );
+    assert!(
+        client
+            .get_group(&GroupParams { id: group.id })
+            .await
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.project.desired_state == DesiredState::Stopped)
+    );
+    terminate(&mut daemon).await;
+}
+
+#[tokio::test]
 async fn group_lifecycle_reports_partial_failure_and_shared_edits_restart_only_mapped_workers() {
     let h = Harness::new();
     let app = h.app("alpha", "graceful");
@@ -1858,11 +2038,13 @@ async fn group_lifecycle_reports_partial_failure_and_shared_edits_restart_only_m
                 id,
                 php: h.php.clone(),
                 allow_horizon: false,
+                fence: None,
             },
             GroupProjectLaunch {
                 id: other,
                 php: other_php,
                 allow_horizon: false,
+                fence: None,
             },
         ],
     };
@@ -1991,6 +2173,7 @@ async fn group_lifecycle_reports_partial_failure_and_shared_edits_restart_only_m
         .stop_group(&GroupStopParams {
             id: group.id,
             idempotency_key: Some(Uuid::new_v4()),
+            expected_revision: None,
         })
         .await
         .unwrap();
@@ -2049,6 +2232,7 @@ async fn group_start_reserves_combined_capacity_before_applying_any_runtime_plan
                 id,
                 php: h.php.clone(),
                 allow_horizon: false,
+                fence: None,
             })
             .collect(),
         idempotency_key: None,
@@ -2113,6 +2297,7 @@ async fn group_launch_rolls_back_all_intents_when_a_late_write_fails() {
                 id,
                 php: h.php.clone(),
                 allow_horizon: false,
+                fence: None,
             })
             .collect(),
         idempotency_key: Some(key),
