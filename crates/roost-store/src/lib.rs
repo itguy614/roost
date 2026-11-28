@@ -182,6 +182,13 @@ impl Store {
         self.transaction_with(c"BEGIN IMMEDIATE", work)
     }
 
+    pub fn transaction_read<T>(
+        &self,
+        work: impl FnOnce(&Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.transaction_with(c"BEGIN", work)
+    }
+
     fn transaction_with<T, E: From<Error>>(
         &self,
         begin: &CStr,
@@ -253,6 +260,26 @@ impl Store {
             }
             Ok((id, result))
         })
+    }
+
+    /// Read a committed receipt for exactly the original method and parameters.
+    /// JSON object key order does not affect equality.
+    pub fn mutation_receipt(
+        &self,
+        id: Uuid,
+        expected: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, Error> {
+        let row: Option<(String, serde_json::Value)> = self.one(
+            c"SELECT json_array(json_extract(request, '$'), json(result)) FROM mutation_receipts WHERE id = ?1",
+            &id.to_string(),
+        )?;
+        let Some((request, result)) = row else {
+            return Ok(None);
+        };
+        if serde_json::from_str::<serde_json::Value>(&request)? != *expected {
+            return Err(Error::IdempotencyConflict);
+        }
+        Ok(Some(result))
     }
 
     fn one<T: DeserializeOwned>(&self, sql: &CStr, id: &str) -> Result<Option<T>, Error> {

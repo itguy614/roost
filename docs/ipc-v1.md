@@ -13,7 +13,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `project.list` | Omit or use `{}` | Array of project records ordered by canonical path |
 | `project.add` | Absolute UTF-8 `path`, optional UUID `idempotency_key` | `operation_id` and `result` containing the created project |
 | `project.get` | Project UUID `id` | Project record |
-| `project.remove` | Project UUID `id`, optional UUID `idempotency_key` | `operation_id` and `result` containing the removed record's `id` |
+| `project.launchFence` | Project UUID `id` | Daemon instance UUID and project, worker profile, and scheduler profile identity and revision snapshot |
+| `mutation.receipt` | UUID `operation_id`, original mutation `method` and `params` object | Original mutation acknowledgement or `null` when no committed record is found |
+| `project.remove` | Project UUID `id`, optional `expected_revision`, optional UUID `idempotency_key` | `operation_id` and `result` containing the removed record's `id` |
 | `provider.list` | Omit or use `{}` | Supported provider names |
 | `provider.detect` | Project UUID `id` | Preferred provider, Herd and system availability, and whether an override is configured |
 | `provider.resolvePhp` | Project UUID `id`, optional `provider` or absolute `php` override | Validated executable `path` and `source` |
@@ -22,7 +24,7 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `queue.suggestions` | Project UUID `id`, optional `explicit` string array | Incomplete symbolic name suggestions with sources, ordered configured profile queues, and scan coverage flags |
 | `scheduler.configure` | Project UUID `id`, optional `options`, optional `expected_revision` for updates, optional UUID `idempotency_key` | Mutation result with the scheduler profile |
 | `scheduler.status` | Project UUID `id` | Scheduler profile, saved desired state, and optional observed process state |
-| `scheduler.start` | Project UUID `id`, absolute `php` path, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
+| `scheduler.start` | Project UUID `id`, absolute `php` path, optional launch `fence`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
 | `scheduler.restart` | Same parameters as `scheduler.start` | Queues replacement after cleanup and returns the requested intent |
 | `scheduler.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
 | `scheduler.logs` | Project UUID `id` | Bounded, redacted scheduler output lines |
@@ -33,9 +35,9 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `watch.status` | Project UUID `id` | Project `id`, current project `revision`, saved `rules`, `state`, `pending` batch flag, and nullable `problem` |
 | `watch.enable` | Project UUID `id`, integer `expected_revision`, optional `rules`, optional UUID `idempotency_key` | Mutation result containing the project with watching enabled |
 | `watch.disable` | Project UUID `id`, integer `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the project with watching disabled |
-| `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
+| `project.start` | Project UUID `id`, absolute `php` path, optional Boolean `allow_horizon`, optional launch `fence`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `running` |
 | `project.restart` | Same parameters as `project.start` | Queues replacement after cleanup and returns the requested intent |
-| `project.setAutostart` | Project UUID `id`, Boolean `enabled`, optional UUID `idempotency_key` | Mutation result containing the project record |
+| `project.setAutostart` | Project UUID `id`, Boolean `enabled`, optional `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the project record |
 | `project.stop` | Project UUID `id`, optional UUID `idempotency_key` | Mutation result with project `id` and desired state `stopped` |
 | `process.list` | Project UUID `id` | Slot status including desired and observed state, identity, generation, restart count, backoff, last exit, `reason`, optional `launch_failure`, and recovery block |
 | `metrics.process.current` | Project UUID `id` | Project ID and an array of owned running generations with current gauges |
@@ -59,7 +61,7 @@ Send one JSON-RPC 2.0 request per UTF-8 line over `roost.sock`, with a newline d
 | `group.update` | Group UUID `id`, `expected_revision`, `name`, complete `options`, optional UUID `idempotency_key` | Mutation result containing the updated group |
 | `group.delete` | Group UUID `id`, `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the deleted group UUID |
 | `group.addProject`, `group.removeProject` | Group UUID `id`, `project_id`, group `expected_revision`, optional UUID `idempotency_key` | Mutation result containing the group and its members |
-| `group.start`, `group.restart` | Group UUID `id`, group `expected_revision`, `launches` with distinct member `id`, absolute `php` path, optional Boolean `allow_horizon`, optional UUID `idempotency_key` | Mutation result with a per-project outcome |
+| `group.start`, `group.restart` | Group UUID `id`, group `expected_revision`, `launches` with distinct member `id`, absolute `php` path, optional Boolean `allow_horizon`, optional launch `fence`, optional UUID `idempotency_key` | Mutation result with a per-project outcome |
 | `group.stop` | Group UUID `id`, optional UUID `idempotency_key` | Mutation result acknowledging per-project stop intent |
 
 Worker profile `options` accepts the following fields and defaults.
@@ -76,7 +78,7 @@ Worker profile `options` accepts the following fields and defaults.
 
 Worker mutations use the `operation_id` and `result` envelope. Start, stop, and restart acknowledge intent before the OS transition finishes. A replay returns the historical acknowledgement even across a daemon restart. A replay leaves current intent unchanged. Project reads report saved desired state. A new session resumes saved running intent only when autostart is enabled and the prior lease has confirmed cleanup. A project with active supervision, queued recovery, or unresolved ownership must be stopped before removal. See [worker supervision](supervision.md) for lifecycle and safety details.
 
-Scheduler options are `enabled` (defaults to true), `crash_restart` (defaults to `on_failure`), and `graceful_stop_seconds` (defaults to 15, allowed 1–60). Configuration requires stopped scheduler intent and confirmed cleanup. Local edits to file-owned scheduler settings return a conflict. The scheduler is independently managed from queue workers. See [scheduler lifecycle and demo](scheduler.md).
+Scheduler options are `enabled` (defaults to true), `crash_restart` (defaults to `on_failure`), and `graceful_stop_seconds` (defaults to 15, allowed 1–60). Omit `expected_revision` or send `null` to create a scheduler only. Updating an existing scheduler requires its current revision. Configuration requires stopped scheduler intent and confirmed cleanup. Local edits to file-owned scheduler settings return a conflict. The scheduler is independently managed from queue workers. See [scheduler lifecycle and demo](scheduler.md).
 
 Watch rules contain `include` and `exclude` arrays of relative globs. Omitting `rules` preserves the saved rules. Watch state is `disabled`, `initializing`, `watching`, or `degraded`. The project watcher and profile policy both default to off. Changing a profile policy requires the project's queue workers to be stopped and their leases cleaned up. File-owned settings and stale revisions return conflicts. See [file watching](file-watching.md).
 
@@ -88,7 +90,9 @@ Queue current polls at ten seconds. New raw queue history items have a `coverage
 
 UUIDs are strings. Path and registration validation runs in the daemon. The CLI resolves relative paths against its own working directory before sending them. `project.add` verifies a regular file at `artisan` after resolving the project directory. It does not execute PHP.
 
-Configuration mutations commit before the response. Worker lifecycle mutations acknowledge acceptance before the process reaches the requested state. With an idempotency key, the daemon uses it as the operation ID and can replay a committed success after a lost response or restart. Retry with the same method and arguments. Reusing a committed key for different arguments or a different method returns a conflict. Without a key, the server generates a fresh operation ID. There is no separate operation lookup in v1.
+Configuration mutations commit before the response. Worker lifecycle mutations acknowledge acceptance before the process reaches the requested state. With an idempotency key, the daemon uses it as the operation ID and can replay a committed success after a lost response or restart. Retry with the same method and arguments. Reusing a committed key for different arguments or a different method returns a conflict. Without a key, the server generates a fresh operation ID. Clients can instead use the additive read-only `mutation.receipt` capability. Pass the original method and serialized arguments, including the matching `idempotency_key` in `params`. A committed key with a different method or arguments returns a conflict. A missing receipt is a point-in-time result and cannot prove that the operation never ran. Receipt lookup does not execute the operation.
+
+Pass the unchanged `project.launchFence` response on a prepared worker or scheduler launch. The mutation transaction compares the daemon instance UUID, project revision, sorted worker profile IDs and revisions, and optional scheduler profile ID and revision before accepting fresh intent. A daemon restart or persisted configuration revision change invalidates an unaccepted prepared request. Receipt lookup still works for a committed request in the same database after either change. Existing callers can omit the fence. The optional `expected_revision` on autostart and removal adds a compare-and-set check inside the mutation transaction. Autostart is a daemon-local recovery preference. Removal still enforces group membership and guardian cleanup and unregisters the project without deleting Laravel files.
 
 | Code | Meaning |
 | --- | --- |

@@ -137,12 +137,14 @@ async fn negotiates_and_serves_project_lifecycle_across_restart() {
 
     let conflict = client
         .remove_project(&RemoveParams {
+            expected_revision: None,
             id: project.id,
             idempotency_key: params.idempotency_key,
         })
         .await;
     assert!(matches!(conflict, Err(rpc::ClientError::Rpc(e)) if e.code == rpc::CONFLICT));
     let remove = RemoveParams {
+        expected_revision: None,
         id: project.id,
         idempotency_key: Some(Uuid::new_v4()),
     };

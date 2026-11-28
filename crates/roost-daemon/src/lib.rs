@@ -9,6 +9,7 @@ mod group_rpc;
 pub mod guardian;
 mod metrics;
 mod metrics_rpc;
+mod mutation_rpc;
 mod notification_rpc;
 mod queue_metrics;
 mod queue_metrics_rpc;
@@ -233,6 +234,7 @@ pub struct DaemonService {
     db: PathBuf,
     started: Instant,
     startup: DaemonStartup,
+    daemon_id: uuid::Uuid,
     workers: Mutex<Supervisor>,
     process_metrics: Mutex<metrics::Current>,
     queue_metrics: Mutex<queue_metrics::Current>,
@@ -265,6 +267,7 @@ impl DaemonService {
             discovery_capacity: Arc::new(Semaphore::new(2)),
             db,
             started: Instant::now(),
+            daemon_id: uuid::Uuid::new_v4(),
             startup,
         })
     }
@@ -427,6 +430,12 @@ async fn dispatch(
     let job = if methods.contains(&method) {
         let call = ProjectCall::decode(method, params)?;
         tokio::task::spawn_blocking(move || call.execute(&service))
+    } else if method == "mutation.receipt" {
+        let params = decode(params)?;
+        tokio::task::spawn_blocking(move || mutation_rpc::receipt(&service, params))
+    } else if method == "project.launchFence" {
+        let params: rpc::workers::ProjectParams = decode(params)?;
+        tokio::task::spawn_blocking(move || mutation_rpc::fence(&service, params.id))
     } else if method.starts_with("provider.") || method.starts_with("queue.") {
         let call = DiscoveryCall::decode(method, params)?;
         let permit = call
@@ -575,6 +584,11 @@ impl ProjectCall {
                 let mut apply = false;
                 let (operation_id, result) = store
                     .try_mutate::<_, supervisor::Error>(params.idempotency_key, &request, |store| {
+                        mutation_rpc::validate_revision(
+                            store,
+                            params.id,
+                            params.expected_revision,
+                        )?;
                         workers.validate_config_change(store, params.id)?;
                         workers.scheduler_clear_for_change(store, params.id)?;
                         if store

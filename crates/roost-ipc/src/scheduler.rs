@@ -47,6 +47,8 @@ pub struct SchedulerLaunchParams {
     pub id: ProjectId,
     pub php: PathBuf,
     pub idempotency_key: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence: Option<crate::mutations::LaunchFence>,
 }
 
 impl Client {
