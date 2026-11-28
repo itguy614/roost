@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { defineStore } from 'pinia'
 import { computed, ref, shallowRef } from 'vue'
 
+import type { ProjectDetail } from './projectOperations'
+
 export type Fault =
   | 'offline' | 'disconnected' | 'incompatible' | 'unsupported'
   | 'timeout' | 'access_denied' | 'invalid_response' | 'unavailable' | 'busy'
@@ -27,6 +29,8 @@ export interface ProjectRow extends ProjectLink {
 
 export interface Dashboard {
   daemon: { pid: number; uptime_seconds: number; protocol_version: number }
+  can_add_project?: boolean
+  detail?: ProjectDetail | null
   directory: ProjectLink[]
   projects: ProjectRow[]
   selected: ProjectRow | null
@@ -110,6 +114,12 @@ export const useDashboard = defineStore('dashboard', () => {
     }
   }
 
+  function invalidate() {
+    revision += 1
+    verifying.value = true
+    refresh()
+  }
+
   function selectPage(page: number) {
     if (page < 0 || page === requestedPage.value) return
     requestedPage.value = page
@@ -124,5 +134,5 @@ export const useDashboard = defineStore('dashboard', () => {
     refresh()
   }
 
-  return { snapshot, fault, receivedAt, verifying, stale, busy, selectedId, refresh, selectPage, selectProject, setActive }
+  return { snapshot, fault, receivedAt, verifying, stale, busy, selectedId, refresh, invalidate, selectPage, selectProject, setActive }
 })

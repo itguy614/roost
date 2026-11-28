@@ -12,6 +12,8 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Serialize)]
 pub(crate) struct Dashboard {
     daemon: roost_ipc::Status,
+    can_add_project: bool,
+    detail: Option<crate::project_ops::Detail>,
     directory: Vec<ProjectLink>,
     projects: Vec<ProjectRow>,
     selected: Option<ProjectRow>,
@@ -112,8 +114,14 @@ async fn fetch(
     } else {
         None
     };
+    let detail = match selected_id.and_then(|id| projects.iter().find(|project| project.id == id)) {
+        Some(project) => Some(crate::project_ops::detail(&mut client, project).await?),
+        None => None,
+    };
     Ok(Dashboard {
         daemon,
+        detail,
+        can_add_project: client.supports("project.add"),
         directory,
         projects: rows,
         selected,

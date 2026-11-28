@@ -7,6 +7,8 @@ import {
 import { listen } from '@tauri-apps/api/event'
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { discrepancy, useDashboard, type Fault } from './dashboard'
+import ProjectControls from './ProjectControls.vue'
+import { useProjectOperations } from './projectOperations'
 import icon from '../src-tauri/icons/icon.png'
 
 const dashboard = useDashboard()
@@ -31,6 +33,9 @@ const problems: Record<Fault, { title: string; description: string }> = {
   unavailable: { title: 'Dashboard temporarily unavailable', description: 'Retry to refresh project status.' },
   busy: { title: 'Dashboard is busy', description: 'Roost will try this read again.' },
 }
+const operations = useProjectOperations(dashboard.invalidate, navigate)
+const { busy: operationBusy, confirmation, notice, replay, locked: operationLocked } = operations
+const actionsLocked = computed(() => operationLocked.value || dashboard.stale || dashboard.verifying || !!dashboard.fault)
 const problem = computed(() => dashboard.fault && problems[dashboard.fault])
 const status = computed(() => {
   if (dashboard.verifying) return 'Checking connection'
@@ -123,11 +128,15 @@ function selectPage(page: number) {
             {{ dashboard.stale ? 'Stale snapshot from' : 'Last updated at' }} {{ receivedTime }}
           </p>
         </div>
+        <div class="operation-actions">
+        <CuiButton v-if="snapshot?.can_add_project && !dashboard.selectedId && snapshot.total" size="sm" variant="solid"
+          :disabled="actionsLocked" @click="operations.add()">Add project</CuiButton>
         <CuiTooltip v-if="snapshot && !problem && !dashboard.verifying" text="Read current state from the daemon" placement="bottom">
           <CuiButton size="sm" color="surface-dark" :disabled="dashboard.busy" focusable-when-disabled @click="dashboard.refresh()">
             Refresh
           </CuiButton>
         </CuiTooltip>
+        </div>
       </header>
 
       <CuiAlert v-if="problem" class="view-notice" :title="problem.title" color="warning" entrance="none" live="polite">
@@ -141,6 +150,20 @@ function selectPage(page: number) {
       </CuiAlert>
       <CuiAlert v-else-if="dashboard.verifying" class="view-notice" title="Checking daemon connection" entrance="none" live="polite">
         <span v-if="snapshot">Showing the previous snapshot until a new read succeeds.</span>
+      </CuiAlert>
+
+      <CuiAlert v-if="confirmation" class="view-notice" :title="confirmation.label" color="warning" entrance="none" live="polite">
+        {{ confirmation.message }}
+        <template #actions>
+          <CuiButton size="sm" @click="confirmation = undefined">Cancel</CuiButton>
+          <CuiButton size="sm" variant="solid" :disabled="dashboard.stale || dashboard.verifying || !!dashboard.fault" @click="operations.confirm()">Confirm</CuiButton>
+        </template>
+      </CuiAlert>
+      <CuiAlert v-if="notice || replay" class="view-notice" :color="notice?.error || replay ? 'warning' : 'info'" entrance="none" live="polite">
+        {{ notice?.text ?? 'Checking the earlier request…' }}
+        <template v-if="replay" #actions>
+          <CuiButton size="sm" :disabled="operationBusy || dashboard.stale || dashboard.verifying || !!dashboard.fault" @click="operations.retry()">Retry same request</CuiButton>
+        </template>
       </CuiAlert>
 
       <section v-if="dashboard.selectedId" class="project-detail" aria-label="Project status">
@@ -162,9 +185,11 @@ function selectPage(page: number) {
           </template>
           <div v-else><dt>Observed status</dt><dd class="capitalize">{{ activeProject.observed.state }}</dd></div>
         </dl>
-        <p v-else-if="dashboard.busy" class="subtitle" role="status">Reading project status…</p>
+        <ProjectControls v-if="activeProject && snapshot?.selected?.id === activeProject.id && snapshot.detail"
+          :key="activeProject.id" :project="activeProject" :detail="snapshot.detail" :locked="actionsLocked" :operations="operations" />
+        <p v-else-if="!activeProject && dashboard.busy" class="subtitle" role="status">Reading project status…</p>
         <CuiEmptyState
-          v-else-if="!problem && !dashboard.verifying" size="sm" title-as="h2"
+          v-else-if="!activeProject && !problem && !dashboard.verifying" size="sm" title-as="h2"
           title="Project no longer registered" description="Choose another project from the sidebar."
         />
       </section>
@@ -208,8 +233,12 @@ function selectPage(page: number) {
         />
       </section>
       <CuiEmptyState v-else-if="snapshot && !problem && !dashboard.verifying" size="sm" title-as="h2"
-        title="No projects yet" description="Use roost project add PATH to register a Laravel project."
-      />
+        title="No projects yet" description="Register a local Laravel project to see it here."
+      >
+        <template v-if="snapshot.can_add_project" #actions>
+          <CuiButton size="sm" variant="solid" :disabled="actionsLocked" @click="operations.add()">Add project</CuiButton>
+        </template>
+      </CuiEmptyState>
     </main>
   </div>
 </template>

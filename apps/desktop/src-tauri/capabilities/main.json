@@ -1,6 +1,16 @@
 {
   "identifier": "main",
-  "description": "Read-only Roost dashboard in the local main window",
-  "windows": ["main"],
-  "permissions": ["allow-dashboard-snapshot", "core:event:allow-listen", "core:event:allow-unlisten"]
+  "description": "Roost dashboard and scoped project operations in the local main window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-dashboard-snapshot",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-choose-project-directory",
+    "allow-resolve-project-php",
+    "allow-discover-project-queues",
+    "allow-project-action"
+  ]
 }
